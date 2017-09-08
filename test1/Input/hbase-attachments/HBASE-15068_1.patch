@@ -1,0 +1,145 @@
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSource.java
+index ab621cc..678826c 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSource.java
+@@ -57,6 +57,8 @@ public interface MetricsMasterSource extends BaseSource {
+   String SERVER_NAME_NAME = "serverName";
+   String CLUSTER_ID_NAME = "clusterId";
+   String IS_ACTIVE_MASTER_NAME = "isActiveMaster";
++  String SPLIT_PLAN_COUNT_NAME = "splitPlanCount";
++  String MERGE_PLAN_COUNT_NAME = "MergePlanCount";
+ 
+   String CLUSTER_REQUESTS_NAME = "clusterRequests";
+   String MASTER_ACTIVE_TIME_DESC = "Master Active Time";
+@@ -70,7 +72,8 @@ public interface MetricsMasterSource extends BaseSource {
+   String SERVER_NAME_DESC = "Server Name";
+   String CLUSTER_ID_DESC = "Cluster Id";
+   String IS_ACTIVE_MASTER_DESC = "Is Active Master";
+-
++  String SPLIT_PLAN_COUNT_DESC = "Number of Region Split Plans executed";
++  String MERGE_PLAN_COUNT_DESC = "Number of Region Merge Plans executed";
+ 
+ 
+   /**
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapper.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapper.java
+index 678db69..5e67f83 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapper.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapper.java
+@@ -112,4 +112,13 @@ public interface MetricsMasterWrapper {
+    */
+   long getNumWALFiles();
+ 
++  /**
++   * Get the number of region split plans executed.
++   */
++  long getSplitPlanCount();
++
++  /**
++   * Get the number of region merge plans executed.
++   */
++  long getMergePlanCount();
+ }
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSourceImpl.java
+index c5ce5e4..b0ba66e 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterSourceImpl.java
+@@ -74,6 +74,10 @@ public class MetricsMasterSourceImpl
+     // masterWrapper can be null because this function is called inside of init.
+     if (masterWrapper != null) {
+       metricsRecordBuilder
++          .addGauge(Interns.info(MERGE_PLAN_COUNT_NAME, MERGE_PLAN_COUNT_DESC),
++              masterWrapper.getMergePlanCount())
++          .addGauge(Interns.info(SPLIT_PLAN_COUNT_NAME, SPLIT_PLAN_COUNT_DESC),
++              masterWrapper.getSplitPlanCount())
+           .addGauge(Interns.info(MASTER_ACTIVE_TIME_NAME,
+               MASTER_ACTIVE_TIME_DESC), masterWrapper.getActiveTime())
+           .addGauge(Interns.info(MASTER_START_TIME_NAME,
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 8e51f25..b1d300b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -93,6 +93,7 @@ import org.apache.hadoop.hbase.master.cleaner.HFileCleaner;
+ import org.apache.hadoop.hbase.master.cleaner.LogCleaner;
+ import org.apache.hadoop.hbase.master.handler.DispatchMergingRegionHandler;
+ import org.apache.hadoop.hbase.master.normalizer.NormalizationPlan;
++import org.apache.hadoop.hbase.master.normalizer.NormalizationPlan.PlanType;
+ import org.apache.hadoop.hbase.master.normalizer.RegionNormalizer;
+ import org.apache.hadoop.hbase.master.normalizer.RegionNormalizerChore;
+ import org.apache.hadoop.hbase.master.normalizer.RegionNormalizerFactory;
+@@ -336,6 +337,9 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+ 
+   // handle table states
+   private TableStateManager tableStateManager;
++  
++  private long splitPlanCount;
++  private long mergePlanCount;
+ 
+   /** flag used in test cases in order to simulate RS failures during master initialization */
+   private volatile boolean initializationBeforeMetaAssignment = false;
+@@ -1369,6 +1373,11 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+         }
+         NormalizationPlan plan = this.normalizer.computePlanForTable(table);
+         plan.execute(clusterConnection.getAdmin());
++        if (plan.getType() == PlanType.SPLIT) {
++          splitPlanCount++;
++        } else if (plan.getType() == PlanType.MERGE) {
++          mergePlanCount++;
++        }
+       }
+     }
+     // If Region did not generate any plans, it means the cluster is already balanced.
+@@ -2387,6 +2396,20 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+     }
+     return regionStates.getAverageLoad();
+   }
++  
++  /*
++   * @return the count of region split plans executed
++   */
++  public long getSplitPlanCount() {
++    return splitPlanCount;
++  }
++
++  /*
++   * @return the count of region merge plans executed
++   */
++  public long getMergePlanCount() {
++    return mergePlanCount;
++  }
+ 
+   @Override
+   public boolean registerService(Service instance) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapperImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapperImpl.java
+index a935a37..4cff28b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapperImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsMasterWrapperImpl.java
+@@ -40,6 +40,16 @@ public class MetricsMasterWrapperImpl implements MetricsMasterWrapper {
+   }
+ 
+   @Override
++  public long getSplitPlanCount() {
++    return master.getSplitPlanCount();
++  }
++
++  @Override
++  public long getMergePlanCount() {
++    return master.getMergePlanCount();
++  }
++
++  @Override
+   public String getClusterId() {
+     return master.getClusterId();
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterMetricsWrapper.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterMetricsWrapper.java
+index 2df4ac9..02f3721 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterMetricsWrapper.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterMetricsWrapper.java
+@@ -50,6 +50,8 @@ public class TestMasterMetricsWrapper {
+   public void testInfo() {
+     HMaster master = TEST_UTIL.getHBaseCluster().getMaster();
+     MetricsMasterWrapperImpl info = new MetricsMasterWrapperImpl(master);
++    assertEquals(master.getSplitPlanCount(), info.getSplitPlanCount(), 0);
++    assertEquals(master.getMergePlanCount(), info.getMergePlanCount(), 0);
+     assertEquals(master.getAverageLoad(), info.getAverageLoad(), 0);
+     assertEquals(master.getClusterId(), info.getClusterId());
+     assertEquals(master.getMasterActiveTime(), info.getActiveTime());

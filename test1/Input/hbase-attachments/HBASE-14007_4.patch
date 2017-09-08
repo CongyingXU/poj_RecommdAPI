@@ -1,0 +1,131 @@
+commit d83e63763fdf728ae069d529485f352bd86863e4
+Author: thiruvel <thiruvel@yahoo-inc.com>
+Date:   Sat Jun 25 19:03:59 2016 -0700
+
+    HBASE-14007: Writing to a table should fail through MR if the table does not exist to is disabled
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
+index 998d700..3b5ef8b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
+@@ -29,6 +29,9 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.TableNotEnabledException;
++import org.apache.hadoop.hbase.TableNotFoundException;
++import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.BufferedMutator;
+ import org.apache.hadoop.hbase.client.Connection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+@@ -158,7 +161,7 @@ implements Configurable {
+   }
+ 
+   /**
+-   * Checks if the output target exists.
++   * Checks if the output table exists and is enabled.
+    *
+    * @param context  The current context.
+    * @throws IOException When the check fails.
+@@ -168,8 +171,19 @@ implements Configurable {
+   @Override
+   public void checkOutputSpecs(JobContext context) throws IOException,
+       InterruptedException {
+-    // TODO Check if the table exists?
+ 
++    try (Admin admin = ConnectionFactory.createConnection(getConf()).getAdmin()) {
++      TableName tableName = TableName.valueOf(this.conf.get(OUTPUT_TABLE));
++      if (!admin.tableExists(tableName)) {
++        throw new TableNotFoundException("Can't write, table does not exist:" +
++            tableName.getNameAsString());
++      }
++
++      if (!admin.isTableEnabled(tableName)) {
++        throw new TableNotEnabledException("Can't write, table is not enabled: " +
++            tableName.getNameAsString());
++      }
++    }
+   }
+ 
+   /**
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+index a52eea6..fa5b9a4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hbase.mapreduce;
+ 
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -29,6 +30,10 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.TableNotEnabledException;
++import org.apache.hadoop.hbase.TableNotFoundException;
++import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Scan;
+@@ -39,6 +44,7 @@ import org.apache.hadoop.hbase.testclassification.VerySlowMapReduceTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.mapreduce.Job;
+ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
++import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+ 
+ /**
+@@ -124,4 +130,24 @@ public class TestTableMapReduce extends TestTableMapReduceBase {
+       }
+     }
+   }
++
++  @Test(expected = TableNotEnabledException.class)
++  public void testWritingToDisabledTable() throws IOException {
++
++    try (Admin admin = UTIL.getConnection().getAdmin();
++      Table table = UTIL.getConnection().getTable(TABLE_FOR_NEGATIVE_TESTS)) {
++      admin.disableTable(table.getName());
++      runTestOnTable(table);
++      fail("Should not have reached here, should have thrown an exception");
++    }
++  }
++
++  @Test(expected = TableNotFoundException.class)
++  public void testWritingToNonExistentTable() throws IOException {
++
++    try (Table table = UTIL.getConnection().getTable(TableName.valueOf("table-does-not-exist"))) {
++      runTestOnTable(table);
++      fail("Should not have reached here, should have thrown an exception");
++    }
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+index 398c248..e78bf4f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+@@ -58,6 +58,7 @@ public abstract class TestTableMapReduceBase {
+       withTimeout(this.getClass()).withLookingForStuckThread(true).build();
+   protected static final HBaseTestingUtility UTIL = new HBaseTestingUtility();
+   protected static final TableName MULTI_REGION_TABLE_NAME = TableName.valueOf("mrtest");
++  protected static final TableName TABLE_FOR_NEGATIVE_TESTS = TableName.valueOf("testfailuretable");
+   protected static final byte[] INPUT_FAMILY = Bytes.toBytes("contents");
+   protected static final byte[] OUTPUT_FAMILY = Bytes.toBytes("text");
+ 
+@@ -83,10 +84,12 @@ public abstract class TestTableMapReduceBase {
+         UTIL.createMultiRegionTable(MULTI_REGION_TABLE_NAME, new byte[][] { INPUT_FAMILY,
+             OUTPUT_FAMILY });
+     UTIL.loadTable(table, INPUT_FAMILY, false);
++    UTIL.createTable(TABLE_FOR_NEGATIVE_TESTS, new byte[][] { INPUT_FAMILY, OUTPUT_FAMILY });
+   }
+ 
+   @AfterClass
+   public static void afterClass() throws Exception {
++    UTIL.deleteTable(TABLE_FOR_NEGATIVE_TESTS);
+     UTIL.shutdownMiniCluster();
+   }
+ 

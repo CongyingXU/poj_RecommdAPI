@@ -1,0 +1,152 @@
+From b3864dd82f9382a242dad5a1ab85e7addb6b41e1 Mon Sep 17 00:00:00 2001
+From: Peter Conrad <pconrad@pconrad-ltm6.internal.salesforce.com>
+Date: Mon, 26 Sep 2016 12:41:22 -0700
+Subject: [PATCH 1/2] Added tuning information to Schema Design chapter.
+
+---
+ src/main/asciidoc/_chapters/schema_design.adoc | 100 ++++++++++++++++++++++++-
+ 1 file changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/src/main/asciidoc/_chapters/schema_design.adoc b/src/main/asciidoc/_chapters/schema_design.adoc
+index 7dc568a..d7b4b9c 100644
+--- a/src/main/asciidoc/_chapters/schema_design.adoc
++++ b/src/main/asciidoc/_chapters/schema_design.adoc
+@@ -1110,4 +1110,102 @@ If you don't have time to build it both ways and compare, my advice would be to
+ [[schema.ops]]
+ == Operational and Performance Configuration Options
+
+-See the Performance section <<perf.schema,perf.schema>> for more information operational and performance schema design options, such as Bloom Filters, Table-configured regionsizes, compression, and blocksizes.
++====  Tune HBase Server RPC Handling
++
++* Set `hbase.regionserver.handler.count` (in `hbase-site.xml`) to cores x spindles for concurrency.
++* Optionally, split the call queues into separate read and write queues for differentiated service. The parameter `hbase.ipc.server.callqueue.handler.factor` specifies the number of call queues:
++- `0` means a single shared queue
++- `1` means one queue for each handler.
++* Use `hbase.ipc.server.callqueue.read.ratio` (`hbase.ipc.server.callqueue.read.share` in 0.98) to split the call queues into read and write queues:
++- `0.5` means there will be the same number of read and write queues
++- `< 0.5` for more read than write
++- `> 0.5` for more write than read
++* Set `hbase.ipc.server.callqueue.scan.ratio` (HBase 1.0+)  to split read call queues into small-read and long-read queues:
++- 0.5 means that there will be the same number of short-read and long-read queues
++- `< 0.5` for more short-read
++- `> 0.5` for more long-read
++
++====  Disable Nagle for RPC
++
++Disable Nagle’s algorithm. Delayed ACKs can add up to ~200ms to RPC round trip time. Set the following parameters:
++
++* In Hadoop’s `core-site.xml`:
++- `ipc.server.tcpnodelay = true`
++- `ipc.client.tcpnodelay = true`
++* In HBase’s `hbase-site.xml`:
++- `hbase.ipc.client.tcpnodelay = true`
++- `hbase.ipc.server.tcpnodelay = true`
++
++====  Limit Server Failure Impact
++
++Detect regionserver failure as fast as reasonable. Set the following parameters:
++
++* In `hbase-site.xml`, set `zookeeper.session.timeout` to 30 seconds or less to bound failure detection (20-30 seconds is a good start).
++* Detect and avoid unhealthy or failed HDFS DataNodes: in `hdfs-site.xml` and `hbase-site.xml`, set the following parameters:
++- `dfs.namenode.avoid.read.stale.datanode = true`
++- `dfs.namenode.avoid.write.stale.datanode = true`
++
++====  Optimize on the Server Side for Low Latency
++
++* Skip the network for local blocks. In `hbase-site.xml`, set the following parameters:
++- `dfs.client.read.shortcircuit = true`
++- `dfs.client.read.shortcircuit.buffer.size = 131072` (Important to avoid OOME)
++* Ensure data locality. In `hbase-site.xml`, set `hbase.hstore.min.locality.to.skip.major.compact = 0.7` (Meaning that 0.7 \<= n \<= 1)
++* Make sure DataNodes have enough handlers for block transfers. In `hdfs-site`.xml``, set the following parameters:
++- `dfs.datanode.max.xcievers >= 8192`
++- `dfs.datanode.handler.count =` number of spindles
++
++===  JVM Tuning
++
++====  Tune JVM GC for low collection latencies
++
++* Use the CMS collector: `-XX:+UseConcMarkSweepGC`
++* Keep eden space as small as possible to minimize average collection time. Example:
++
++    -XX:CMSInitiatingOccupancyFraction=70
++
++*  Optimize for low collection latency rather than throughput: `-XX:+UseParNewGC`
++* Collect eden in parallel: `-Xmn512m`
++*  Avoid collection under pressure: `-XX:+UseCMSInitiatingOccupancyOnly`
++* Limit per request scanner result sizing so everything fits into survivor space but doesn’t tenure. In `hbase-site.xml`, set `hbase.client.scanner.max.result.size` to 1/8th of eden space (with -`Xmn512m` this is ~51MB )
++* Set `max.result.size` x `handler.count` less than survivor space
++
++====  OS-Level Tuning
++
++* Turn transparent huge pages (THP) off:
++
++  echo never > /sys/kernel/mm/transparent_hugepage/enabled
++  echo never > /sys/kernel/mm/transparent_hugepage/defrag
++
++* Set `vm.swappiness = 0`
++* Set `vm.min_free_kbytes` to at least 1GB (8GB on larger memory systems)
++* Disable NUMA zone reclaim with `vm.zone_reclaim_mode = 0`
++
++==  Special Cases
++
++====  For applications where failing quickly is better than waiting
++
++*  In `hbase-site.xml` on the client side, set the following parameters:
++- Set `phoenix.query.timeoutMs` to the max tolerable wait time
++- Set `hbase.client.pause = 1000`
++- Set `hbase.client.retries.number = 3`
++- If you want to ride over splits and region moves, increase `hbase.client.retries.number` substantially (>= 20)
++- Set the RecoverableZookeeper retry count: `zookeeper.recovery.retry = 1` (no retry)
++* In `hbase-site.xml` on the server side, set the Zookeeper session timeout for detecting server failures: `zookeeper.session.timeout` <= 30 seconds (20-30 is good).
++
++====  For applications that can tolerate slightly out of date information
++
++**HBase timeline consistency (HBASE-10070) **
++With read replicas enabled, read-only copies of regions (replicas) are distributed over the cluster. One RegionServer services the default or primary replica, which is the only replica that can service writes. Other RegionServers serve the secondary replicas, follow the primary RegionServer, and only see committed updates. The secondary replicas are read-only, but can serve reads immediately while the primary is failing over, cutting read availability blips from seconds to milliseconds. Phoenix supports timeline consistency as of 4.4.0
++Tips:
++
++* Deploy HBase 1.0.0 or later.
++* Enable timeline consistent replicas on the server side.
++* Use one of the following methods to set timeline consistency:
++- Use `ALTER SESSION SET CONSISTENCY = 'TIMELINE’`
++- Set the connection property `Consistency` to `timeline` in the JDBC connect string
++- Set `phoenix.connection.consistency = timeline` in `hbase-site.xml` on the client side for all connections
++
++=== More Information
++
++See the Performance section <<perf.schema,perf.schema>> for more information about operational and performance schema design options, such as Bloom Filters, Table-configured regionsizes, compression, and blocksizes.
+--
+2.7.4 (Apple Git-66)
+
+
+From a19c06bdbab60c42ec13b4f5e406e7b05e75ee5e Mon Sep 17 00:00:00 2001
+From: Peter Conrad <pconrad@pconrad-ltm6.internal.salesforce.com>
+Date: Mon, 3 Oct 2016 12:25:20 -0700
+Subject: [PATCH 2/2] Stripping out Phoenix-specific info.
+
+---
+ src/main/asciidoc/_chapters/schema_design.adoc | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/src/main/asciidoc/_chapters/schema_design.adoc b/src/main/asciidoc/_chapters/schema_design.adoc
+index d7b4b9c..4d7f0b4 100644
+--- a/src/main/asciidoc/_chapters/schema_design.adoc
++++ b/src/main/asciidoc/_chapters/schema_design.adoc
+@@ -1186,7 +1186,6 @@ Detect regionserver failure as fast as reasonable. Set the following parameters:
+ ====  For applications where failing quickly is better than waiting
+
+ *  In `hbase-site.xml` on the client side, set the following parameters:
+-- Set `phoenix.query.timeoutMs` to the max tolerable wait time
+ - Set `hbase.client.pause = 1000`
+ - Set `hbase.client.retries.number = 3`
+ - If you want to ride over splits and region moves, increase `hbase.client.retries.number` substantially (>= 20)
+@@ -1204,7 +1203,6 @@ Tips:
+ * Use one of the following methods to set timeline consistency:
+ - Use `ALTER SESSION SET CONSISTENCY = 'TIMELINE’`
+ - Set the connection property `Consistency` to `timeline` in the JDBC connect string
+-- Set `phoenix.connection.consistency = timeline` in `hbase-site.xml` on the client side for all connections
+
+ === More Information
+
+--
+2.7.4 (Apple Git-66)

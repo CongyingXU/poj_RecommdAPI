@@ -1,0 +1,449 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+index bc97a95..ffeb51a 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+@@ -25,6 +25,7 @@ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+@@ -80,7 +81,7 @@ public class ClusterStatus extends VersionedWritable {
+   private Collection<ServerName> deadServers;
+   private ServerName master;
+   private Collection<ServerName> backupMasters;
+-  private Map<String, RegionState> intransition;
++  private Set<RegionState> intransition;
+   private String clusterId;
+   private String[] masterCoprocessors;
+   private Boolean balancerOn;
+@@ -90,7 +91,7 @@ public class ClusterStatus extends VersionedWritable {
+       final Collection<ServerName> deadServers,
+       final ServerName master,
+       final Collection<ServerName> backupMasters,
+-      final Map<String, RegionState> rit,
++      final Set<RegionState> rit,
+       final String[] masterCoprocessors,
+       final Boolean balancerOn) {
+     this.hbaseVersion = hbaseVersion;
+@@ -261,7 +262,7 @@ public class ClusterStatus extends VersionedWritable {
+   }
+ 
+   @InterfaceAudience.Private
+-  public Map<String, RegionState> getRegionsInTransition() {
++  public Set<RegionState> getRegionsInTransition() {
+     return this.intransition;
+   }
+ 
+@@ -340,7 +341,7 @@ public class ClusterStatus extends VersionedWritable {
+     int ritSize = (intransition != null) ? intransition.size() : 0;
+     sb.append("\nNumber of regions in transition: " + ritSize);
+     if (ritSize > 0) {
+-      for (RegionState state: intransition.values()) {
++      for (RegionState state: intransition) {
+         sb.append("\n  " + state.toDescriptiveString());
+       }
+     }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index 9c0dd6a..2c77904 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -31,10 +31,12 @@ import java.security.PrivilegedExceptionAction;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.NavigableSet;
++import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.hadoop.conf.Configuration;
+@@ -3528,12 +3530,11 @@ public final class ProtobufUtil {
+       backupMasters.add(ProtobufUtil.toServerName(sn));
+     }
+ 
+-    Map<String, RegionState> rit = null;
+-    rit = new HashMap<String, RegionState>(proto.getRegionsInTransitionList().size());
++    Set<RegionState> rit = null;
++    rit = new HashSet<RegionState>(proto.getRegionsInTransitionList().size());
+     for (RegionInTransition region : proto.getRegionsInTransitionList()) {
+-      String key = new String(region.getSpec().getValue().toByteArray());
+       RegionState value = RegionState.convert(region.getRegionState());
+-      rit.put(key, value);
++      rit.add(value);
+     }
+ 
+     String[] masterCoprocessors = null;
+@@ -3577,11 +3578,11 @@ public final class ProtobufUtil {
+     }
+ 
+     if (status.getRegionsInTransition() != null) {
+-      for (Map.Entry<String, RegionState> rit : status.getRegionsInTransition().entrySet()) {
+-        ClusterStatusProtos.RegionState rs = rit.getValue().convert();
++      for (RegionState rit : status.getRegionsInTransition()) {
++        ClusterStatusProtos.RegionState rs = rit.convert();
+         RegionSpecifier.Builder spec =
+             RegionSpecifier.newBuilder().setType(RegionSpecifierType.REGION_NAME);
+-        spec.setValue(ByteStringer.wrap(Bytes.toBytes(rit.getKey())));
++        spec.setValue(ByteStringer.wrap(rit.getRegion().getRegionName()));
+ 
+         RegionInTransition pbRIT =
+             RegionInTransition.newBuilder().setSpec(spec.build()).setRegionState(rs).build();
+diff --git a/hbase-rsgroup/src/main/java/org/apache/hadoop/hbase/rsgroup/RSGroupAdminServer.java b/hbase-rsgroup/src/main/java/org/apache/hadoop/hbase/rsgroup/RSGroupAdminServer.java
+index 8725781..7aea464 100644
+--- a/hbase-rsgroup/src/main/java/org/apache/hadoop/hbase/rsgroup/RSGroupAdminServer.java
++++ b/hbase-rsgroup/src/main/java/org/apache/hadoop/hbase/rsgroup/RSGroupAdminServer.java
+@@ -191,7 +191,7 @@ public class RSGroupAdminServer extends RSGroupAdmin {
+               }
+             }
+             for (RegionState state :
+-                master.getAssignmentManager().getRegionStates().getRegionsInTransition().values()) {
++                master.getAssignmentManager().getRegionStates().getRegionsInTransition()) {
+               if (state.getServerName().getHostPort().equals(rs)) {
+                 regions.add(state.getRegion());
+               }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+index bcf7b7a..f16463f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+@@ -471,9 +471,9 @@ public class AssignmentManager {
+     }
+     if (!failover) {
+       // If any region except meta is in transition on a live server, it's a failover.
+-      Map<String, RegionState> regionsInTransition = regionStates.getRegionsInTransition();
++      Set<RegionState> regionsInTransition = regionStates.getRegionsInTransition();
+       if (!regionsInTransition.isEmpty()) {
+-        for (RegionState regionState: regionsInTransition.values()) {
++        for (RegionState regionState: regionsInTransition) {
+           ServerName serverName = regionState.getServerName();
+           if (!regionState.getRegion().isMetaRegion()
+               && serverName != null && onlineServers.contains(serverName)) {
+@@ -542,7 +542,7 @@ public class AssignmentManager {
+           }
+         }
+       }
+-      processRegionsInTransition(regionStates.getRegionsInTransition().values());
++      processRegionsInTransition(regionStates.getRegionsInTransition());
+     }
+ 
+     // Now we can safely claim failover cleanup completed and enable
+@@ -2010,7 +2010,7 @@ public class AssignmentManager {
+     long oldestRITTime = 0;
+     int ritThreshold = this.server.getConfiguration().
+       getInt(HConstants.METRICS_RIT_STUCK_WARNING_THRESHOLD, 60000);
+-    for (RegionState state: regionStates.getRegionsInTransition().values()) {
++    for (RegionState state: regionStates.getRegionsInTransition()) {
+       totalRITs++;
+       long ritTime = currentTime - state.getStamp();
+       if (ritTime > ritThreshold) { // more than the threshold
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 109097b..f8d0003 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -1254,7 +1254,7 @@ public class HMaster extends HRegionServer implements MasterServices {
+       if (!this.loadBalancerTracker.isBalancerOn()) return false;
+       // Only allow one balance run at at time.
+       if (this.assignmentManager.getRegionStates().isRegionsInTransition()) {
+-        Map<String, RegionState> regionsInTransition =
++        Set<RegionState> regionsInTransition =
+           this.assignmentManager.getRegionStates().getRegionsInTransition();
+         // if hbase:meta region is in transition, result of assignment cannot be recorded
+         // ignore the force flag in that case
+@@ -2152,7 +2152,7 @@ public class HMaster extends HRegionServer implements MasterServices {
+ 
+     String clusterId = fileSystemManager != null ?
+       fileSystemManager.getClusterId().toString() : null;
+-    Map<String, RegionState> regionsInTransition = assignmentManager != null ?
++    Set<RegionState> regionsInTransition = assignmentManager != null ?
+       assignmentManager.getRegionStates().getRegionsInTransition() : null;
+     String[] coprocessors = cpHost != null ? getMasterCoprocessors() : null;
+     boolean balancerOn = loadBalancerTracker != null ?
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterDumpServlet.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterDumpServlet.java
+index fc5b474..a921ab5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterDumpServlet.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterDumpServlet.java
+@@ -24,6 +24,7 @@ import java.io.PrintStream;
+ import java.io.PrintWriter;
+ import java.util.Date;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+@@ -116,11 +117,9 @@ public class MasterDumpServlet extends StateDumpServlet {
+       return;
+     }
+ 
+-    Map<String, RegionState> regionsInTransition =
+-      am.getRegionStates().getRegionsInTransition();
+-    for (Map.Entry<String, RegionState> e : regionsInTransition.entrySet()) {
+-      String rid = e.getKey();
+-      RegionState rs = e.getValue();
++    Set<RegionState> regionsInTransition = am.getRegionStates().getRegionsInTransition();
++    for (RegionState rs : regionsInTransition) {
++      String rid = rs.getRegion().getRegionNameAsString();
+       out.println("Region " + rid + ": " + rs.toDescriptiveString());
+     }
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+index be9758a..026e849 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+@@ -205,9 +205,8 @@ public class RegionStates {
+   /**
+    * Get regions in transition and their states
+    */
+-  @SuppressWarnings("unchecked")
+-  public synchronized Map<String, RegionState> getRegionsInTransition() {
+-    return (Map<String, RegionState>)regionsInTransition.clone();
++  public synchronized Set<RegionState> getRegionsInTransition() {
++    return new HashSet<RegionState>(regionsInTransition.values());
+   }
+ 
+   @SuppressWarnings("unchecked")
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+index eec5ea4..8666ee6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+@@ -547,10 +547,10 @@ public class HBaseFsck extends Configured implements Closeable {
+     errors.print("Number of requests: " + status.getRequestsCount());
+     errors.print("Number of regions: " + status.getRegionsCount());
+ 
+-    Map<String, RegionState> rits = status.getRegionsInTransition();
++    Set<RegionState> rits = status.getRegionsInTransition();
+     errors.print("Number of regions in transition: " + rits.size());
+     if (details) {
+-      for (RegionState state: rits.values()) {
++      for (RegionState state: rits) {
+         errors.print("  " + state.toDescriptiveString());
+       }
+     }
+@@ -722,7 +722,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     checkAndFixTableLocks();
+ 
+     checkAndFixReplication();
+-    
++
+     // Remove the hbck lock
+     unlockHbck();
+ 
+@@ -3283,7 +3283,7 @@ public class HBaseFsck extends Configured implements Closeable {
+       checker.fixExpiredTableLocks();
+     }
+   }
+-  
++
+   private void checkAndFixReplication() throws IOException {
+     ReplicationChecker checker = new ReplicationChecker(getConf(), zkw, connection, errors);
+     checker.checkUnDeletedQueues();
+@@ -4214,7 +4214,7 @@ public class HBaseFsck extends Configured implements Closeable {
+   public boolean shouldDisableSplitAndMerge() {
+     return fixAny || disableSplitAndMerge;
+   }
+-  
++
+   /**
+    * Set summary mode.
+    * Print only summary of the tables and status (OK or INCONSISTENT)
+@@ -4246,7 +4246,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     fixTableLocks = shouldFix;
+     fixAny |= shouldFix;
+   }
+-  
++
+   /**
+    * Set replication fix mode.
+    */
+@@ -4517,7 +4517,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     out.println("");
+     out.println(" Replication options");
+     out.println("   -fixReplication   Deletes replication queues for removed peers");
+-    
++
+     out.flush();
+     errors.reportError(ERROR_CODE.WRONG_USAGE, sw.toString());
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java
+index e681789..e463ca9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java
+@@ -46,6 +46,7 @@ import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
++import java.util.Set;
+ 
+ /**
+  * This class contains helper methods that repair parts of hbase's filesystem
+@@ -124,10 +125,8 @@ public class HBaseFsckRepair {
+     long expiration = timeout + EnvironmentEdgeManager.currentTime();
+     while (EnvironmentEdgeManager.currentTime() < expiration) {
+       try {
+-        Map<String, RegionState> rits=
+-            admin.getClusterStatus().getRegionsInTransition();
+-
+-        if (rits.keySet() != null && !rits.keySet().contains(region.getEncodedName())) {
++        Set<RegionState> rits = admin.getClusterStatus().getRegionsInTransition();
++        if (!rits.contains(region.getEncodedName())) {
+           // yay! no longer RIT
+           return;
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
+index 73917cd..e1c4a1f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
+@@ -1916,8 +1916,7 @@ public class TestMasterObserver {
+ 
+       // wait for assignments to finish, if any
+       AssignmentManager mgr = master.getAssignmentManager();
+-      Collection<RegionState> transRegions =
+-        mgr.getRegionStates().getRegionsInTransition().values();
++      Set<RegionState> transRegions = mgr.getRegionStates().getRegionsInTransition();
+       for (RegionState state : transRegions) {
+         mgr.getRegionStates().waitOnRegionToClearRegionsInTransition(state.getRegion());
+       }
+@@ -1953,8 +1952,7 @@ public class TestMasterObserver {
+   private void waitForRITtoBeZero(HMaster master) throws Exception {
+     // wait for assignments to finish
+     AssignmentManager mgr = master.getAssignmentManager();
+-    Collection<RegionState> transRegions =
+-      mgr.getRegionStates().getRegionsInTransition().values();
++    Set<RegionState> transRegions = mgr.getRegionStates().getRegionsInTransition();
+     for (RegionState state : transRegions) {
+       mgr.getRegionStates().waitOnRegionToClearRegionsInTransition(state.getRegion());
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java
+index cd4410f..8499335 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java
+@@ -544,7 +544,7 @@ public class TestRegionMergeTransactionOnCluster {
+       if (enabled.get() && req.getTransition(0).getTransitionCode()
+           == TransitionCode.READY_TO_MERGE && !resp.hasErrorMessage()) {
+         RegionStates regionStates = myMaster.getAssignmentManager().getRegionStates();
+-        for (RegionState regionState: regionStates.getRegionsInTransition().values()) {
++        for (RegionState regionState: regionStates.getRegionsInTransition()) {
+           // Find the merging_new region and remove it
+           if (regionState.isMergingNew()) {
+             regionStates.deleteRegion(regionState.getRegion());
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+index fe620e7..e6578bb 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+@@ -31,6 +31,7 @@ import java.io.InterruptedIOException;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -213,8 +214,7 @@ public class TestSplitTransactionOnCluster {
+         @Override
+         public boolean evaluate() throws Exception {
+           RegionStates regionStates = cluster.getMaster().getAssignmentManager().getRegionStates();
+-          Map<String, RegionState> rit = regionStates.getRegionsInTransition();
+-          return !rit.containsKey(hri.getEncodedName());
++          return !regionStates.isRegionInTransition(hri.getEncodedName());
+         }
+       });
+     } finally {
+@@ -657,7 +657,7 @@ public class TestSplitTransactionOnCluster {
+       tableExists = MetaTableAccessor.tableExists(regionServer.getConnection(),
+         tableName);
+       assertEquals("The specified table should present.", true, tableExists);
+-      Map<String, RegionState> rit = cluster.getMaster().getAssignmentManager().getRegionStates()
++      Set<RegionState> rit = cluster.getMaster().getAssignmentManager().getRegionStates()
+           .getRegionsInTransition();
+       assertTrue(rit.size() == 3);
+       cluster.getMaster().getAssignmentManager().regionOffline(st.getFirstDaughter());
+@@ -1311,7 +1311,7 @@ public class TestSplitTransactionOnCluster {
+       if (enabled.get() && req.getTransition(0).getTransitionCode().equals(
+           TransitionCode.READY_TO_SPLIT) && !resp.hasErrorMessage()) {
+         RegionStates regionStates = myMaster.getAssignmentManager().getRegionStates();
+-        for (RegionState regionState: regionStates.getRegionsInTransition().values()) {
++        for (RegionState regionState: regionStates.getRegionsInTransition()) {
+           // Find the merging_new region and remove it
+           if (regionState.isSplittingNew()) {
+             regionStates.deleteRegion(regionState.getRegion());
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckOneRS.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckOneRS.java
+index d5869ed..7ad2177 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckOneRS.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckOneRS.java
+@@ -80,6 +80,7 @@ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+@@ -610,7 +611,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+       hbck.close();
+     }
+   }
+-  
++
+   @Test (timeout=180000)
+   public void testHbckAfterRegionMerge() throws Exception {
+     TableName table = TableName.valueOf("testMergeRegionFilesInHdfs");
+@@ -1528,7 +1529,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+     // check no errors
+     HBaseFsck hbck = doFsck(conf, false);
+     assertNoErrors(hbck);
+-    
++
+     // create peer
+     ReplicationAdmin replicationAdmin = new ReplicationAdmin(conf);
+     Assert.assertEquals(0, replicationAdmin.getPeersCount());
+@@ -1539,7 +1540,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+     replicationAdmin.addPeer("1", rpc, null);
+     replicationAdmin.getPeersCount();
+     Assert.assertEquals(1, replicationAdmin.getPeersCount());
+-    
++
+     // create replicator
+     ZooKeeperWatcher zkw = new ZooKeeperWatcher(conf, "Test Hbase Fsck", connection);
+     ReplicationQueues repQueues =
+@@ -1551,7 +1552,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+     Assert.assertEquals(2, repQueues.getAllQueues().size());
+     hbck = doFsck(conf, false);
+     assertNoErrors(hbck);
+-    
++
+     // queues for removed peer
+     repQueues.addLog("2", "file1");
+     repQueues.addLog("2-server2", "file1");
+@@ -1560,7 +1561,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+     assertErrors(hbck, new HBaseFsck.ErrorReporter.ERROR_CODE[] {
+         HBaseFsck.ErrorReporter.ERROR_CODE.UNDELETED_REPLICATION_QUEUE,
+         HBaseFsck.ErrorReporter.ERROR_CODE.UNDELETED_REPLICATION_QUEUE });
+-    
++
+     // fix the case
+     hbck = doFsck(conf, true);
+     hbck = doFsck(conf, false);
+@@ -1569,7 +1570,7 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+     Assert.assertEquals(2, repQueues.getAllQueues().size());
+     Assert.assertNull(repQueues.getLogsInQueue("2"));
+     Assert.assertNull(repQueues.getLogsInQueue("2-sever2"));
+-    
++
+     replicationAdmin.removePeer("1");
+     repQueues.removeAllQueues();
+     zkw.close();
+@@ -1679,8 +1680,8 @@ public class TestHBaseFsckOneRS extends BaseTestHBaseFsck {
+       st.prepare();
+       st.stepsBeforePONR(regionServer, regionServer, false);
+       AssignmentManager am = cluster.getMaster().getAssignmentManager();
+-      Map<String, RegionState> regionsInTransition = am.getRegionStates().getRegionsInTransition();
+-      for (RegionState state : regionsInTransition.values()) {
++      Set<RegionState> regionsInTransition = am.getRegionStates().getRegionsInTransition();
++      for (RegionState state : regionsInTransition) {
+         am.regionOffline(state.getRegion());
+       }
+       Map<HRegionInfo, ServerName> regionsMap = new HashMap<HRegionInfo, ServerName>();

@@ -1,0 +1,702 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+index 5189139..4c2ff8c 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+@@ -34,7 +34,9 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.filter.Filter;
++import org.apache.hadoop.hbase.filter.FilterList;
+ import org.apache.hadoop.hbase.filter.IncompatibleFilterException;
++import org.apache.hadoop.hbase.filter.PrefixFilter;
+ import org.apache.hadoop.hbase.io.TimeRange;
+ import org.apache.hadoop.hbase.security.access.Permission;
+ import org.apache.hadoop.hbase.security.visibility.Authorizations;
+@@ -109,6 +111,10 @@ public class Scan extends Query {
+ 
+   private byte [] startRow = HConstants.EMPTY_START_ROW;
+   private byte [] stopRow  = HConstants.EMPTY_END_ROW;
++
++  private Filter userFilter      = null;
++  private Filter rowPrefixFilter = null;
++
+   private int maxVersions = 1;
+   private int batch = -1;
+ 
+@@ -298,7 +304,7 @@ public class Scan extends Query {
+    * Get versions of columns only within the specified timestamp range,
+    * [minStamp, maxStamp).  Note, default maximum versions to return is 1.  If
+    * your time range spans more than one version and you want all versions
+-   * returned, up the number of versions beyond the defaut.
++   * returned, up the number of versions beyond the default.
+    * @param minStamp minimum timestamp value, inclusive
+    * @param maxStamp maximum timestamp value, exclusive
+    * @throws IOException if invalid time range
+@@ -338,6 +344,7 @@ public class Scan extends Query {
+    * Set the start row of the scan.
+    * @param startRow row to start scan on (inclusive)
+    * Note: In order to make startRow exclusive add a trailing 0 byte
++   * Note: In order to scan for a row prefix use {@link #setRowPrefixFilter(byte[])} instead.
+    * @return this
+    */
+   public Scan setStartRow(byte [] startRow) {
+@@ -348,7 +355,7 @@ public class Scan extends Query {
+   /**
+    * Set the stop row.
+    * @param stopRow row to end at (exclusive)
+-   * Note: In order to make stopRow inclusive add a trailing 0 byte
++   * Note: In order to scan for a row prefix use {@link #setRowPrefixFilter(byte[])} instead.
+    * @return this
+    */
+   public Scan setStopRow(byte [] stopRow) {
+@@ -439,11 +446,60 @@ public class Scan extends Query {
+ 
+   @Override
+   public Scan setFilter(Filter filter) {
+-    super.setFilter(filter);
++    this.userFilter = filter;
++    super.setFilter(combineUserFilterAndRowPrefixFilter());
++    return this;
++  }
++
++  /**
++   * <p>Set the prefix all row keys must start with.</p>
++   * <p>This is a utility method that sets right the start and stop row and introduces
++   * the right filter to achieve the desired result.</p>
++   * <p>This can safely be used in combination with setFilter.</p>
++   * <p><b>NOTE: Doing a {@link #setStartRow(byte[])} and/or {@link #setStopRow(byte[])}
++   * after this method will yield undefined results.</b></p>
++   * @param rowPrefix the prefix all rows must start with. Use <i>null</i> to remove the filter.
++   * @return this
++   */
++  public Scan setRowPrefixFilter(byte[] rowPrefix) {
++    if (rowPrefix == null || rowPrefix.length == 0) {
++      setStartRow(HConstants.EMPTY_START_ROW);
++      rowPrefixFilter = null;
++    } else {
++      setStartRow(rowPrefix);
++      rowPrefixFilter = new PrefixFilter(rowPrefix);
++    }
++
++    setStopRow(HConstants.EMPTY_END_ROW); // Always end of the table
++
++    super.setFilter(combineUserFilterAndRowPrefixFilter());
+     return this;
+   }
+ 
+   /**
++   * Internal utility to correctly combine the
++   * rowPrefixFilter (set using {@link #setRowPrefixFilter(byte[])})
++   * and userFilter (set using {@link #setFilter(org.apache.hadoop.hbase.filter.Filter)}.
++   * If only one of those filters is present then only that filter is set.
++   * If both are set a FilterList is created that requires a MUST_PASS_ALL
++   * @return the combined filter
++   */
++  private Filter combineUserFilterAndRowPrefixFilter() {
++    if (this.rowPrefixFilter == null) {
++      return this.userFilter;
++    }
++
++    if (this.userFilter == null) {
++      return this.rowPrefixFilter;
++    }
++
++    FilterList list = new FilterList(FilterList.Operator.MUST_PASS_ALL);
++    list.addFilter(this.rowPrefixFilter);
++    list.addFilter(this.userFilter);
++    return list;
++  }
++
++  /**
+    * Setting the familyMap
+    * @param familyMap map of family to qualifier
+    * @return this
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/FilterTestingCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/FilterTestingCluster.java
+new file mode 100644
+index 0000000..0ea0d46
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/FilterTestingCluster.java
+@@ -0,0 +1,130 @@
++/*
++ * Copyright The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.filter;
++
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.commons.logging.impl.Log4JLogger;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.MasterNotRunningException;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.ZooKeeperConnectionException;
++import org.apache.hadoop.hbase.client.HBaseAdmin;
++import org.apache.hadoop.hbase.client.HTable;
++import org.apache.hadoop.hbase.client.ScannerCallable;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.ipc.RpcClient;
++import org.apache.hadoop.hbase.ipc.RpcServer;
++import org.apache.hadoop.hbase.testclassification.FilterTests;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.log4j.Level;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.experimental.categories.Category;
++
++/**
++ * By using this class as the super class of a set of tests you will have a HBase testing
++ * cluster available that is very suitable for writing tests for scanning and filtering against.
++ */
++@Category({FilterTests.class, MediumTests.class})
++public class FilterTestingCluster {
++  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private static Configuration conf = null;
++  private static HBaseAdmin admin = null;
++  private static List<String> createdTables = new ArrayList<>();
++
++  protected static void createTable(String tableName, String columnFamilyName) {
++    assertNotNull("HBaseAdmin is not initialized successfully.", admin);
++    HTableDescriptor desc = new HTableDescriptor(TableName.valueOf(tableName));
++    HColumnDescriptor colDef = new HColumnDescriptor(Bytes.toBytes(columnFamilyName));
++    desc.addFamily(colDef);
++
++    try {
++      admin.createTable(desc);
++      createdTables.add(tableName);
++      assertTrue("Fail to create the table", admin.tableExists(tableName));
++    } catch (IOException e) {
++      assertNull("Exception found while creating table", e);
++    }
++  }
++
++  protected static Table openTable(String tableName) throws IOException {
++    Table table = new HTable(conf, tableName);
++    assertTrue("Fail to create the table", admin.tableExists(tableName));
++    return table;
++  }
++
++  private static void deleteTables() {
++    if (admin != null) {
++      for (String tableName: createdTables){
++        try {
++          if (admin.tableExists(tableName)) {
++            admin.disableTable(tableName);
++            admin.deleteTable(tableName);
++          }
++        } catch (IOException e) {
++          assertNull("Exception found deleting the table", e);
++        }
++      }
++    }
++  }
++
++  private static void initialize(Configuration conf) {
++    FilterTestingCluster.conf = HBaseConfiguration.create(conf);
++    FilterTestingCluster.conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
++    try {
++      admin = new HBaseAdmin(conf);
++    } catch (MasterNotRunningException e) {
++      assertNull("Master is not running", e);
++    } catch (ZooKeeperConnectionException e) {
++      assertNull("Cannot connect to Zookeeper", e);
++    } catch (IOException e) {
++      assertNull("IOException", e);
++    }
++  }
++
++  @BeforeClass
++  public static void setUp() throws Exception {
++    ((Log4JLogger)RpcServer.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)RpcClient.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)ScannerCallable.LOG).getLogger().setLevel(Level.ALL);
++    TEST_UTIL.startMiniCluster(1);
++    initialize(TEST_UTIL.getConfiguration());
++  }
++
++  @AfterClass
++  public static void tearDown() throws Exception {
++    deleteTables();
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestFilterWithScanLimits.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestFilterWithScanLimits.java
+index 504877d..142b15a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestFilterWithScanLimits.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestFilterWithScanLimits.java
+@@ -22,7 +22,6 @@ package org.apache.hadoop.hbase.filter;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertNull;
+-import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -30,32 +29,15 @@ import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.commons.logging.impl.Log4JLogger;
+-import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.Cell;
+-import org.apache.hadoop.hbase.HBaseConfiguration;
+-import org.apache.hadoop.hbase.HBaseTestingUtility;
+-import org.apache.hadoop.hbase.HColumnDescriptor;
+-import org.apache.hadoop.hbase.HConstants;
+-import org.apache.hadoop.hbase.HTableDescriptor;
+-import org.apache.hadoop.hbase.MasterNotRunningException;
+-import org.apache.hadoop.hbase.TableName;
+-import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+-import org.apache.hadoop.hbase.client.HBaseAdmin;
+-import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Scan;
+-import org.apache.hadoop.hbase.client.ScannerCallable;
+ import org.apache.hadoop.hbase.client.Table;
+-import org.apache.hadoop.hbase.ipc.RpcClient;
+-import org.apache.hadoop.hbase.ipc.RpcServer;
+ import org.apache.hadoop.hbase.testclassification.FilterTests;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+-import org.apache.log4j.Level;
+-import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+@@ -64,30 +46,27 @@ import org.junit.experimental.categories.Category;
+  * Test if Filter is incompatible with scan-limits
+  */
+ @Category({FilterTests.class, MediumTests.class})
+-public class TestFilterWithScanLimits {
++public class TestFilterWithScanLimits extends FilterTestingCluster {
+   private static final Log LOG = LogFactory
+       .getLog(TestFilterWithScanLimits.class);
+ 
+-  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+-  private static Configuration conf = null;
+-  private static HBaseAdmin admin = null;
+-  private static byte[] name = Bytes.toBytes("test");
++  private static final String tableName = "scanWithLimit";
++  private static final String columnFamily = "f1";
+ 
+   @Test
+   public void testScanWithLimit() {
+     int kv_number = 0;
+     try {
+       Scan scan = new Scan();
+-      // set batch number as 2, which means each Result should contain 2 KVs at
+-      // most
++      // set batch number as 2, which means each Result should contain 2 KVs at most
+       scan.setBatch(2);
+       SingleColumnValueFilter filter = new SingleColumnValueFilter(
+-          Bytes.toBytes("f1"), Bytes.toBytes("c5"),
++          Bytes.toBytes(columnFamily), Bytes.toBytes("c5"),
+           CompareFilter.CompareOp.EQUAL, new SubstringComparator("2_c5"));
+ 
+       // add filter after batch defined
+       scan.setFilter(filter);
+-      Table table = new HTable(conf, name);
++      Table table = openTable(tableName);
+       ResultScanner scanner = table.getScanner(scan);
+       // Expect to get following row
+       // row2 => <f1:c1, 2_c1>, <f1:c2, 2_c2>,
+@@ -111,10 +90,11 @@ public class TestFilterWithScanLimits {
+     assertEquals("We should not get result(s) returned.", 0, kv_number);
+   }
+ 
+-  private static void prepareData() {
++  @BeforeClass
++  public static void prepareData() {
+     try {
+-      Table table = new HTable(TestFilterWithScanLimits.conf, name);
+-      assertTrue("Fail to create the table", admin.tableExists(name));
++      createTable(tableName, columnFamily);
++      Table table = openTable(tableName);
+       List<Put> puts = new ArrayList<Put>();
+ 
+       // row1 => <f1:c1, 1_c1>, <f1:c2, 1_c2>, <f1:c3, 1_c3>, <f1:c4,1_c4>,
+@@ -137,64 +117,4 @@ public class TestFilterWithScanLimits {
+     }
+   }
+ 
+-  private static void createTable() {
+-    assertNotNull("HBaseAdmin is not initialized successfully.", admin);
+-    if (admin != null) {
+-
+-      HTableDescriptor desc = new HTableDescriptor(TableName.valueOf(name));
+-      HColumnDescriptor coldef = new HColumnDescriptor(Bytes.toBytes("f1"));
+-      desc.addFamily(coldef);
+-
+-      try {
+-        admin.createTable(desc);
+-        assertTrue("Fail to create the table", admin.tableExists(name));
+-      } catch (IOException e) {
+-        assertNull("Exception found while creating table", e);
+-      }
+-
+-    }
+-  }
+-
+-  private static void deleteTable() {
+-    if (admin != null) {
+-      try {
+-        admin.disableTable(name);
+-        admin.deleteTable(name);
+-      } catch (IOException e) {
+-        assertNull("Exception found deleting the table", e);
+-      }
+-    }
+-  }
+-
+-  private static void initialize(Configuration conf) {
+-    TestFilterWithScanLimits.conf = HBaseConfiguration.create(conf);
+-    TestFilterWithScanLimits.conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
+-    try {
+-      admin = new HBaseAdmin(conf);
+-    } catch (MasterNotRunningException e) {
+-      assertNull("Master is not running", e);
+-    } catch (ZooKeeperConnectionException e) {
+-      assertNull("Cannot connect to Zookeeper", e);
+-    } catch (IOException e) {
+-      assertNull("IOException", e);
+-    }
+-    createTable();
+-    prepareData();
+-  }
+-
+-  @BeforeClass
+-  public static void setUp() throws Exception {
+-    ((Log4JLogger)RpcServer.LOG).getLogger().setLevel(Level.ALL);
+-    ((Log4JLogger)RpcClient.LOG).getLogger().setLevel(Level.ALL);
+-    ((Log4JLogger)ScannerCallable.LOG).getLogger().setLevel(Level.ALL);
+-    TEST_UTIL.startMiniCluster(1);
+-    initialize(TEST_UTIL.getConfiguration());
+-  }
+-
+-  @AfterClass
+-  public static void tearDown() throws Exception {
+-    deleteTable();
+-    TEST_UTIL.shutdownMiniCluster();
+-  }
+-
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestScanRowPrefix.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestScanRowPrefix.java
+new file mode 100644
+index 0000000..08758f7
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestScanRowPrefix.java
+@@ -0,0 +1,260 @@
++/*
++ * Copyright The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.filter;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.commons.codec.binary.Hex;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.client.ResultScanner;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.testclassification.FilterTests;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.junit.Assert;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++/**
++ * Test if Scan.setRowPrefixFilter works as intended.
++ */
++@Category({FilterTests.class, MediumTests.class})
++public class TestScanRowPrefix extends FilterTestingCluster {
++  private static final Log LOG = LogFactory
++      .getLog(TestScanRowPrefix.class);
++
++  @Test
++  public void testPrefixScanning() throws IOException {
++    String tableName = "prefixScanning";
++    createTable(tableName,"F");
++    Table table = openTable(tableName);
++
++    /**
++     * Note that about half of these tests were relevant for an earlier implementation approach
++     * of setRowPrefixFilter. These test cases have been retained to ensure that also the
++     * edge cases found there are still covered.
++     */
++
++    final byte[][] rowIds = {
++        {(byte) 0x11},                                                      //  0
++        {(byte) 0x12},                                                      //  1
++        {(byte) 0x12, (byte) 0x23, (byte) 0xFF, (byte) 0xFE},               //  2
++        {(byte) 0x12, (byte) 0x23, (byte) 0xFF, (byte) 0xFF},               //  3
++        {(byte) 0x12, (byte) 0x23, (byte) 0xFF, (byte) 0xFF, (byte) 0x00},  //  4
++        {(byte) 0x12, (byte) 0x23, (byte) 0xFF, (byte) 0xFF, (byte) 0x01},  //  5
++        {(byte) 0x12, (byte) 0x24},                                         //  6
++        {(byte) 0x12, (byte) 0x24, (byte) 0x00},                            //  7
++        {(byte) 0x12, (byte) 0x24, (byte) 0x00, (byte) 0x00},               //  8
++        {(byte) 0x12, (byte) 0x25},                                         //  9
++        {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF},  // 10
++    };
++    for (byte[] rowId: rowIds) {
++      Put p = new Put(rowId);
++      // Use the rowId as the column qualifier
++      p.add("F".getBytes(), rowId, "Dummy value".getBytes());
++      table.put(p);
++    }
++
++    byte[] prefix0 = {};
++    List<byte[]> expected0 = new ArrayList<>(16);
++    expected0.addAll(Arrays.asList(rowIds)); // Expect all rows
++    
++    byte[] prefix1 = {(byte) 0x12, (byte) 0x23};
++    List<byte[]> expected1 = new ArrayList<>(16);
++    expected1.add(rowIds[2]);
++    expected1.add(rowIds[3]);
++    expected1.add(rowIds[4]);
++    expected1.add(rowIds[5]);
++
++    byte[] prefix2 = {(byte) 0x12, (byte) 0x23, (byte) 0xFF, (byte) 0xFF};
++    List<byte[]> expected2 = new ArrayList<>();
++    expected2.add(rowIds[3]);
++    expected2.add(rowIds[4]);
++    expected2.add(rowIds[5]);
++
++    byte[] prefix3 = {(byte) 0x12, (byte) 0x24};
++    List<byte[]> expected3 = new ArrayList<>();
++    expected3.add(rowIds[6]);
++    expected3.add(rowIds[7]);
++    expected3.add(rowIds[8]);
++
++    byte[] prefix4 = {(byte) 0xFF, (byte) 0xFF};
++    List<byte[]> expected4 = new ArrayList<>();
++    expected4.add(rowIds[10]);
++
++    // ========
++    // PREFIX 0
++    Scan scan = new Scan();
++    scan.setRowPrefixFilter(prefix0);
++    verifyScanResult(table, scan, expected0, "Scan empty prefix failed");
++
++    // ========
++    // PREFIX 1
++    scan = new Scan();
++    scan.setRowPrefixFilter(prefix1);
++    verifyScanResult(table, scan, expected1, "Scan normal prefix failed");
++
++    scan = new Scan();
++    scan.setFilter(new ColumnPrefixFilter(prefix1));
++    verifyScanResult(table, scan, expected1, "Double check on column prefix failed");
++
++    // ========
++    // PREFIX 2
++    scan = new Scan();
++    scan.setRowPrefixFilter(prefix2);
++    verifyScanResult(table, scan, expected2, "Scan edge 0xFF prefix failed");
++
++    scan = new Scan();
++    scan.setFilter(new ColumnPrefixFilter(prefix2));
++    verifyScanResult(table, scan, expected2, "Double check on column prefix failed");
++
++    // ========
++    // PREFIX 3
++    scan = new Scan();
++    scan.setRowPrefixFilter(prefix3);
++    verifyScanResult(table, scan, expected3, "Scan normal with 0x00 ends failed");
++
++    scan = new Scan();
++    scan.setFilter(new ColumnPrefixFilter(prefix3));
++    verifyScanResult(table, scan, expected3, "Double check on column prefix failed");
++
++    // ========
++    // PREFIX 4
++    scan = new Scan();
++    scan.setRowPrefixFilter(prefix4);
++    verifyScanResult(table, scan, expected4, "Scan end prefix failed");
++
++    scan = new Scan();
++    scan.setFilter(new ColumnPrefixFilter(prefix4));
++    verifyScanResult(table, scan, expected4, "Double check on column prefix failed");
++
++    // ========
++    // COMBINED
++    // Prefix + Filter
++    scan = new Scan();
++    scan.setRowPrefixFilter(prefix1);
++    verifyScanResult(table, scan, expected1, "Prefix filter failed");
++
++    scan.setFilter(new ColumnPrefixFilter(prefix2));
++    verifyScanResult(table, scan, expected2, "Combined Prefix + Filter failed");
++
++    scan.setRowPrefixFilter(null);
++    verifyScanResult(table, scan, expected2, "Combined Prefix + Filter; removing Prefix failed");
++
++    // ========
++    // Reversed: Filter + Prefix
++    scan = new Scan();
++    scan.setFilter(new ColumnPrefixFilter(prefix2));
++    verifyScanResult(table, scan, expected2, "Test filter failed");
++
++    scan.setRowPrefixFilter(prefix1);
++    verifyScanResult(table, scan, expected2, "Combined Filter + Prefix failed");
++
++    scan.setFilter(null);
++    verifyScanResult(table, scan, expected1, "Combined Filter + Prefix ; removing Filter failed");
++  }
++
++  private void verifyScanResult(Table table, Scan scan, List<byte[]> expectedKeys, String message) {
++    List<byte[]> actualKeys = new ArrayList<>();
++    try {
++      ResultScanner scanner = table.getScanner(scan);
++      for (Result result : scanner) {
++        actualKeys.add(result.getRow());
++      }
++
++      String fullMessage = message;
++      if (LOG.isDebugEnabled()) {
++        fullMessage = message + "\n" + tableOfTwoListsOfByteArrays(
++                "Expected", expectedKeys,
++                "Actual  ", actualKeys);
++      }
++
++      Assert.assertArrayEquals(
++              fullMessage,
++              expectedKeys.toArray(),
++              actualKeys.toArray());
++    } catch (IOException e) {
++      e.printStackTrace();
++      Assert.fail();
++    }
++  }
++
++  private String printMultiple(char letter, int count) {
++    StringBuilder sb = new StringBuilder(count);
++    for (int i = 0; i < count; i++) {
++      sb.append(letter);
++    }
++    return sb.toString();
++  }
++
++  private String tableOfTwoListsOfByteArrays(
++          String label1, List<byte[]> listOfBytes1,
++          String label2, List<byte[]> listOfBytes2) {
++    int margin1 = calculateWidth(label1, listOfBytes1);
++    int margin2 = calculateWidth(label2, listOfBytes2);
++
++    StringBuilder sb = new StringBuilder(512);
++    String separator = '+' + printMultiple('-', margin1 + margin2 + 5) + '+' + '\n';
++    sb.append(separator);
++    sb.append(printLine(label1, margin1, label2, margin2)).append('\n');
++    sb.append(separator);
++    int maxLength = Math.max(listOfBytes1.size(), listOfBytes2.size());
++    for (int offset = 0; offset < maxLength; offset++) {
++      String value1 = getStringFromList(listOfBytes1, offset);
++      String value2 = getStringFromList(listOfBytes2, offset);
++      sb.append(printLine(value1, margin1, value2, margin2)).append('\n');
++    }
++    sb.append(separator).append('\n');
++    return sb.toString();
++  }
++
++  private String printLine(String leftValue, int leftWidth1, String rightValue, int rightWidth) {
++    return "| " +
++            leftValue + printMultiple(' ', leftWidth1 - leftValue.length()) +
++            " | " +
++            rightValue + printMultiple(' ', rightWidth - rightValue.length()) +
++            " |";
++  }
++
++  private int calculateWidth(String label1, List<byte[]> listOfBytes1) {
++    int longestList1 = label1.length();
++    for (byte[] value : listOfBytes1) {
++      longestList1 = Math.max(value.length * 2, longestList1);
++    }
++    return longestList1 + 5;
++  }
++
++  private String getStringFromList(List<byte[]> listOfBytes, int offset) {
++    String value1;
++    if (listOfBytes.size() > offset) {
++      value1 = Hex.encodeHexString(listOfBytes.get(offset));
++    } else {
++      value1 = "<missing>";
++    }
++    return value1;
++  }
++
++}
+diff --git a/src/main/docbkx/book.xml b/src/main/docbkx/book.xml
+index b88c0b1..a325c29 100644
+--- a/src/main/docbkx/book.xml
++++ b/src/main/docbkx/book.xml
+@@ -573,8 +573,8 @@ create 'bar', 'fam'
+           allow iteration over multiple rows for specified attributes. </para>
+         <para>The following is an example of a on an HTable table instance. Assume that a table is
+           populated with rows with keys "row1", "row2", "row3", and then another set of rows with
+-          the keys "abc1", "abc2", and "abc3". The following example shows how startRow and stopRow
+-          can be applied to a Scan instance to return the rows beginning with "row".</para>
++          the keys "abc1", "abc2", and "abc3". The following example shows how to set a Scan
++          instance to return the rows beginning with "row".</para>
+         <programlisting language="java">
+ public static final byte[] CF = "cf".getBytes();
+ public static final byte[] ATTR = "attr".getBytes();
+@@ -584,8 +584,7 @@ HTable htable = ...      // instantiate HTable
+ 
+ Scan scan = new Scan();
+ scan.addColumn(CF, ATTR);
+-scan.setStartRow(Bytes.toBytes("row")); // start key is inclusive
+-scan.setStopRow(Bytes.toBytes("rox"));  // stop key is exclusive
++scan.addRowPrefixFilter(Bytes.toBytes("row"));
+ ResultScanner rs = htable.getScanner(scan);
+ try {
+   for (Result r = rs.next(); r != null; r = rs.next()) {

@@ -1,0 +1,1238 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerName.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerName.java
+deleted file mode 100644
+index eb9d00b..0000000
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ServerName.java
++++ /dev/null
+@@ -1,402 +0,0 @@
+-/**
+- *
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hbase;
+-
+-import java.io.Serializable;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.regex.Pattern;
+-
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-import org.apache.hadoop.hbase.classification.InterfaceStability;
+-import org.apache.hadoop.hbase.exceptions.DeserializationException;
+-import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+-import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
+-import org.apache.hadoop.hbase.util.Addressing;
+-import org.apache.hadoop.hbase.util.Bytes;
+-
+-import com.google.common.net.InetAddresses;
+-import com.google.protobuf.InvalidProtocolBufferException;
+-
+-/**
+- * Instance of an HBase ServerName.
+- * A server name is used uniquely identifying a server instance in a cluster and is made
+- * of the combination of hostname, port, and startcode.  The startcode distingushes restarted
+- * servers on same hostname and port (startcode is usually timestamp of server startup). The
+- * {@link #toString()} format of ServerName is safe to use in the  filesystem and as znode name
+- * up in ZooKeeper.  Its format is:
+- * <code>&lt;hostname> '{@link #SERVERNAME_SEPARATOR}' &lt;port> '{@link #SERVERNAME_SEPARATOR}' &lt;startcode></code>.
+- * For example, if hostname is <code>www.example.org</code>, port is <code>1234</code>,
+- * and the startcode for the regionserver is <code>1212121212</code>, then
+- * the {@link #toString()} would be <code>www.example.org,1234,1212121212</code>.
+- * 
+- * <p>You can obtain a versioned serialized form of this class by calling
+- * {@link #getVersionedBytes()}.  To deserialize, call {@link #parseVersionedServerName(byte[])}
+- * 
+- * <p>Immutable.
+- */
+-@InterfaceAudience.Public
+-@InterfaceStability.Evolving
+-public class ServerName implements Comparable<ServerName>, Serializable {
+-  private static final long serialVersionUID = 1367463982557264981L;
+-
+-  /**
+-   * Version for this class.
+-   * Its a short rather than a byte so I can for sure distinguish between this
+-   * version of this class and the version previous to this which did not have
+-   * a version.
+-   */
+-  private static final short VERSION = 0;
+-  static final byte [] VERSION_BYTES = Bytes.toBytes(VERSION);
+-
+-  /**
+-   * What to use if no startcode supplied.
+-   */
+-  public static final int NON_STARTCODE = -1;
+-
+-  /**
+-   * This character is used as separator between server hostname, port and
+-   * startcode.
+-   */
+-  public static final String SERVERNAME_SEPARATOR = ",";
+-
+-  public static final Pattern SERVERNAME_PATTERN =
+-    Pattern.compile("[^" + SERVERNAME_SEPARATOR + "]+" +
+-      SERVERNAME_SEPARATOR + Addressing.VALID_PORT_REGEX +
+-      SERVERNAME_SEPARATOR + Addressing.VALID_PORT_REGEX + "$");
+-
+-  /**
+-   * What to use if server name is unknown.
+-   */
+-  public static final String UNKNOWN_SERVERNAME = "#unknown#";
+-
+-  private final String servername;
+-  private final String hostnameOnly;
+-  private final int port;
+-  private final long startcode;
+-
+-  /**
+-   * Cached versioned bytes of this ServerName instance.
+-   * @see #getVersionedBytes()
+-   */
+-  private byte [] bytes;
+-  public static final List<ServerName> EMPTY_SERVER_LIST = new ArrayList<ServerName>(0);
+-
+-  private ServerName(final String hostname, final int port, final long startcode) {
+-    // Drop the domain is there is one; no need of it in a local cluster.  With it, we get long
+-    // unwieldy names.
+-    this.hostnameOnly = hostname;
+-    this.port = port;
+-    this.startcode = startcode;
+-    this.servername = getServerName(this.hostnameOnly, port, startcode);
+-  }
+-
+-  /**
+-   * @param hostname
+-   * @return hostname minus the domain, if there is one (will do pass-through on ip addresses)
+-   */
+-  static String getHostNameMinusDomain(final String hostname) {
+-    if (InetAddresses.isInetAddress(hostname)) return hostname;
+-    String [] parts = hostname.split("\\.");
+-    if (parts == null || parts.length == 0) return hostname;
+-    return parts[0];
+-  }
+-
+-  private ServerName(final String serverName) {
+-    this(parseHostname(serverName), parsePort(serverName),
+-      parseStartcode(serverName));
+-  }
+-
+-  private ServerName(final String hostAndPort, final long startCode) {
+-    this(Addressing.parseHostname(hostAndPort),
+-      Addressing.parsePort(hostAndPort), startCode);
+-  }
+-
+-  public static String parseHostname(final String serverName) {
+-    if (serverName == null || serverName.length() <= 0) {
+-      throw new IllegalArgumentException("Passed hostname is null or empty");
+-    }
+-    if (!Character.isLetterOrDigit(serverName.charAt(0))) {
+-      throw new IllegalArgumentException("Bad passed hostname, serverName=" + serverName);
+-    }
+-    int index = serverName.indexOf(SERVERNAME_SEPARATOR);
+-    return serverName.substring(0, index);
+-  }
+-
+-  public static int parsePort(final String serverName) {
+-    String [] split = serverName.split(SERVERNAME_SEPARATOR);
+-    return Integer.parseInt(split[1]);
+-  }
+-
+-  public static long parseStartcode(final String serverName) {
+-    int index = serverName.lastIndexOf(SERVERNAME_SEPARATOR);
+-    return Long.parseLong(serverName.substring(index + 1));
+-  }
+-
+-  /**
+-   * Retrieve an instance of ServerName.
+-   * Callers should use the equals method to compare returned instances, though we may return
+-   * a shared immutable object as an internal optimization.
+-   */
+-  public static ServerName valueOf(final String hostname, final int port, final long startcode) {
+-    return new ServerName(hostname, port, startcode);
+-  }
+-
+-  /**
+-   * Retrieve an instance of ServerName.
+-   * Callers should use the equals method to compare returned instances, though we may return
+-   * a shared immutable object as an internal optimization.
+-   */
+-  public static ServerName valueOf(final String serverName) {
+-    return new ServerName(serverName);
+-  }
+-
+-  /**
+-   * Retrieve an instance of ServerName.
+-   * Callers should use the equals method to compare returned instances, though we may return
+-   * a shared immutable object as an internal optimization.
+-   */
+-  public static ServerName valueOf(final String hostAndPort, final long startCode) {
+-    return new ServerName(hostAndPort, startCode);
+-  }
+-
+-  @Override
+-  public String toString() {
+-    return getServerName();
+-  }
+-
+-  /**
+-   * @return Return a SHORT version of {@link ServerName#toString()}, one that has the host only,
+-   * minus the domain, and the port only -- no start code; the String is for us internally mostly
+-   * tying threads to their server.  Not for external use.  It is lossy and will not work in
+-   * in compares, etc.
+-   */
+-  public String toShortString() {
+-    return Addressing.createHostAndPortStr(getHostNameMinusDomain(this.hostnameOnly), this.port);
+-  }
+-
+-  /**
+-   * @return {@link #getServerName()} as bytes with a short-sized prefix with
+-   * the ServerName#VERSION of this class.
+-   */
+-  public synchronized byte [] getVersionedBytes() {
+-    if (this.bytes == null) {
+-      this.bytes = Bytes.add(VERSION_BYTES, Bytes.toBytes(getServerName()));
+-    }
+-    return this.bytes;
+-  }
+-
+-  public String getServerName() {
+-    return servername;
+-  }
+-
+-  public String getHostname() {
+-    return hostnameOnly;
+-  }
+-
+-  public int getPort() {
+-    return port;
+-  }
+-
+-  public long getStartcode() {
+-    return startcode;
+-  }
+-
+-  /**
+-   * For internal use only.
+-   * @param hostName
+-   * @param port
+-   * @param startcode
+-   * @return Server name made of the concatenation of hostname, port and
+-   * startcode formatted as <code>&lt;hostname> ',' &lt;port> ',' &lt;startcode></code>
+-   */
+-  static String getServerName(String hostName, int port, long startcode) {
+-    final StringBuilder name = new StringBuilder(hostName.length() + 1 + 5 + 1 + 13);
+-    name.append(hostName);
+-    name.append(SERVERNAME_SEPARATOR);
+-    name.append(port);
+-    name.append(SERVERNAME_SEPARATOR);
+-    name.append(startcode);
+-    return name.toString();
+-  }
+-
+-  /**
+-   * @param hostAndPort String in form of &lt;hostname> ':' &lt;port>
+-   * @param startcode
+-   * @return Server name made of the concatenation of hostname, port and
+-   * startcode formatted as <code>&lt;hostname> ',' &lt;port> ',' &lt;startcode></code>
+-   */
+-  public static String getServerName(final String hostAndPort,
+-      final long startcode) {
+-    int index = hostAndPort.indexOf(":");
+-    if (index <= 0) throw new IllegalArgumentException("Expected <hostname> ':' <port>");
+-    return getServerName(hostAndPort.substring(0, index),
+-      Integer.parseInt(hostAndPort.substring(index + 1)), startcode);
+-  }
+-
+-  /**
+-   * @return Hostname and port formatted as described at
+-   * {@link Addressing#createHostAndPortStr(String, int)}
+-   */
+-  public String getHostAndPort() {
+-    return Addressing.createHostAndPortStr(this.hostnameOnly, this.port);
+-  }
+-
+-  /**
+-   * @param serverName ServerName in form specified by {@link #getServerName()}
+-   * @return The server start code parsed from <code>servername</code>
+-   */
+-  public static long getServerStartcodeFromServerName(final String serverName) {
+-    int index = serverName.lastIndexOf(SERVERNAME_SEPARATOR);
+-    return Long.parseLong(serverName.substring(index + 1));
+-  }
+-
+-  /**
+-   * Utility method to excise the start code from a server name
+-   * @param inServerName full server name
+-   * @return server name less its start code
+-   */
+-  public static String getServerNameLessStartCode(String inServerName) {
+-    if (inServerName != null && inServerName.length() > 0) {
+-      int index = inServerName.lastIndexOf(SERVERNAME_SEPARATOR);
+-      if (index > 0) {
+-        return inServerName.substring(0, index);
+-      }
+-    }
+-    return inServerName;
+-  }
+-
+-  @Override
+-  public int compareTo(ServerName other) {
+-    int compare = this.getHostname().compareToIgnoreCase(other.getHostname());
+-    if (compare != 0) return compare;
+-    compare = this.getPort() - other.getPort();
+-    if (compare != 0) return compare;
+-    return (int)(this.getStartcode() - other.getStartcode());
+-  }
+-
+-  @Override
+-  public int hashCode() {
+-    return getServerName().hashCode();
+-  }
+-
+-  @Override
+-  public boolean equals(Object o) {
+-    if (this == o) return true;
+-    if (o == null) return false;
+-    if (!(o instanceof ServerName)) return false;
+-    return this.compareTo((ServerName)o) == 0;
+-  }
+-
+-  /**
+-   * @param left
+-   * @param right
+-   * @return True if <code>other</code> has same hostname and port.
+-   */
+-  public static boolean isSameHostnameAndPort(final ServerName left,
+-      final ServerName right) {
+-    if (left == null) return false;
+-    if (right == null) return false;
+-    return left.getHostname().equals(right.getHostname()) &&
+-      left.getPort() == right.getPort();
+-  }
+-
+-  /**
+-   * Use this method instantiating a {@link ServerName} from bytes
+-   * gotten from a call to {@link #getVersionedBytes()}.  Will take care of the
+-   * case where bytes were written by an earlier version of hbase.
+-   * @param versionedBytes Pass bytes gotten from a call to {@link #getVersionedBytes()}
+-   * @return A ServerName instance.
+-   * @see #getVersionedBytes()
+-   */
+-  public static ServerName parseVersionedServerName(final byte [] versionedBytes) {
+-    // Version is a short.
+-    short version = Bytes.toShort(versionedBytes);
+-    if (version == VERSION) {
+-      int length = versionedBytes.length - Bytes.SIZEOF_SHORT;
+-      return valueOf(Bytes.toString(versionedBytes, Bytes.SIZEOF_SHORT, length));
+-    }
+-    // Presume the bytes were written with an old version of hbase and that the
+-    // bytes are actually a String of the form "'<hostname>' ':' '<port>'".
+-    return valueOf(Bytes.toString(versionedBytes), NON_STARTCODE);
+-  }
+-
+-  /**
+-   * @param str Either an instance of {@link ServerName#toString()} or a
+-   * "'<hostname>' ':' '<port>'".
+-   * @return A ServerName instance.
+-   */
+-  public static ServerName parseServerName(final String str) {
+-    return SERVERNAME_PATTERN.matcher(str).matches()? valueOf(str) :
+-        valueOf(str, NON_STARTCODE);
+-  }
+-
+-
+-  /**
+-   * @return true if the String follows the pattern of {@link ServerName#toString()}, false
+-   *  otherwise.
+-   */
+-  public static boolean isFullServerName(final String str){
+-    if (str == null ||str.isEmpty()) return false;
+-    return SERVERNAME_PATTERN.matcher(str).matches();
+-  }
+-
+-  /**
+-   * Get a ServerName from the passed in data bytes.
+-   * @param data Data with a serialize server name in it; can handle the old style
+-   * servername where servername was host and port.  Works too with data that
+-   * begins w/ the pb 'PBUF' magic and that is then followed by a protobuf that
+-   * has a serialized {@link ServerName} in it.
+-   * @return Returns null if <code>data</code> is null else converts passed data
+-   * to a ServerName instance.
+-   * @throws DeserializationException 
+-   */
+-  public static ServerName parseFrom(final byte [] data) throws DeserializationException {
+-    if (data == null || data.length <= 0) return null;
+-    if (ProtobufUtil.isPBMagicPrefix(data)) {
+-      int prefixLen = ProtobufUtil.lengthOfPBMagic();
+-      try {
+-        ZooKeeperProtos.Master rss =
+-          ZooKeeperProtos.Master.PARSER.parseFrom(data, prefixLen, data.length - prefixLen);
+-        org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ServerName sn = rss.getMaster();
+-        return valueOf(sn.getHostName(), sn.getPort(), sn.getStartCode());
+-      } catch (InvalidProtocolBufferException e) {
+-        // A failed parse of the znode is pretty catastrophic. Rather than loop
+-        // retrying hoping the bad bytes will changes, and rather than change
+-        // the signature on this method to add an IOE which will send ripples all
+-        // over the code base, throw a RuntimeException.  This should "never" happen.
+-        // Fail fast if it does.
+-        throw new DeserializationException(e);
+-      }
+-    }
+-    // The str returned could be old style -- pre hbase-1502 -- which was
+-    // hostname and port seperated by a colon rather than hostname, port and
+-    // startcode delimited by a ','.
+-    String str = Bytes.toString(data);
+-    int index = str.indexOf(ServerName.SERVERNAME_SEPARATOR);
+-    if (index != -1) {
+-      // Presume its ServerName serialized with versioned bytes.
+-      return ServerName.parseVersionedServerName(data);
+-    }
+-    // Presume it a hostname:port format.
+-    String hostname = Addressing.parseHostname(str);
+-    int port = Addressing.parsePort(str);
+-    return valueOf(hostname, port, -1L);
+-  }
+-}
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java
+deleted file mode 100644
+index 0ce0219..0000000
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java
++++ /dev/null
+@@ -1,43 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hbase.exceptions;
+-
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-
+-/**
+- * Failed deserialization.
+- */
+-@InterfaceAudience.Private
+-@SuppressWarnings("serial")
+-public class DeserializationException extends HBaseException {
+-  public DeserializationException() {
+-    super();
+-  }
+-
+-  public DeserializationException(final String message) {
+-    super(message);
+-  }
+-
+-  public DeserializationException(final String message, final Throwable t) {
+-    super(message, t);
+-  }
+-
+-  public DeserializationException(final Throwable t) {
+-    super(t);
+-  }
+-}
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java
+deleted file mode 100644
+index fe0d7d7..0000000
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hbase.exceptions;
+-
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-
+-/**
+- * Base checked exception in HBase.
+- * @see <a href="https://issues.apache.org/jira/browse/HBASE-5796">HBASE-5796</a>
+- */
+-@SuppressWarnings("serial")
+-@InterfaceAudience.Private
+-public class HBaseException extends Exception {
+-  public HBaseException() {
+-    super();
+-  }
+-
+-  public HBaseException(final String message) {
+-    super(message);
+-  }
+-
+-  public HBaseException(final String message, final Throwable t) {
+-    super(message, t);
+-  }
+-
+-  public HBaseException(final Throwable t) {
+-    super(t);
+-  }
+-}
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index 9c451b1..b6110ea 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -68,6 +68,7 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.filter.ByteArrayComparable;
+ import org.apache.hadoop.hbase.filter.Filter;
+ import org.apache.hadoop.hbase.io.TimeRange;
++import org.apache.hadoop.hbase.protobuf.CommonProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos;
+ import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos.AccessControlService;
+ import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
+@@ -172,6 +173,7 @@ public final class ProtobufUtil {
+   private final static Map<String, Class<?>>
+     PRIMITIVES = new HashMap<String, Class<?>>();
+ 
++  private static final String PB_MAGIC_STR = Bytes.toString(CommonProtobufUtil.PB_MAGIC);
+ 
+   /**
+    * Many results are simple: no cell, exists true or false. To save on object creations,
+@@ -241,14 +243,6 @@ public final class ProtobufUtil {
+   }
+ 
+   /**
+-   * Magic we put ahead of a serialized protobuf message.
+-   * For example, all znode content is protobuf messages with the below magic
+-   * for preamble.
+-   */
+-  public static final byte [] PB_MAGIC = new byte [] {'P', 'B', 'U', 'F'};
+-  private static final String PB_MAGIC_STR = Bytes.toString(PB_MAGIC);
+-
+-  /**
+    * Prepend the passed bytes with four bytes of magic, {@link #PB_MAGIC}, to flag what
+    * follows as a protobuf in hbase.  Prepend these bytes to all content written to znodes, etc.
+    * @param bytes Bytes to decorate
+@@ -256,7 +250,7 @@ public final class ProtobufUtil {
+    * byte array that is <code>bytes.length</code> plus {@link #PB_MAGIC}.length.
+    */
+   public static byte [] prependPBMagic(final byte [] bytes) {
+-    return Bytes.add(PB_MAGIC, bytes);
++    return Bytes.add(CommonProtobufUtil.PB_MAGIC, bytes);
+   }
+ 
+   /**
+@@ -273,8 +267,9 @@ public final class ProtobufUtil {
+    * @return True if passed <code>bytes</code> has {@link #PB_MAGIC} for a prefix.
+    */
+   public static boolean isPBMagicPrefix(final byte [] bytes, int offset, int len) {
+-    if (bytes == null || len < PB_MAGIC.length) return false;
+-    return Bytes.compareTo(PB_MAGIC, 0, PB_MAGIC.length, bytes, offset, PB_MAGIC.length) == 0;
++    if (bytes == null || len < CommonProtobufUtil.PB_MAGIC.length) return false;
++    return Bytes.compareTo(CommonProtobufUtil.PB_MAGIC, 0, CommonProtobufUtil.PB_MAGIC.length,
++      bytes, offset, CommonProtobufUtil.PB_MAGIC.length) == 0;
+   }
+ 
+   /**
+@@ -283,7 +278,8 @@ public final class ProtobufUtil {
+    */
+   public static void expectPBMagicPrefix(final byte [] bytes) throws DeserializationException {
+     if (!isPBMagicPrefix(bytes)) {
+-      throw new DeserializationException("Missing pb magic " + PB_MAGIC_STR + " prefix");
++      throw new DeserializationException("Missing pb magic " + PB_MAGIC_STR +
++        " prefix");
+     }
+   }
+ 
+@@ -291,7 +287,7 @@ public final class ProtobufUtil {
+    * @return Length of {@link #PB_MAGIC}
+    */
+   public static int lengthOfPBMagic() {
+-    return PB_MAGIC.length;
++    return CommonProtobufUtil.PB_MAGIC.length;
+   }
+ 
+   /**
+@@ -1883,7 +1879,7 @@ public final class ProtobufUtil {
+   public static byte [] toDelimitedByteArray(final Message m) throws IOException {
+     // Allocate arbitrary big size so we avoid resizing.
+     ByteArrayOutputStream baos = new ByteArrayOutputStream(4096);
+-    baos.write(PB_MAGIC);
++    baos.write(CommonProtobufUtil.PB_MAGIC);
+     m.writeDelimitedTo(baos);
+     return baos.toByteArray();
+   }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
+index 0ad81ae..092be15 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
+@@ -42,7 +42,7 @@ import org.apache.hadoop.hbase.filter.FilterList;
+ import org.apache.hadoop.hbase.filter.QualifierFilter;
+ import org.apache.hadoop.hbase.filter.RegexStringComparator;
+ import org.apache.hadoop.hbase.filter.RowFilter;
+-import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.protobuf.CommonProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.QuotaProtos.Quotas;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Strings;
+@@ -298,8 +298,8 @@ public class QuotaTableUtil {
+    *  Quotas protobuf helpers
+    */
+   protected static Quotas quotasFromData(final byte[] data) throws IOException {
+-    int magicLen = ProtobufUtil.lengthOfPBMagic();
+-    if (!ProtobufUtil.isPBMagicPrefix(data, 0, magicLen)) {
++    int magicLen = CommonProtobufUtil.lengthOfPBMagic();
++    if (!CommonProtobufUtil.isPBMagicPrefix(data, 0, magicLen)) {
+       throw new IOException("Missing pb magic prefix");
+     }
+     return Quotas.parseFrom(new ByteArrayInputStream(data, magicLen, data.length - magicLen));
+@@ -307,7 +307,7 @@ public class QuotaTableUtil {
+ 
+   protected static byte[] quotasToData(final Quotas data) throws IOException {
+     ByteArrayOutputStream stream = new ByteArrayOutputStream();
+-    stream.write(ProtobufUtil.PB_MAGIC);
++    stream.write(CommonProtobufUtil.PB_MAGIC);
+     data.writeTo(stream);
+     return stream.toByteArray();
+   }
+diff --git a/hbase-common/pom.xml b/hbase-common/pom.xml
+index 8a25cd4..49dd638 100644
+--- a/hbase-common/pom.xml
++++ b/hbase-common/pom.xml
+@@ -202,6 +202,10 @@
+     </dependency>
+     <dependency>
+       <groupId>org.apache.hbase</groupId>
++      <artifactId>hbase-protocol</artifactId>
++    </dependency>
++    <dependency>
++      <groupId>org.apache.hbase</groupId>
+       <artifactId>hbase-annotations</artifactId>
+       <type>test-jar</type>
+       <scope>test</scope>
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+index f938020..9ff1dc7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+@@ -55,6 +55,7 @@ import org.apache.hadoop.hbase.fs.HFileSystem;
+ import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+ import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
++import org.apache.hadoop.hbase.protobuf.CommonProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.BytesBytesPair;
+@@ -668,7 +669,7 @@ public class HFile {
+         bbpBuilder.setSecond(ByteStringer.wrap(e.getValue()));
+         builder.addMapEntry(bbpBuilder.build());
+       }
+-      out.write(ProtobufUtil.PB_MAGIC);
++      out.write(CommonProtobufUtil.PB_MAGIC);
+       builder.build().writeDelimitedTo(out);
+     }
+ 
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/ServerName.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/ServerName.java
+new file mode 100644
+index 0000000..360f0fe
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/ServerName.java
+@@ -0,0 +1,402 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase;
++
++import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.regex.Pattern;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.classification.InterfaceStability;
++import org.apache.hadoop.hbase.exceptions.DeserializationException;
++import org.apache.hadoop.hbase.protobuf.CommonProtobufUtil;
++import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
++import org.apache.hadoop.hbase.util.Addressing;
++import org.apache.hadoop.hbase.util.Bytes;
++
++import com.google.common.net.InetAddresses;
++import com.google.protobuf.InvalidProtocolBufferException;
++
++/**
++ * Instance of an HBase ServerName.
++ * A server name is used uniquely identifying a server instance in a cluster and is made
++ * of the combination of hostname, port, and startcode.  The startcode distingushes restarted
++ * servers on same hostname and port (startcode is usually timestamp of server startup). The
++ * {@link #toString()} format of ServerName is safe to use in the  filesystem and as znode name
++ * up in ZooKeeper.  Its format is:
++ * <code>&lt;hostname> '{@link #SERVERNAME_SEPARATOR}' &lt;port> '{@link #SERVERNAME_SEPARATOR}' &lt;startcode></code>.
++ * For example, if hostname is <code>www.example.org</code>, port is <code>1234</code>,
++ * and the startcode for the regionserver is <code>1212121212</code>, then
++ * the {@link #toString()} would be <code>www.example.org,1234,1212121212</code>.
++ * 
++ * <p>You can obtain a versioned serialized form of this class by calling
++ * {@link #getVersionedBytes()}.  To deserialize, call {@link #parseVersionedServerName(byte[])}
++ * 
++ * <p>Immutable.
++ */
++@InterfaceAudience.Public
++@InterfaceStability.Evolving
++public class ServerName implements Comparable<ServerName>, Serializable {
++  private static final long serialVersionUID = 1367463982557264981L;
++
++  /**
++   * Version for this class.
++   * Its a short rather than a byte so I can for sure distinguish between this
++   * version of this class and the version previous to this which did not have
++   * a version.
++   */
++  private static final short VERSION = 0;
++  static final byte [] VERSION_BYTES = Bytes.toBytes(VERSION);
++
++  /**
++   * What to use if no startcode supplied.
++   */
++  public static final int NON_STARTCODE = -1;
++
++  /**
++   * This character is used as separator between server hostname, port and
++   * startcode.
++   */
++  public static final String SERVERNAME_SEPARATOR = ",";
++
++  public static final Pattern SERVERNAME_PATTERN =
++    Pattern.compile("[^" + SERVERNAME_SEPARATOR + "]+" +
++      SERVERNAME_SEPARATOR + Addressing.VALID_PORT_REGEX +
++      SERVERNAME_SEPARATOR + Addressing.VALID_PORT_REGEX + "$");
++
++  /**
++   * What to use if server name is unknown.
++   */
++  public static final String UNKNOWN_SERVERNAME = "#unknown#";
++
++  private final String servername;
++  private final String hostnameOnly;
++  private final int port;
++  private final long startcode;
++
++  /**
++   * Cached versioned bytes of this ServerName instance.
++   * @see #getVersionedBytes()
++   */
++  private byte [] bytes;
++  public static final List<ServerName> EMPTY_SERVER_LIST = new ArrayList<ServerName>(0);
++
++  private ServerName(final String hostname, final int port, final long startcode) {
++    // Drop the domain is there is one; no need of it in a local cluster.  With it, we get long
++    // unwieldy names.
++    this.hostnameOnly = hostname;
++    this.port = port;
++    this.startcode = startcode;
++    this.servername = getServerName(this.hostnameOnly, port, startcode);
++  }
++
++  /**
++   * @param hostname
++   * @return hostname minus the domain, if there is one (will do pass-through on ip addresses)
++   */
++  static String getHostNameMinusDomain(final String hostname) {
++    if (InetAddresses.isInetAddress(hostname)) return hostname;
++    String [] parts = hostname.split("\\.");
++    if (parts == null || parts.length == 0) return hostname;
++    return parts[0];
++  }
++
++  private ServerName(final String serverName) {
++    this(parseHostname(serverName), parsePort(serverName),
++      parseStartcode(serverName));
++  }
++
++  private ServerName(final String hostAndPort, final long startCode) {
++    this(Addressing.parseHostname(hostAndPort),
++      Addressing.parsePort(hostAndPort), startCode);
++  }
++
++  public static String parseHostname(final String serverName) {
++    if (serverName == null || serverName.length() <= 0) {
++      throw new IllegalArgumentException("Passed hostname is null or empty");
++    }
++    if (!Character.isLetterOrDigit(serverName.charAt(0))) {
++      throw new IllegalArgumentException("Bad passed hostname, serverName=" + serverName);
++    }
++    int index = serverName.indexOf(SERVERNAME_SEPARATOR);
++    return serverName.substring(0, index);
++  }
++
++  public static int parsePort(final String serverName) {
++    String [] split = serverName.split(SERVERNAME_SEPARATOR);
++    return Integer.parseInt(split[1]);
++  }
++
++  public static long parseStartcode(final String serverName) {
++    int index = serverName.lastIndexOf(SERVERNAME_SEPARATOR);
++    return Long.parseLong(serverName.substring(index + 1));
++  }
++
++  /**
++   * Retrieve an instance of ServerName.
++   * Callers should use the equals method to compare returned instances, though we may return
++   * a shared immutable object as an internal optimization.
++   */
++  public static ServerName valueOf(final String hostname, final int port, final long startcode) {
++    return new ServerName(hostname, port, startcode);
++  }
++
++  /**
++   * Retrieve an instance of ServerName.
++   * Callers should use the equals method to compare returned instances, though we may return
++   * a shared immutable object as an internal optimization.
++   */
++  public static ServerName valueOf(final String serverName) {
++    return new ServerName(serverName);
++  }
++
++  /**
++   * Retrieve an instance of ServerName.
++   * Callers should use the equals method to compare returned instances, though we may return
++   * a shared immutable object as an internal optimization.
++   */
++  public static ServerName valueOf(final String hostAndPort, final long startCode) {
++    return new ServerName(hostAndPort, startCode);
++  }
++
++  @Override
++  public String toString() {
++    return getServerName();
++  }
++
++  /**
++   * @return Return a SHORT version of {@link ServerName#toString()}, one that has the host only,
++   * minus the domain, and the port only -- no start code; the String is for us internally mostly
++   * tying threads to their server.  Not for external use.  It is lossy and will not work in
++   * in compares, etc.
++   */
++  public String toShortString() {
++    return Addressing.createHostAndPortStr(getHostNameMinusDomain(this.hostnameOnly), this.port);
++  }
++
++  /**
++   * @return {@link #getServerName()} as bytes with a short-sized prefix with
++   * the ServerName#VERSION of this class.
++   */
++  public synchronized byte [] getVersionedBytes() {
++    if (this.bytes == null) {
++      this.bytes = Bytes.add(VERSION_BYTES, Bytes.toBytes(getServerName()));
++    }
++    return this.bytes;
++  }
++
++  public String getServerName() {
++    return servername;
++  }
++
++  public String getHostname() {
++    return hostnameOnly;
++  }
++
++  public int getPort() {
++    return port;
++  }
++
++  public long getStartcode() {
++    return startcode;
++  }
++
++  /**
++   * For internal use only.
++   * @param hostName
++   * @param port
++   * @param startcode
++   * @return Server name made of the concatenation of hostname, port and
++   * startcode formatted as <code>&lt;hostname> ',' &lt;port> ',' &lt;startcode></code>
++   */
++  static String getServerName(String hostName, int port, long startcode) {
++    final StringBuilder name = new StringBuilder(hostName.length() + 1 + 5 + 1 + 13);
++    name.append(hostName);
++    name.append(SERVERNAME_SEPARATOR);
++    name.append(port);
++    name.append(SERVERNAME_SEPARATOR);
++    name.append(startcode);
++    return name.toString();
++  }
++
++  /**
++   * @param hostAndPort String in form of &lt;hostname> ':' &lt;port>
++   * @param startcode
++   * @return Server name made of the concatenation of hostname, port and
++   * startcode formatted as <code>&lt;hostname> ',' &lt;port> ',' &lt;startcode></code>
++   */
++  public static String getServerName(final String hostAndPort,
++      final long startcode) {
++    int index = hostAndPort.indexOf(":");
++    if (index <= 0) throw new IllegalArgumentException("Expected <hostname> ':' <port>");
++    return getServerName(hostAndPort.substring(0, index),
++      Integer.parseInt(hostAndPort.substring(index + 1)), startcode);
++  }
++
++  /**
++   * @return Hostname and port formatted as described at
++   * {@link Addressing#createHostAndPortStr(String, int)}
++   */
++  public String getHostAndPort() {
++    return Addressing.createHostAndPortStr(this.hostnameOnly, this.port);
++  }
++
++  /**
++   * @param serverName ServerName in form specified by {@link #getServerName()}
++   * @return The server start code parsed from <code>servername</code>
++   */
++  public static long getServerStartcodeFromServerName(final String serverName) {
++    int index = serverName.lastIndexOf(SERVERNAME_SEPARATOR);
++    return Long.parseLong(serverName.substring(index + 1));
++  }
++
++  /**
++   * Utility method to excise the start code from a server name
++   * @param inServerName full server name
++   * @return server name less its start code
++   */
++  public static String getServerNameLessStartCode(String inServerName) {
++    if (inServerName != null && inServerName.length() > 0) {
++      int index = inServerName.lastIndexOf(SERVERNAME_SEPARATOR);
++      if (index > 0) {
++        return inServerName.substring(0, index);
++      }
++    }
++    return inServerName;
++  }
++
++  @Override
++  public int compareTo(ServerName other) {
++    int compare = this.getHostname().compareToIgnoreCase(other.getHostname());
++    if (compare != 0) return compare;
++    compare = this.getPort() - other.getPort();
++    if (compare != 0) return compare;
++    return (int)(this.getStartcode() - other.getStartcode());
++  }
++
++  @Override
++  public int hashCode() {
++    return getServerName().hashCode();
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (o == null) return false;
++    if (!(o instanceof ServerName)) return false;
++    return this.compareTo((ServerName)o) == 0;
++  }
++
++  /**
++   * @param left
++   * @param right
++   * @return True if <code>other</code> has same hostname and port.
++   */
++  public static boolean isSameHostnameAndPort(final ServerName left,
++      final ServerName right) {
++    if (left == null) return false;
++    if (right == null) return false;
++    return left.getHostname().equals(right.getHostname()) &&
++      left.getPort() == right.getPort();
++  }
++
++  /**
++   * Use this method instantiating a {@link ServerName} from bytes
++   * gotten from a call to {@link #getVersionedBytes()}.  Will take care of the
++   * case where bytes were written by an earlier version of hbase.
++   * @param versionedBytes Pass bytes gotten from a call to {@link #getVersionedBytes()}
++   * @return A ServerName instance.
++   * @see #getVersionedBytes()
++   */
++  public static ServerName parseVersionedServerName(final byte [] versionedBytes) {
++    // Version is a short.
++    short version = Bytes.toShort(versionedBytes);
++    if (version == VERSION) {
++      int length = versionedBytes.length - Bytes.SIZEOF_SHORT;
++      return valueOf(Bytes.toString(versionedBytes, Bytes.SIZEOF_SHORT, length));
++    }
++    // Presume the bytes were written with an old version of hbase and that the
++    // bytes are actually a String of the form "'<hostname>' ':' '<port>'".
++    return valueOf(Bytes.toString(versionedBytes), NON_STARTCODE);
++  }
++
++  /**
++   * @param str Either an instance of {@link ServerName#toString()} or a
++   * "'<hostname>' ':' '<port>'".
++   * @return A ServerName instance.
++   */
++  public static ServerName parseServerName(final String str) {
++    return SERVERNAME_PATTERN.matcher(str).matches()? valueOf(str) :
++        valueOf(str, NON_STARTCODE);
++  }
++
++
++  /**
++   * @return true if the String follows the pattern of {@link ServerName#toString()}, false
++   *  otherwise.
++   */
++  public static boolean isFullServerName(final String str){
++    if (str == null ||str.isEmpty()) return false;
++    return SERVERNAME_PATTERN.matcher(str).matches();
++  }
++
++  /**
++   * Get a ServerName from the passed in data bytes.
++   * @param data Data with a serialize server name in it; can handle the old style
++   * servername where servername was host and port.  Works too with data that
++   * begins w/ the pb 'PBUF' magic and that is then followed by a protobuf that
++   * has a serialized {@link ServerName} in it.
++   * @return Returns null if <code>data</code> is null else converts passed data
++   * to a ServerName instance.
++   * @throws DeserializationException 
++   */
++  public static ServerName parseFrom(final byte [] data) throws DeserializationException {
++    if (data == null || data.length <= 0) return null;
++    if (CommonProtobufUtil.isPBMagicPrefix(data)) {
++      int prefixLen = CommonProtobufUtil.lengthOfPBMagic();
++      try {
++        ZooKeeperProtos.Master rss =
++          ZooKeeperProtos.Master.PARSER.parseFrom(data, prefixLen, data.length - prefixLen);
++        org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ServerName sn = rss.getMaster();
++        return valueOf(sn.getHostName(), sn.getPort(), sn.getStartCode());
++      } catch (InvalidProtocolBufferException e) {
++        // A failed parse of the znode is pretty catastrophic. Rather than loop
++        // retrying hoping the bad bytes will changes, and rather than change
++        // the signature on this method to add an IOE which will send ripples all
++        // over the code base, throw a RuntimeException.  This should "never" happen.
++        // Fail fast if it does.
++        throw new DeserializationException(e);
++      }
++    }
++    // The str returned could be old style -- pre hbase-1502 -- which was
++    // hostname and port seperated by a colon rather than hostname, port and
++    // startcode delimited by a ','.
++    String str = Bytes.toString(data);
++    int index = str.indexOf(ServerName.SERVERNAME_SEPARATOR);
++    if (index != -1) {
++      // Presume its ServerName serialized with versioned bytes.
++      return ServerName.parseVersionedServerName(data);
++    }
++    // Presume it a hostname:port format.
++    String hostname = Addressing.parseHostname(str);
++    int port = Addressing.parsePort(str);
++    return valueOf(hostname, port, -1L);
++  }
++}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java
+new file mode 100644
+index 0000000..0ce0219
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/DeserializationException.java
+@@ -0,0 +1,43 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.exceptions;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * Failed deserialization.
++ */
++@InterfaceAudience.Private
++@SuppressWarnings("serial")
++public class DeserializationException extends HBaseException {
++  public DeserializationException() {
++    super();
++  }
++
++  public DeserializationException(final String message) {
++    super(message);
++  }
++
++  public DeserializationException(final String message, final Throwable t) {
++    super(message, t);
++  }
++
++  public DeserializationException(final Throwable t) {
++    super(t);
++  }
++}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java
+new file mode 100644
+index 0000000..fe0d7d7
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/exceptions/HBaseException.java
+@@ -0,0 +1,44 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.exceptions;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * Base checked exception in HBase.
++ * @see <a href="https://issues.apache.org/jira/browse/HBASE-5796">HBASE-5796</a>
++ */
++@SuppressWarnings("serial")
++@InterfaceAudience.Private
++public class HBaseException extends Exception {
++  public HBaseException() {
++    super();
++  }
++
++  public HBaseException(final String message) {
++    super(message);
++  }
++
++  public HBaseException(final String message, final Throwable t) {
++    super(message, t);
++  }
++
++  public HBaseException(final Throwable t) {
++    super(t);
++  }
++}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/protobuf/CommonProtobufUtil.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/protobuf/CommonProtobufUtil.java
+new file mode 100644
+index 0000000..2e946f9
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/protobuf/CommonProtobufUtil.java
+@@ -0,0 +1,65 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.protobuf;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.util.Bytes;
++
++/**
++ * Protobufs utility.
++ */
++@edu.umd.cs.findbugs.annotations.SuppressWarnings(value="DP_CREATE_CLASSLOADER_INSIDE_DO_PRIVILEGED",
++  justification="None. Address sometime.")
++@InterfaceAudience.Private // TODO: some clients (Hive, etc) use this class
++public class CommonProtobufUtil {
++
++  private CommonProtobufUtil() {
++  }
++
++  /**
++   * Magic we put ahead of a serialized protobuf message.
++   * For example, all znode content is protobuf messages with the below magic
++   * for preamble.
++   */
++  public static final byte [] PB_MAGIC = new byte [] {'P', 'B', 'U', 'F'};
++
++  /**
++   * @param bytes Bytes to check.
++   * @return True if passed <code>bytes</code> has {@link #PB_MAGIC} for a prefix.
++   */
++  public static boolean isPBMagicPrefix(final byte [] bytes) {
++    if (bytes == null) return false;
++    return isPBMagicPrefix(bytes, 0, bytes.length);
++  }
++
++  /**
++   * @param bytes Bytes to check.
++   * @return True if passed <code>bytes</code> has {@link #PB_MAGIC} for a prefix.
++   */
++  public static boolean isPBMagicPrefix(final byte [] bytes, int offset, int len) {
++    if (bytes == null || len < PB_MAGIC.length) return false;
++    return Bytes.compareTo(PB_MAGIC, 0, PB_MAGIC.length, bytes, offset, PB_MAGIC.length) == 0;
++  }
++
++  /**
++   * @return Length of {@link #PB_MAGIC}
++   */
++  public static int lengthOfPBMagic() {
++    return PB_MAGIC.length;
++  }
++}

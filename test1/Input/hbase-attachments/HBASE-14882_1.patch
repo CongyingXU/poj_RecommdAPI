@@ -1,0 +1,233 @@
+From dadb8e7cb0010c5106f981703c654c26694861a2 Mon Sep 17 00:00:00 2001
+From: Xiang Li <waterlx@gmail.com>
+Date: Fri, 12 Aug 2016 20:29:20 +0800
+Subject: [PATCH] HBASE-14882: Provide a Put API that adds the provided family,
+ qualifier, value without copying
+
+---
+ .../java/org/apache/hadoop/hbase/client/Put.java   | 129 ++++++++++++++++++++-
+ .../org/apache/hadoop/hbase/client/TestPut.java    |  42 +++++++
+ .../java/org/apache/hadoop/hbase/HConstants.java   |   5 +
+ 3 files changed, 173 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
+index dbaf3a7..d4c7d8a 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
+@@ -225,13 +225,136 @@ public class Put extends Mutation implements HeapSize, Comparable<Row> {
+    * that the underlying arrays won't change. It's intended
+    * for usage internal HBase to and for advanced client applications.
+    */
+-  public Put addImmutable(byte [] family, byte [] qualifier, long ts, byte [] value) {
++  public Put addImmutable(final byte [] family, final byte [] qualifier, final long ts, final byte [] value) {
++    // Check family
++    if (family == null || family.length == 0 || family.length > HConstants.MAX_FAMILY_LENGTH) {
++      throw new IllegalArgumentException("Family cannot be null. " +
++        "And its length cannot be 0 or greater than " + HConstants.MAX_FAMILY_LENGTH);
++    }
++
++    // Check qualifier
++    if (qualifier == null) {
++      throw new IllegalArgumentException("Qualifier is null");
++    }
++    // As array.length returns int , qualifier.length can not be greater than Integer.MAX_VALUE,
++    // so it is safe that Cell.getQualifierLength() returns int. Do not need to check here.
++
++    // Check value
++    if (value == null) {
++      throw new IllegalArgumentException("Value is null");
++    }
++    // As array.length returns int, value.length can not be greater than Integer.MAX_VALUE,
++    // so it is safe that Cell.getValueLength() returns int. Do not need to check here.
++
++    // Check timestamp
+     if (ts < 0) {
+       throw new IllegalArgumentException("Timestamp cannot be negative. ts=" + ts);
+     }
++
+     List<Cell> list = getCellList(family);
+-    KeyValue kv = createPutKeyValue(family, qualifier, ts, value);
+-    list.add(kv);
++    list.add(new Cell() {
++      // 1) Row
++      @Override
++      public byte[] getRowArray() {
++        return row;
++      }
++
++      @Override
++      public int getRowOffset() {
++        return 0;
++      }
++
++      @Override
++      public short getRowLength() {
++        // row.length is checked by Mutation.checkRow() in the constructor of Put,
++        // so it is safe to make the type conversion.
++        return (short)(row.length);
++      }
++
++      // 2) Family
++      @Override
++      public byte[] getFamilyArray() {
++        return family;
++      }
++
++      @Override
++      public int getFamilyOffset() {
++        return 0;
++      }
++
++      @Override
++      public byte getFamilyLength() {
++        // family.length is checked at the beginning of this function,
++        // so it is safe to make the type conversion.
++        return (byte)(family.length);
++      }
++
++      // 3) Qualifier
++      @Override
++      public byte[] getQualifierArray() {
++        return qualifier;
++      }
++
++      @Override
++      public int getQualifierOffset() {
++        return 0;
++      }
++
++      @Override
++      public int getQualifierLength() {
++        return qualifier.length;
++      }
++
++      // 4) Timestamp
++      @Override
++      public long getTimestamp() {
++        return ts;
++      }
++
++      //5) Type
++      @Override
++      public byte getTypeByte() {
++        return KeyValue.Type.Put.getCode();
++      }
++
++      //6) SequenceId
++      @Override
++      public long getSequenceId() {
++        return 0L;
++      }
++
++      //7) Value
++      @Override
++      public byte[] getValueArray() {
++        return value;
++      }
++
++      @Override
++      public int getValueOffset() {
++        return 0;
++      }
++
++      @Override
++      public int getValueLength() {
++        return value.length;
++      }
++
++      // 8) Tags
++      @Override
++      public byte[] getTagsArray() {
++        return HConstants.EMPTY_BYTE_ARRAY;
++      }
++
++      @Override
++      public int getTagsOffset() {
++        return 0;
++      }
++
++      @Override
++      public int getTagsLength() {
++        return 0;
++      }
++    });
+     familyMap.put(family, list);
+     return this;
+   }
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
+index 8603fe1..12cc611 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
+@@ -20,6 +20,8 @@
+ package org.apache.hadoop.hbase.client;
+ 
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.Cell;
++
+ import org.junit.Test;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotEquals;
+@@ -56,4 +58,44 @@ public class TestPut {
+     Put putRowIsNotImmutable = new Put(rowKey, 1000L, false);
+     assertTrue(rowKey != putRowIsNotImmutable.getRow());  // A local copy is made
+   }
++
++  // HBASE-14882
++  @Test
++  public void testAddImmutable() {
++    byte[] row        = Bytes.toBytes("immutable-row");
++    byte[] family     = Bytes.toBytes("immutable-family");
++
++    byte[] qualifier0 = Bytes.toBytes("immutable-qualifier-0");
++    byte[] value0     = Bytes.toBytes("immutable-value-0");
++
++    byte[] qualifier1 = Bytes.toBytes("immutable-qualifier-1");
++    byte[] value1     = Bytes.toBytes("immutable-value-1");
++    long   ts1        = 5000L;
++
++    Put put = new Put(row, true);
++    put.addImmutable(family, qualifier0, value0);
++    put.addImmutable(family, qualifier1, ts1, value1);
++
++    // Verify the first cell in the list
++    Cell cell0 = put.getCellList(family).get(0);
++
++    // Verify no local copy is made for family, qualifier and value
++    assertTrue(cell0.getFamilyArray()    == family);
++    assertTrue(cell0.getQualifierArray() == qualifier0);
++    assertTrue(cell0.getValueArray()     == value0);
++
++    // Verify timestamp
++    assertTrue(cell0.getTimestamp()      == put.getTimeStamp());
++
++    // verify the second cell in the list
++    Cell cell1 = put.getCellList(family).get(1);
++
++    // Verify no local copy is made for family, qualifier and value
++    assertTrue(cell0.getFamilyArray()    == family);
++    assertTrue(cell1.getQualifierArray() == qualifier1);
++    assertTrue(cell1.getValueArray()     == value1);
++
++    // Verify timestamp
++    assertTrue(cell1.getTimestamp()      == ts1);
++  }
+ }
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 4c499a2..0cf0ef4 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -550,6 +550,11 @@ public final class HConstants {
+   public static final int MAX_ROW_LENGTH = Short.MAX_VALUE;
+ 
+   /**
++   * Max length of column family
++   */
++  public static final int MAX_FAMILY_LENGTH = Byte.MAX_VALUE;
++
++  /**
+    * Timestamp to use when we want to refer to the latest cell.
+    * This is the timestamp sent by clients when no timestamp is specified on
+    * commit.
+-- 
+2.7.4 (Apple Git-66)
+

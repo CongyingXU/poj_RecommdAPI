@@ -1,0 +1,1593 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupAdminImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupAdminImpl.java
+index b73e576..32d176c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupAdminImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupAdminImpl.java
+@@ -217,6 +217,30 @@ public class BackupAdminImpl implements BackupAdmin {
+         }
+       }
+       LOG.debug("Delete backup info "+ backupInfo.getBackupId());
++      Map<byte[], String> map = sysTable.readBulkLoadedFiles(backupId);
++      FileSystem fs = FileSystem.get(conn.getConfiguration());
++      boolean succ = true;
++      int numDeleted = 0;
++      for (String f : map.values()) {
++        Path p = new Path(f);
++        try {
++          if (!fs.delete(p)) {
++            if (fs.exists(p)) {
++              LOG.warn(f + " was not deleted");
++              succ = false;
++            }
++          } else {
++            numDeleted++;
++          }
++        } catch (IOException ioe) {
++          LOG.warn(f + " was not deleted", ioe);
++          succ = false;
++        }
++      }
++      LOG.debug(numDeleted + " bulk loaded files out of " + map.size() + " were deleted");
++      if (succ) {
++        sysTable.deleteBulkLoadedFiles(map);
++      }
+ 
+       sysTable.deleteBackupInfo(backupInfo.getBackupId());
+       LOG.info("Delete backup " + backupInfo.getBackupId() + " completed.");
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupManager.java
+index ece07b9..67d0db5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupManager.java
+@@ -24,6 +24,7 @@ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+@@ -390,6 +391,20 @@ public class BackupManager implements Closeable {
+     systemTable.writeBackupStartCode(startCode, backupContext.getTargetRootDir());
+   }
+ 
++  public Map<TableName, Map<String, Map<String, List<String>>>> readOrigBulkloadRows(
++      List<TableName> tableList) throws IOException {
++    return systemTable.readOrigBulkloadRows(tableList);
++  }
++
++  public void removeOrigBulkLoadedRows(List<TableName> lst) throws IOException {
++    systemTable.removeOrigBulkLoadedRows(lst);
++  }
++
++  public void writeBulkLoadedFiles(List<TableName> sTableList, Map<byte[], List<Path>>[] maps)
++      throws IOException {
++    systemTable.writeBulkLoadedFiles(sTableList, maps, backupContext.getBackupId());
++  }
++
+   /**
+    * Get the RS log information after the last log roll from hbase:backup.
+    * @return RS log info
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTable.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTable.java
+index 381cc0f..62b7bff 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTable.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTable.java
+@@ -26,6 +26,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Set;
++import java.util.TreeMap;
+ import java.util.TreeSet;
+ 
+ import org.apache.commons.lang.StringUtils;
+@@ -34,6 +35,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellComparator;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+@@ -43,6 +45,7 @@ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.backup.BackupInfo;
+ import org.apache.hadoop.hbase.backup.BackupInfo.BackupState;
+ import org.apache.hadoop.hbase.backup.BackupRestoreConstants;
++import org.apache.hadoop.hbase.backup.BackupType;
+ import org.apache.hadoop.hbase.backup.util.BackupClientUtil;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+@@ -57,6 +60,8 @@ import org.apache.hadoop.hbase.client.Table;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.BackupProtos;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ /**
+  * This class provides 'hbase:backup' table API
+@@ -102,6 +107,7 @@ public final class BackupSystemTable implements Closeable {
+   final static byte[] SESSIONS_FAMILY = "session".getBytes();
+   // Stores other meta
+   final static byte[] META_FAMILY = "meta".getBytes();
++  final static byte[] BULK_LOAD_FAMILY = "bulk".getBytes();
+   // Connection to HBase cluster, shared
+   // among all instances
+   private final Connection connection;
+@@ -197,6 +203,95 @@ public final class BackupSystemTable implements Closeable {
+     }
+   }
+ 
++  /*
++   * @param backupId the backup Id
++   * @return Map of rows to path of bulk loaded hfile
++   */
++  Map<byte[], String> readBulkLoadedFiles(String backupId) throws IOException {
++    Scan scan = BackupSystemTableHelper.createScanForBulkLoadedFiles(backupId);
++    try (Table table = connection.getTable(tableName);
++        ResultScanner scanner = table.getScanner(scan)) {
++      Result res = null;
++      Map<byte[], String> map = new TreeMap<>(Bytes.BYTES_COMPARATOR);
++      while ((res = scanner.next()) != null) {
++        res.advance();
++        byte[] row = CellUtil.cloneRow(res.listCells().get(0));
++        for (Cell cell : res.listCells()) {
++          if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.PATH_COL, 0,
++              BackupSystemTableHelper.PATH_COL.length) == 0) {
++            map.put(row, Bytes.toString(CellUtil.cloneValue(cell)));
++          }
++        }
++      }
++      return map;
++    }
++  }
++
++  /*
++   * Used during restore
++   * @param backupId the backup Id
++   * @param sTableList List of tables
++   * @return array of Map of family to List of Paths
++   */
++  public Map<byte[], List<Path>>[] readBulkLoadedFiles(String backupId, List<TableName> sTableList)
++      throws IOException {
++    Scan scan = BackupSystemTableHelper.createScanForBulkLoadedFiles(backupId);
++    Map<byte[], List<Path>>[] mapForSrc = new Map[sTableList == null ? 1 : sTableList.size()];
++    try (Table table = connection.getTable(tableName);
++        ResultScanner scanner = table.getScanner(scan)) {
++      Result res = null;
++      while ((res = scanner.next()) != null) {
++        res.advance();
++        TableName tbl = null;
++        byte[] fam = null;
++        String path = null;
++        for (Cell cell : res.listCells()) {
++          if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.TBL_COL, 0,
++              BackupSystemTableHelper.TBL_COL.length) == 0) {
++            tbl = TableName.valueOf(CellUtil.cloneValue(cell));
++          } else if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.FAM_COL, 0,
++              BackupSystemTableHelper.FAM_COL.length) == 0) {
++            fam = CellUtil.cloneValue(cell);
++          } else if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.PATH_COL, 0,
++              BackupSystemTableHelper.PATH_COL.length) == 0) {
++            path = Bytes.toString(CellUtil.cloneValue(cell));
++          }
++        }
++        int srcIdx = IncrementalTableBackupClient.getIndex(tbl, sTableList);
++        if (srcIdx == -1) {
++          // the table is not among the query
++          continue;
++        }
++        if (mapForSrc[srcIdx] == null) {
++          mapForSrc[srcIdx] = new TreeMap<>(Bytes.BYTES_COMPARATOR);
++        }
++        List<Path> files;
++        if (!mapForSrc[srcIdx].containsKey(fam)) {
++          files = new ArrayList<Path>();
++          mapForSrc[srcIdx].put(fam, files);
++        } else {
++          files = mapForSrc[srcIdx].get(fam);
++        }
++        files.add(new Path(path));
++        LOG.debug("found bulk loaded file : " + tbl + " " +  Bytes.toString(fam) + " " + path);
++      };
++      return mapForSrc;
++    }
++  }
++
++  /*
++   * @param map Map of row keys to path of bulk loaded hfile
++   */
++  void deleteBulkLoadedFiles(Map<byte[], String> map) throws IOException {
++    try (Table table = connection.getTable(tableName)) {
++      List<Delete> dels = new ArrayList<>();
++      for (byte[] row : map.keySet()) {
++        dels.add(new Delete(row).addFamily(BackupSystemTable.META_FAMILY));
++      }
++      table.delete(dels);
++    }
++  }
++
+   /**
+    * Write the start code (timestamp) to hbase:backup. If passed in null, then write 0 byte.
+    * @param startCode start code
+@@ -213,6 +308,103 @@ public final class BackupSystemTable implements Closeable {
+     }
+   }
+ 
++  public void writeOrigBulkLoad(TableName tabName, byte[] region,
++      List<Pair<byte[], String>> stagingFamilyPaths) throws IOException {
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("write bulk load descriptor to hbase:backup " + tabName + " with " +
++          stagingFamilyPaths.size() + " entries");
++    }
++    try (Table table = connection.getTable(tableName)) {
++      List<Put> puts = BackupSystemTableHelper.createPutForOrigBulkload(tabName, region,
++          stagingFamilyPaths);
++      table.put(puts);
++      LOG.debug("written " + puts.size() + " rows for bulk load of " + tabName);
++    }
++  }
++  public void removeOrigBulkLoadedRows(List<TableName> lst) throws IOException {
++    try (Table table = connection.getTable(tableName)) {
++      List<Delete> lstDels = BackupSystemTableHelper.createDeleteForOrigBulkLoad(lst);
++      table.delete(lstDels);
++      LOG.debug("deleted original bulk load rows for " + lst.size() + " tables");
++    }
++  }
++
++  public Map<TableName, Map<String, Map<String, List<String>>>> readOrigBulkloadRows(
++      List<TableName> tableList) throws IOException {
++    Map<TableName, Map<String, Map<String, List<String>>>> map = new HashMap<>();
++    for (TableName tTable : tableList) {
++      Scan scan = BackupSystemTableHelper.createScanForOrigBulkLoadedFiles(tTable);
++      if (map.get(tTable) == null) {
++        map.put(tTable, new HashMap<String, Map<String, List<String>>>());
++      }
++      Map<String, Map<String, List<String>>> tblMap = map.get(tTable);
++      try (Table table = connection.getTable(tableName);
++          ResultScanner scanner = table.getScanner(scan)) {
++        Result res = null;
++        while ((res = scanner.next()) != null) {
++          res.advance();
++          String fam = null;
++          String path = null;
++          byte[] row = null;
++          String region = null;
++          for (Cell cell : res.listCells()) {
++            row = CellUtil.cloneRow(cell);
++            String rowStr = Bytes.toString(row);
++            region = BackupSystemTableHelper.getTableNameFromOrigBulkLoadRow(rowStr);
++            if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.FAM_COL, 0,
++                BackupSystemTableHelper.FAM_COL.length) == 0) {
++              fam = Bytes.toString(CellUtil.cloneValue(cell));
++            } else if (CellComparator.compareQualifiers(cell, BackupSystemTableHelper.PATH_COL, 0,
++                BackupSystemTableHelper.PATH_COL.length) == 0) {
++              path = Bytes.toString(CellUtil.cloneValue(cell));
++            }
++          }
++          if (tblMap.get(region) == null) {
++            tblMap.put(region, new HashMap<String, List<String>>());
++          }
++          Map<String, List<String>> famMap = tblMap.get(region);
++          if (famMap.get(fam) == null) {
++            famMap.put(fam, new ArrayList<String>());
++          }
++          famMap.get(fam).add(path);
++          LOG.debug("found orig " + path + " for " + fam + " of " + region);
++        }
++      }
++    }
++    return map;
++  }
++
++  /*
++   * @param sTableList List of tables
++   * @param maps array of Map of family to List of Paths
++   * @param backupId the backup Id
++   */
++  public void writeBulkLoadedFiles(List<TableName> sTableList, Map<byte[], List<Path>>[] maps,
++      String backupId) throws IOException {
++    try (Table table = connection.getTable(tableName)) {
++      long ts = EnvironmentEdgeManager.currentTime();
++      int cnt = 0;
++      List<Put> puts = new ArrayList<>();
++      for (int idx = 0; idx < maps.length; idx++) {
++        Map<byte[], List<Path>> map = maps[idx];
++        TableName tn = sTableList.get(idx);
++        if (map == null) continue;
++        for (Map.Entry<byte[], List<Path>> entry: map.entrySet()) {
++          byte[] fam = entry.getKey();
++          List<Path> paths = entry.getValue();
++          for (Path p : paths) {
++            Put put = BackupSystemTableHelper.createPutForBulkLoadedFile(tn, fam, p.toString(),
++                backupId, ts, cnt++);
++            puts.add(put);
++          }
++        }
++      }
++      if (!puts.isEmpty()) {
++        table.put(puts);
++      }
++    }
++  }
++
+   /**
+    * Get the Region Servers log information after the last log roll from hbase:backup.
+    * @param backupRoot root directory path to backup
+@@ -336,6 +528,21 @@ public final class BackupSystemTable implements Closeable {
+ 
+   }
+ 
++  /*
++   * Retrieve TableName's for completed backup of given type
++   * @param type backup type
++   * @return List of table names
++   */
++  public List<TableName> getTablesForBackupType(BackupType type) throws IOException {
++    List<TableName> names = new ArrayList<>();
++    List<BackupInfo> infos = getBackupHistory(true);
++    for (BackupInfo info : infos) {
++      if (info.getType() != type) continue;
++      names.addAll(info.getTableNames());
++    }
++    return names;
++  }
++
+   /**
+    * Get history for backup destination
+    * @param backupRoot - backup destination
+@@ -927,6 +1134,8 @@ public final class BackupSystemTable implements Closeable {
+     HColumnDescriptor colMetaDesc = new HColumnDescriptor(META_FAMILY);
+     // colDesc.setMaxVersions(1);
+     tableDesc.addFamily(colMetaDesc);
++    /*HColumnDescriptor colBulkLoadDesc = new HColumnDescriptor(BULK_LOAD_FAMILY);
++    tableDesc.addFamily(colBulkLoadDesc); */
+     return tableDesc;
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTableHelper.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTableHelper.java
+index 33ff3ab..e40c4c5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTableHelper.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/BackupSystemTableHelper.java
+@@ -18,12 +18,16 @@
+ package org.apache.hadoop.hbase.backup.impl;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import org.apache.commons.lang.StringUtils;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.TableName;
+@@ -36,7 +40,10 @@ import org.apache.hadoop.hbase.client.Get;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.mapreduce.LoadIncrementalHFiles.LoadQueueItem;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ 
+ /**
+@@ -47,6 +54,7 @@ import org.apache.hadoop.hbase.util.Bytes;
+ @InterfaceStability.Evolving
+ 
+ final class BackupSystemTableHelper {
++  private static final Log LOG = LogFactory.getLog(BackupSystemTableHelper.class);
+ 
+   /**
+    * hbase:backup schema:
+@@ -64,9 +72,19 @@ final class BackupSystemTableHelper {
+   private final static String INCR_BACKUP_SET = "incrbackupset:";
+   private final static String TABLE_RS_LOG_MAP_PREFIX = "trslm:";
+   private final static String RS_LOG_TS_PREFIX = "rslogts:";
++  private final static String BULK_LOADING_PREFIX = "loading:";
++  private final static String BULK_LOAD_PREFIX = "bulk:";
++  private final static byte[] BULK_LOAD_PREFIX_BYTES = BULK_LOAD_PREFIX.getBytes();
++  // separator between BULK_LOAD_PREFIX and ordinals
++  final static byte[] TBL_COL = "tbl".getBytes();
++  final static byte[] FAM_COL = "fam".getBytes();
++  final static byte[] PATH_COL = "path".getBytes();
++
+   private final static String WALS_PREFIX = "wals:";
+   private final static String SET_KEY_PREFIX = "backupset:";
+ 
++  protected final static String BLK_LD_DELIM = "-";
++
+   private final static byte[] EMPTY_VALUE = new byte[] {};
+ 
+   // Safe delimiter in a string
+@@ -268,6 +286,83 @@ final class BackupSystemTableHelper {
+     return put;
+   }
+ 
++  /*
++   * Creates Put's for bulk load resulting from running LoadIncrementalHFiles
++   */
++  static List<Put> createPutForOrigBulkload(TableName table, byte[] region,
++      List<Pair<byte[], String>> stagingFamilyPaths) {
++    List<Put> puts = new ArrayList<>();
++    long ts = EnvironmentEdgeManager.currentTime();
++    int idx = 0;
++    for (Pair<byte[], String> pair : stagingFamilyPaths) {
++      Put put = new Put(rowkey(BULK_LOADING_PREFIX, table.toString(), BLK_LD_DELIM,
++          Bytes.toString(region), BLK_LD_DELIM, Long.toString(ts), BLK_LD_DELIM,
++          Integer.toString(idx)));
++      put.addColumn(BackupSystemTable.META_FAMILY, TBL_COL, table.getName());
++      put.addColumn(BackupSystemTable.META_FAMILY, FAM_COL, pair.getFirst());
++      put.addColumn(BackupSystemTable.META_FAMILY, PATH_COL,
++          pair.getSecond().getBytes());
++      puts.add(put);
++      LOG.debug("writing bulk path " + pair.getSecond() + " for " + table);
++      idx++;
++    }
++    return puts;
++  }
++  public static List<Delete> createDeleteForOrigBulkLoad(List<TableName> lst) {
++    List<Delete> lstDels = new ArrayList<>();
++    for (TableName table : lst) {
++      Delete del = new Delete(rowkey(BULK_LOADING_PREFIX, table.toString(), BLK_LD_DELIM));
++      del.addFamily(BackupSystemTable.META_FAMILY);
++      lstDels.add(del);
++    }
++    return lstDels;
++  }
++
++  static Scan createScanForOrigBulkLoadedFiles(TableName table) throws IOException {
++    Scan scan = new Scan();
++    byte[] startRow = rowkey(BULK_LOADING_PREFIX, table.toString(), BLK_LD_DELIM);
++    byte[] stopRow = Arrays.copyOf(startRow, startRow.length);
++    stopRow[stopRow.length - 1] = (byte) (stopRow[stopRow.length - 1] + 1);
++    scan.setStartRow(startRow);
++    scan.setStopRow(stopRow);
++    scan.addFamily(BackupSystemTable.META_FAMILY);
++    scan.setMaxVersions(1);
++    return scan;
++  }
++
++  static String getTableNameFromOrigBulkLoadRow(String rowStr) {
++    String[] parts = rowStr.split(BLK_LD_DELIM);
++    return parts[1];
++  }
++
++  /*
++   * Used to query bulk loaded hfiles which have been copied by incremental backup
++   * @param backupId the backup Id. It can be null when querying for all tables
++   * @return the Scan object
++   */
++  static Scan createScanForBulkLoadedFiles(String backupId) throws IOException {
++    Scan scan = new Scan();
++    byte[] startRow = backupId == null ? BULK_LOAD_PREFIX_BYTES :
++      rowkey(BULK_LOAD_PREFIX, backupId+BLK_LD_DELIM);
++    byte[] stopRow = Arrays.copyOf(startRow, startRow.length);
++    stopRow[stopRow.length - 1] = (byte) (stopRow[stopRow.length - 1] + 1);
++    scan.setStartRow(startRow);
++    scan.setStopRow(stopRow);
++    //scan.setTimeRange(lower, Long.MAX_VALUE);
++    scan.addFamily(BackupSystemTable.META_FAMILY);
++    scan.setMaxVersions(1);
++    return scan;
++  }
++
++  static Put createPutForBulkLoadedFile(TableName tn, byte[] fam, String p, String backupId,
++      long ts, int idx) {
++    Put put = new Put(rowkey(BULK_LOAD_PREFIX, backupId+BLK_LD_DELIM+ts+BLK_LD_DELIM+idx));
++    put.addColumn(BackupSystemTable.META_FAMILY, TBL_COL, tn.getName());
++    put.addColumn(BackupSystemTable.META_FAMILY, FAM_COL, fam);
++    put.addColumn(BackupSystemTable.META_FAMILY, PATH_COL, p.getBytes());
++    return put;
++  }
++
+   /**
+    * Creates Scan operation to load last RS log roll results
+    * @return scan operation
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/IncrementalTableBackupClient.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/IncrementalTableBackupClient.java
+index c56afbd..4d6e26c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/IncrementalTableBackupClient.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/IncrementalTableBackupClient.java
+@@ -18,15 +18,21 @@
+ 
+ package org.apache.hadoop.hbase.backup.impl;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
+ 
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
+@@ -41,6 +47,9 @@ import org.apache.hadoop.hbase.backup.util.BackupClientUtil;
+ import org.apache.hadoop.hbase.backup.util.BackupServerUtil;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.FSUtils;
++import org.apache.hadoop.hbase.util.HFileArchiveUtil;
+ 
+ @InterfaceAudience.Private
+ public class IncrementalTableBackupClient extends TableBackupClient {
+@@ -155,6 +164,88 @@ public class IncrementalTableBackupClient extends TableBackupClient {
+     return list;
+   }
+ 
++  static int getIndex(TableName tbl, List<TableName> sTableList) {
++    if (sTableList == null) return 0;
++    for (int i = 0; i < sTableList.size(); i++) {
++      if (tbl.equals(sTableList.get(i))) {
++        return i;
++      }
++    }
++    return -1;
++  }
++
++  Map<byte[], List<Path>>[] handleBulkLoad(List<TableName> sTableList) throws IOException {
++    Map<byte[], List<Path>>[] mapForSrc = new Map[sTableList.size()];
++    Map<TableName, Map<String, Map<String, List<String>>>> map = backupManager.readOrigBulkloadRows(
++        sTableList);
++    FileSystem fs = FileSystem.get(conf);
++    FileSystem tgtFs;
++    try {
++      tgtFs = FileSystem.get(new URI(backupContext.getTargetRootDir()), conf);
++    } catch (URISyntaxException use) {
++      throw new IOException("Unable to get FileSystem", use);
++    }
++    Path rootdir = FSUtils.getRootDir(conf);
++    Path tgtRoot = new Path(new Path(backupContext.getTargetRootDir()), backupId);
++    for (Map.Entry<TableName, Map<String, Map<String, List<String>>>> tblEntry : map.entrySet()) {
++      TableName srcTable = tblEntry.getKey();
++      int srcIdx = getIndex(srcTable, sTableList);
++      if (srcIdx < 0) {
++        LOG.warn("Couldn't find " + srcTable + " in source table List");
++        continue;
++      }
++      if (mapForSrc[srcIdx] == null) {
++        mapForSrc[srcIdx] = new TreeMap<byte[], List<Path>>(Bytes.BYTES_COMPARATOR);
++      }
++      Path tblDir = FSUtils.getTableDir(rootdir, srcTable);
++      Path tgtTable = new Path(new Path(tgtRoot, srcTable.getNamespaceAsString()),
++          srcTable.getQualifierAsString());
++      for (Map.Entry<String,Map<String,List<String>>> regionEntry : tblEntry.getValue().entrySet()){
++        String regionName = regionEntry.getKey();
++        Path regionDir = new Path(tblDir, regionName);
++        // map from family to List of hfiles
++        for (Map.Entry<String,List<String>> famEntry : regionEntry.getValue().entrySet()) {
++          String fam = famEntry.getKey();
++          Path famDir = new Path(regionDir, fam);
++          List<Path> files;
++          if (!mapForSrc[srcIdx].containsKey(fam)) {
++            files = new ArrayList<Path>();
++            mapForSrc[srcIdx].put(fam.getBytes(), files);
++          } else {
++            files = mapForSrc[srcIdx].get(fam);
++          }
++          Path archive = HFileArchiveUtil.getStoreArchivePath(conf, srcTable, regionName, fam);
++          String tblName = srcTable.getQualifierAsString();
++          Path tgtFam = new Path(new Path(tgtTable, regionName), fam);
++          if (!tgtFs.mkdirs(tgtFam)) {
++            throw new IOException("couldn't create " + tgtFam);
++          }
++          for (String file : famEntry.getValue()) {
++            Path p = new Path(famDir, file);
++            Path tgt = new Path(tgtFam, file);
++            if (fs.exists(p)) {
++              LOG.debug("found bulk hfile " + file + " in " + famDir + " for " + tblName);
++              try {
++                LOG.debug("copying " + p + " to " + tgt);
++                FileUtil.copy(fs, p, tgtFs, tgt, false,conf);
++              } catch (FileNotFoundException e) {
++                LOG.debug("copying archive " + archive + " to " + tgt);
++                FileUtil.copy(fs, archive, tgtFs, tgt, false, conf);
++              }
++            } else {
++              LOG.debug("copying archive " + archive + " to " + tgt);
++              FileUtil.copy(fs, archive, tgtFs, tgt, false, conf);
++            }
++            files.add(tgt);
++          }
++        }
++      }
++    }
++    backupManager.writeBulkLoadedFiles(sTableList, mapForSrc);
++    backupManager.removeOrigBulkLoadedRows(sTableList);
++    return mapForSrc;
++  }
++
+   @Override
+   public void execute() throws IOException {
+ 
+@@ -205,6 +296,8 @@ public class IncrementalTableBackupClient extends TableBackupClient {
+           BackupClientUtil.getMinValue(BackupServerUtil
+               .getRSLogTimestampMins(newTableSetTimestampMap));
+       backupManager.writeBackupStartCode(newStartCode);
++
++      handleBulkLoad(backupManager.getBackupContext().getTableNames());
+       // backup complete
+       completeBackup(conn, backupContext, backupManager,
+         BackupType.INCREMENTAL, conf);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/RestoreTablesClient.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/RestoreTablesClient.java
+index 46fa46f..9c2b6c5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/RestoreTablesClient.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/impl/RestoreTablesClient.java
+@@ -19,9 +19,12 @@
+ package org.apache.hadoop.hbase.backup.impl;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.TreeSet;
+ 
+ import org.apache.commons.lang.StringUtils;
+@@ -34,10 +37,13 @@ import org.apache.hadoop.hbase.backup.BackupType;
+ import org.apache.hadoop.hbase.backup.HBackupFileSystem;
+ import org.apache.hadoop.hbase.backup.RestoreRequest;
+ import org.apache.hadoop.hbase.backup.impl.BackupManifest.BackupImage;
++import org.apache.hadoop.hbase.backup.mapreduce.MapReduceRestoreTask;
+ import org.apache.hadoop.hbase.backup.util.RestoreServerUtil;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.mapreduce.LoadIncrementalHFiles;
++import org.apache.hadoop.hbase.mapreduce.LoadIncrementalHFiles.LoadQueueItem;
+ 
+ @InterfaceAudience.Private
+ public class RestoreTablesClient {
+@@ -46,6 +52,7 @@ public class RestoreTablesClient {
+   private Configuration conf;
+   private Connection conn;
+   private String backupId;
++  private String fullBackupId;
+   private TableName[] sTableArray;
+   private TableName[] tTableArray;
+   private String targetRootDir;
+@@ -138,6 +145,7 @@ public class RestoreTablesClient {
+     // We need hFS only for full restore (see the code)
+     BackupManifest manifest = HBackupFileSystem.getManifest(sTable, conf, backupRoot, backupId);
+     if (manifest.getType() == BackupType.FULL) {
++      fullBackupId = manifest.getBackupImage().getBackupId();
+       LOG.info("Restoring '" + sTable + "' to '" + tTable + "' from full" + " backup image "
+           + tableBackupPath.toString());
+       restoreTool.fullRestoreTable(conn, tableBackupPath, sTable, tTable, truncateIfExists,
+@@ -167,7 +175,6 @@ public class RestoreTablesClient {
+     restoreTool.incrementalRestoreTable(conn, tableBackupPath, paths, new TableName[] { sTable },
+       new TableName[] { tTable }, lastIncrBackupId);
+     LOG.info(sTable + " has been successfully restored to " + tTable);
+-
+   }
+ 
+   /**
+@@ -208,13 +215,57 @@ public class RestoreTablesClient {
+           }
+         }
+       }
++      try (BackupSystemTable table = new BackupSystemTable(conn)) {
++        List<TableName> sTableList = Arrays.asList(sTableArray);
++        Map<byte[], List<Path>>[] mapForSrc = table.readBulkLoadedFiles(backupId, sTableList);
++        Map<LoadQueueItem, ByteBuffer> loaderResult;
++        conf.setBoolean(LoadIncrementalHFiles.ALWAYS_COPY_FILES, true);
++        LoadIncrementalHFiles loader = MapReduceRestoreTask.createLoader(conf);
++        for (int i = 0; i < sTableList.size(); i++) {
++          if (mapForSrc[i] != null && !mapForSrc[i].isEmpty()) {
++            loaderResult = loader.run(null, mapForSrc[i], tTableArray[i]);
++            LOG.debug("bulk loading " + sTableList.get(i) + " to " + tTableArray[i]);
++            if (loaderResult.isEmpty()) {
++              String msg = "Couldn't bulk load for " + sTableList.get(i) + " to " + tTableArray[i];
++              LOG.error(msg);
++              throw new IOException(msg);
++            }
++          }
++        }
++      }
+     } catch (Exception e) {
+       LOG.error("Failed", e);
++      if (e instanceof IOException) {
++        throw (IOException)e;
++      }
+       throw new IOException(e);
+     }
+     LOG.debug("restoreStage finished");
+   }
+ 
++  static long getTsFromBackupId(String backupId) {
++    if (backupId == null) {
++      return 0;
++    }
++    return Long.valueOf(backupId.substring(backupId.lastIndexOf("_")+1));
++  }
++
++  static boolean withinRange(long a, long lower, long upper) {
++    if (a < lower || a > upper) {
++      return false;
++    }
++    return true;
++  }
++
++  int getIndex(TableName tbl, List<TableName> sTableList) {
++    for (int i = 0; i < sTableList.size(); i++) {
++      if (tbl.equals(sTableList.get(i))) {
++        return i;
++      }
++    }
++    return -1;
++  }
++
+   public void execute() throws IOException {
+ 
+     // case VALIDATION:
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/mapreduce/MapReduceRestoreTask.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/mapreduce/MapReduceRestoreTask.java
+index 743e8e7..8556106 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/mapreduce/MapReduceRestoreTask.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/mapreduce/MapReduceRestoreTask.java
+@@ -88,7 +88,7 @@ public class MapReduceRestoreTask implements RestoreTask {
+         result = player.run(playerArgs);
+         if (succeeded(result)) {
+           // do bulk load
+-          LoadIncrementalHFiles loader = createLoader();
++          LoadIncrementalHFiles loader = createLoader(getConf());
+           if (LOG.isDebugEnabled()) {
+             LOG.debug("Restoring HFiles from directory " + bulkOutputPath);
+           }
+@@ -124,13 +124,13 @@ public class MapReduceRestoreTask implements RestoreTask {
+     return result == 0;
+   }
+ 
+-  private LoadIncrementalHFiles createLoader() throws IOException {
++  public static LoadIncrementalHFiles createLoader(Configuration config) throws IOException {
+     // set configuration for restore:
+     // LoadIncrementalHFile needs more time
+     // <name>hbase.rpc.timeout</name> <value>600000</value>
+     // calculates
+     Integer milliSecInHour = 3600000;
+-    Configuration conf = new Configuration(getConf());
++    Configuration conf = new Configuration(config);
+     conf.setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, milliSecInHour);
+ 
+     // By default, it is 32 and loader will fail if # of files in any region exceed this
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
+index ed6e2a5..2b6e0dd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
+@@ -27,6 +27,7 @@ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -61,6 +62,9 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.TableNotFoundException;
++import org.apache.hadoop.hbase.backup.BackupType;
++import org.apache.hadoop.hbase.backup.impl.BackupManager;
++import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.client.Admin;
+@@ -141,7 +145,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+     initialize();
+   }
+ 
+-  private void initialize() throws Exception {
++  private void initialize() throws IOException {
+     if (initalized) {
+       return;
+     }
+@@ -278,6 +282,14 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+     public String toString() {
+       return "family:"+ Bytes.toString(family) + " path:" + hfilePath.toString();
+     }
++
++    public byte[] getFamily() {
++      return family;
++    }
++
++    public Path getFilePath() {
++      return hfilePath;
++    }
+   }
+ 
+   /*
+@@ -1168,7 +1180,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+    * If the table is created for the first time, then "completebulkload" reads the files twice.
+    * More modifications necessary if we want to avoid doing it.
+    */
+-  private void createTable(TableName tableName, String dirPath, Admin admin) throws Exception {
++  private void createTable(TableName tableName, String dirPath, Admin admin) throws IOException {
+     final Path hfofDir = new Path(dirPath);
+     final FileSystem fs = hfofDir.getFileSystem(getConf());
+ 
+@@ -1222,7 +1234,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+   }
+ 
+   public Map<LoadQueueItem, ByteBuffer> run(String dirPath, Map<byte[], List<Path>> map,
+-      TableName tableName) throws Exception{
++      TableName tableName) throws IOException {
+     initialize();
+     try (Connection connection = ConnectionFactory.createConnection(getConf());
+         Admin admin = connection.getAdmin()) {
+@@ -1245,7 +1257,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+       try (Table table = connection.getTable(tableName);
+         RegionLocator locator = connection.getRegionLocator(tableName)) {
+         boolean silence = "yes".equalsIgnoreCase(getConf().get(IGNORE_UNMATCHED_CF_CONF_KEY, ""));
+-        boolean copyFiles = "yes".equalsIgnoreCase(getConf().get(ALWAYS_COPY_FILES, ""));
++        boolean copyFiles = getConf().getBoolean(ALWAYS_COPY_FILES, false);
+         if (dirPath != null) {
+           doBulkLoad(hfofDir, admin, table, locator, silence, copyFiles);
+         } else {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 4ab5ea6..3747149 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1712,6 +1712,8 @@ public class HRegionServer extends HasThread implements
+     // listeners the wal factory will add to wals it creates.
+     final List<WALActionsListener> listeners = new ArrayList<WALActionsListener>();
+     listeners.add(new MetricsWAL());
++    /* loader = new BulkLoadHandler(getConnection());
++    listeners.add(loader); */
+     if (this.replicationSourceHandler != null &&
+         this.replicationSourceHandler.getWALActionsListener() != null) {
+       // Replication handler is an implementation of WALActionsListener.
+@@ -2281,6 +2283,7 @@ public class HRegionServer extends HasThread implements
+    * have already been called.
+    */
+   protected void stopServiceThreads() {
++    //loader.close();
+     // clean up the scheduled chores
+     if (this.choreService != null) choreService.shutdown();
+     if (this.nonceManagerChore != null) nonceManagerChore.cancel(true);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
+index a235696..4a09fe9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
+@@ -153,4 +153,20 @@ public class HFileArchiveUtil {
+   private static Path getArchivePath(final Path rootdir) {
+     return new Path(rootdir, HConstants.HFILE_ARCHIVE_DIRECTORY);
+   }
++  
++  /*
++   * @return table name given archive file path
++   */
++  public static TableName getTableName(Path archivePath) {
++    Path p = archivePath;
++    String tbl = null;
++    // namespace is the 4th parent of file
++    for (int i = 0; i < 5; i++) {
++      if (p == null) return null;
++      if (i == 3) tbl = p.getName();
++      p = p.getParent();
++    }
++    if (p == null) return null;
++    return TableName.valueOf(p.getName(), tbl);
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupBase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupBase.java
+index 05f166a..2d1f1a6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupBase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupBase.java
+@@ -50,6 +50,10 @@ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
++import org.apache.hadoop.hbase.mapreduce.HadoopSecurityEnabledUserProviderForTesting;
++import org.apache.hadoop.hbase.security.UserProvider;
++import org.apache.hadoop.hbase.security.access.SecureTestUtil;
+ import org.apache.hadoop.hbase.snapshot.SnapshotTestingUtils;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.wal.WALFactory;
+@@ -90,6 +94,7 @@ public class TestBackupBase {
+   protected static String BACKUP_ROOT_DIR = "/backupUT";
+   protected static String BACKUP_REMOTE_ROOT_DIR = "/backupUT";
+   protected static String provider = "defaultProvider";
++  protected static boolean secure = false;
+ 
+   /**
+    * @throws java.lang.Exception
+@@ -98,6 +103,16 @@ public class TestBackupBase {
+   public static void setUpBeforeClass() throws Exception {
+     TEST_UTIL = new HBaseTestingUtility();
+     conf1 = TEST_UTIL.getConfiguration();
++    if (secure) {
++      // set the always on security provider
++      UserProvider.setUserProviderForTesting(TEST_UTIL.getConfiguration(),
++          HadoopSecurityEnabledUserProviderForTesting.class);
++      // setup configuration
++      SecureTestUtil.enableSecurity(TEST_UTIL.getConfiguration());
++    }
++    String coproc = conf1.get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY);
++    conf1.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, (coproc == null ? "" : coproc + ",") +
++        BackupObserver.class.getName());
+     conf1.setBoolean(BackupRestoreConstants.BACKUP_ENABLE_KEY, true);
+     conf1.set(HConstants.ZOOKEEPER_ZNODE_PARENT, "/1");
+     // Set MultiWAL (with 2 default WAL files per RS)
+@@ -118,7 +133,7 @@ public class TestBackupBase {
+     LOG.info("ROOTDIR " + BACKUP_ROOT_DIR);
+     BACKUP_REMOTE_ROOT_DIR = TEST_UTIL2.getConfiguration().get("fs.defaultFS") + "/backupUT";
+     LOG.info("REMOTE ROOTDIR " + BACKUP_REMOTE_ROOT_DIR);
+-    waitForSystemTable();
++    waitForSystemTable(TEST_UTIL);
+     createTables();
+     populateFromMasterConfig(TEST_UTIL.getHBaseCluster().getMaster().getConfiguration(), conf1);
+   }
+@@ -131,7 +146,7 @@ public class TestBackupBase {
+     }
+   }
+ 
+-  public static void waitForSystemTable() throws Exception
++  public static void waitForSystemTable(HBaseTestingUtility TEST_UTIL) throws Exception
+   {
+     try (Admin admin = TEST_UTIL.getAdmin();) {
+       while (!admin.tableExists(BackupSystemTable.getTableName())
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackupDeleteTable.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackupDeleteTable.java
+index 973e787..67f6c28 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackupDeleteTable.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackupDeleteTable.java
+@@ -20,24 +20,31 @@ package org.apache.hadoop.hbase.backup;
+ 
+ import static org.junit.Assert.assertTrue;
+ 
++import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.List;
++import java.util.Map;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.backup.impl.BackupAdminImpl;
++import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;
+ import org.apache.hadoop.hbase.backup.util.RestoreServerUtil;
+ import org.apache.hadoop.hbase.client.Connection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.mapreduce.TestLoadIncrementalHFiles;
+ import org.apache.hadoop.hbase.testclassification.LargeTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.hamcrest.CoreMatchers;
+ import org.junit.Assert;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
+ 
+ import com.google.common.collect.Lists;
+ 
+@@ -51,11 +58,25 @@ import com.google.common.collect.Lists;
+  *  6  Incremental backup t1
+  */
+ @Category(LargeTests.class)
++@RunWith(Parameterized.class)
+ public class TestIncrementalBackupDeleteTable extends TestBackupBase {
+   private static final Log LOG = LogFactory.getLog(TestIncrementalBackupDeleteTable.class);
++
++  @Parameterized.Parameters
++  public static Collection<Object[]> data() {
++    secure = true;
++    List<Object[]> params = new ArrayList<Object[]>();
++    params.add(new Object[] {Boolean.TRUE});
++    return params;
++  }
++
++  public TestIncrementalBackupDeleteTable(Boolean b) {
++  }
++
+   //implement all test cases in 1 test since incremental backup/restore has dependencies
+   @Test
+   public void TestIncBackupDeleteTable() throws Exception {
++    String testName = "TestIncBackupDeleteTable";
+     // #1 - create full backup for all tables
+     LOG.info("create full backup image for all tables");
+ 
+@@ -87,6 +108,14 @@ public class TestIncrementalBackupDeleteTable extends TestBackupBase {
+     admin.disableTable(table2);
+     admin.deleteTable(table2);
+ 
++    int NB_ROWS2 = 20;
++    LOG.debug("bulk loading into " + testName);
++    int actual = TestLoadIncrementalHFiles.loadHFiles(testName, table1Desc, TEST_UTIL, famName,
++        qualName, false, null, new byte[][][] {
++      new byte[][]{ Bytes.toBytes("aaaa"), Bytes.toBytes("cccc") },
++      new byte[][]{ Bytes.toBytes("ddd"), Bytes.toBytes("ooo") },
++    }, true, false, true, NB_ROWS_IN_BATCH*2, NB_ROWS2);
++
+     // #3 - incremental backup for table1
+     tables = Lists.newArrayList(table1);
+     request = new BackupRequest();
+@@ -95,32 +124,7 @@ public class TestIncrementalBackupDeleteTable extends TestBackupBase {
+     String backupIdIncMultiple = client.backupTables(request);
+     assertTrue(checkSucceeded(backupIdIncMultiple));
+ 
+-    // #4 - restore full backup for all tables, without overwrite
+-    TableName[] tablesRestoreFull =
+-        new TableName[] { table1, table2};
+-
+-    TableName[] tablesMapFull =
+-        new TableName[] { table1_restore, table2_restore };
+-
+-    client.restore(RestoreServerUtil.createRestoreRequest(BACKUP_ROOT_DIR, backupIdFull, false,
+-      tablesRestoreFull,
+-      tablesMapFull, false));
+-
+-    // #5.1 - check tables for full restore
+     HBaseAdmin hAdmin = TEST_UTIL.getHBaseAdmin();
+-    assertTrue(hAdmin.tableExists(table1_restore));
+-    assertTrue(hAdmin.tableExists(table2_restore));
+-
+-
+-    // #5.2 - checking row count of tables for full restore
+-    HTable hTable = (HTable) conn.getTable(table1_restore);
+-    Assert.assertThat(TEST_UTIL.countRows(hTable), CoreMatchers.equalTo(NB_ROWS_IN_BATCH));
+-    hTable.close();
+-
+-    hTable = (HTable) conn.getTable(table2_restore);
+-    Assert.assertThat(TEST_UTIL.countRows(hTable), CoreMatchers.equalTo(NB_ROWS_IN_BATCH));
+-    hTable.close();
+-
+ 
+     // #6 - restore incremental backup for table1
+     TableName[] tablesRestoreIncMultiple =
+@@ -130,8 +134,18 @@ public class TestIncrementalBackupDeleteTable extends TestBackupBase {
+     client.restore(RestoreServerUtil.createRestoreRequest(BACKUP_ROOT_DIR, backupIdIncMultiple,
+         false, tablesRestoreIncMultiple, tablesMapIncMultiple, true));
+ 
+-    hTable = (HTable) conn.getTable(table1_restore);
+-    Assert.assertThat(TEST_UTIL.countRows(hTable), CoreMatchers.equalTo(NB_ROWS_IN_BATCH * 2));
++    HTable hTable = (HTable) conn.getTable(table1_restore);
++    Assert.assertThat(TEST_UTIL.countRows(hTable), CoreMatchers.equalTo(NB_ROWS_IN_BATCH * 2 +
++        actual));
++
++    request.setBackupType(BackupType.FULL).setTableList(tables).setTargetRootDir(BACKUP_ROOT_DIR);
++    backupIdFull = client.backupTables(request);
++    try (final BackupSystemTable table = new BackupSystemTable(conn)) {
++      Map<TableName, Map<String, Map<String, List<String>>>> map=table.readOrigBulkloadRows(tables);
++      assertTrue("map still has " + map.size() + " entries", map.isEmpty());
++    }
++    assertTrue(checkSucceeded(backupIdFull));
++
+     hTable.close();
+     admin.close();
+     conn.close();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFiles.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFiles.java
+index ebc7c97..ccf6fff 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFiles.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFiles.java
+@@ -308,13 +308,14 @@ public class TestLoadIncrementalHFiles {
+     runTest(testName, htd, bloomType, preCreateTable, tableSplitKeys, hfileRanges, useMap, false);
+   }
+ 
+-  private void runTest(String testName, HTableDescriptor htd, BloomType bloomType,
+-      boolean preCreateTable, byte[][] tableSplitKeys, byte[][][] hfileRanges, boolean useMap,
+-      boolean copyFiles) throws Exception {
++  public static int loadHFiles(String testName, HTableDescriptor htd, HBaseTestingUtility util,
++      byte[] fam, byte[] qual, boolean preCreateTable, byte[][] tableSplitKeys,
++      byte[][][] hfileRanges, boolean useMap, boolean deleteFile,
++      boolean copyFiles, int initRowCount, int factor) throws Exception {
+     Path dir = util.getDataTestDirOnTestFS(testName);
+     FileSystem fs = util.getTestFileSystem();
+     dir = dir.makeQualified(fs);
+-    Path familyDir = new Path(dir, Bytes.toString(FAMILY));
++    Path familyDir = new Path(dir, Bytes.toString(fam));
+ 
+     int hfileIdx = 0;
+     Map<byte[], List<Path>> map = null;
+@@ -324,26 +325,27 @@ public class TestLoadIncrementalHFiles {
+     }
+     if (useMap) {
+       map = new TreeMap<byte[], List<Path>>(Bytes.BYTES_COMPARATOR);
+-      map.put(FAMILY, list);
++      map.put(fam, list);
+     }
+     Path last = null;
+     for (byte[][] range : hfileRanges) {
+       byte[] from = range[0];
+       byte[] to = range[1];
+       Path path = new Path(familyDir, "hfile_" + hfileIdx++);
+-      HFileTestUtil.createHFile(util.getConfiguration(), fs, path, FAMILY, QUALIFIER, from, to, 1000);
++      HFileTestUtil.createHFile(util.getConfiguration(), fs, path, fam, qual, from, to, factor);
+       if (useMap) {
+         last = path;
+         list.add(path);
++        map.put(fam, list);
+       }
+     }
+-    int expectedRows = hfileIdx * 1000;
++    int expectedRows = hfileIdx * factor;
+ 
+-    if (preCreateTable || map != null) {
++    final TableName tableName = htd.getTableName();
++    if (!util.getHBaseAdmin().tableExists(tableName) && (preCreateTable || map != null)) {
+       util.getHBaseAdmin().createTable(htd, tableSplitKeys);
+     }
+ 
+-    final TableName tableName = htd.getTableName();
+     Configuration conf = util.getConfiguration();
+     if (copyFiles) {
+       conf.setBoolean(LoadIncrementalHFiles.ALWAYS_COPY_FILES, true);
+@@ -351,12 +353,14 @@ public class TestLoadIncrementalHFiles {
+     LoadIncrementalHFiles loader = new LoadIncrementalHFiles(conf);
+     String [] args= {dir.toString(), tableName.toString()};
+     if (useMap) {
+-      fs.delete(last);
++      if (deleteFile) fs.delete(last);
+       Map<LoadQueueItem, ByteBuffer> loaded = loader.run(null, map, tableName);
+-      expectedRows -= 1000;
+-      for (LoadQueueItem item : loaded.keySet()) {
+-        if (item.hfilePath.getName().equals(last.getName())) {
+-          fail(last + " should be missing");
++      if (deleteFile) {
++        expectedRows -= 1000;
++        for (LoadQueueItem item : loaded.keySet()) {
++          if (item.hfilePath.getName().equals(last.getName())) {
++            fail(last + " should be missing");
++          }
+         }
+       }
+     } else {
+@@ -365,19 +369,30 @@ public class TestLoadIncrementalHFiles {
+ 
+     if (copyFiles) {
+       for (Path p : list) {
+-        assertTrue(fs.exists(p));
++        assertTrue(p + " should exist", fs.exists(p));
+       }
+     }
+ 
+     Table table = util.getConnection().getTable(tableName);
+     try {
+-      assertEquals(expectedRows, util.countRows(table));
++      assertEquals(initRowCount + expectedRows, util.countRows(table));
+     } finally {
+       table.close();
+     }
+ 
++    return expectedRows;
++  }
++
++  private void runTest(String testName, HTableDescriptor htd, BloomType bloomType,
++      boolean preCreateTable, byte[][] tableSplitKeys, byte[][][] hfileRanges, boolean useMap,
++      boolean copyFiles) throws Exception {
++    loadHFiles(testName, htd, util, FAMILY, QUALIFIER, preCreateTable, tableSplitKeys,
++        hfileRanges, useMap, true, copyFiles, 0, 1000);
++
++    final TableName tableName = htd.getTableName();
+     // verify staging folder has been cleaned up
+     Path stagingBasePath = new Path(FSUtils.getRootDir(util.getConfiguration()), HConstants.BULKLOAD_STAGING_DIR_NAME);
++    FileSystem fs = util.getTestFileSystem();
+     if(fs.exists(stagingBasePath)) {
+       FileStatus[] files = fs.listStatus(stagingBasePath);
+       for(FileStatus file : files) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupHFileCleaner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupHFileCleaner.java
+new file mode 100644
+index 0000000..17f8487
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupHFileCleaner.java
+@@ -0,0 +1,173 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.backup;
++
++import java.io.IOException;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.Abortable;
++import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.hbase.master.cleaner.BaseHFileCleanerDelegate;
++import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Predicate;
++import com.google.common.collect.Iterables;
++
++/**
++ * Implementation of a file cleaner that checks if an hfile is still referenced by backup before
++ * deleting it from hfile archive directory.
++ */
++@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
++public class BackupHFileCleaner extends BaseHFileCleanerDelegate implements Abortable {
++  private static final Log LOG = LogFactory.getLog(BackupHFileCleaner.class);
++  private boolean stopped = false;
++  private boolean aborted;
++  private Configuration conf;
++  private Connection connection;
++  private long prevReadFromBackupTbl = 0, // timestamp of most recent read from hbase:backup table
++      secondPrevReadFromBackupTbl = 0; // timestamp of 2nd most recent read from hbase:backup table
++  //used by uunit test to skip reading hbase:backup
++  private boolean checkForFullyBackedUpTables = true;
++  private List<TableName> fullyBackedUpTables = null;
++
++  private Set<String> getFilenameFromBulkLoad(Map<byte[], List<Path>>[] maps) {
++    Set<String> filenames = new HashSet<String>();
++    for (Map<byte[], List<Path>> map : maps) {
++      if (map == null) continue;
++      for (List<Path> paths : map.values()) {
++        for (Path p : paths) {
++          filenames.add(p.getName());
++        }
++      }
++    }
++    return filenames;
++  }
++
++  private Set<String> loadHFileRefs(List<TableName> tableList) throws IOException {
++    if (connection == null) {
++      connection = ConnectionFactory.createConnection(conf);
++    }
++    try (BackupSystemTable tbl = new BackupSystemTable(connection)) {
++      Map<byte[], List<Path>>[] res =
++          tbl.readBulkLoadedFiles(null, tableList);
++      secondPrevReadFromBackupTbl = prevReadFromBackupTbl;
++      prevReadFromBackupTbl = EnvironmentEdgeManager.currentTime();
++      return getFilenameFromBulkLoad(res);
++    }
++  }
++
++  @VisibleForTesting
++  void setCheckForFullyBackedUpTables(boolean b) {
++    checkForFullyBackedUpTables = b;
++  }
++  @Override
++  public Iterable<FileStatus> getDeletableFiles(Iterable<FileStatus> files) {
++    if (conf == null) {
++      return files;
++    }
++    // obtain the Set of TableName's which have been fully backed up
++    // so that we filter BulkLoad to be returned from server
++    if (checkForFullyBackedUpTables) {
++      if (connection == null) return files;
++      try (BackupSystemTable tbl = new BackupSystemTable(connection)) {
++        fullyBackedUpTables = tbl.getTablesForBackupType(BackupType.FULL);
++      } catch (IOException ioe) {
++        LOG.error("Failed to get tables which have been fully backed up, skipping checking", ioe);
++        return Collections.emptyList();
++      }
++      Collections.sort(fullyBackedUpTables);
++    }
++    final Set<String> hfileRefs;
++    try {
++      hfileRefs = loadHFileRefs(fullyBackedUpTables);
++    } catch (IOException ioe) {
++      LOG.error("Failed to read hfile references, skipping checking deletable files", ioe);
++      return Collections.emptyList();
++    }
++    Iterable<FileStatus> deletables = Iterables.filter(files, new Predicate<FileStatus>() {
++      @Override
++      public boolean apply(FileStatus file) {
++        // If the file is recent, be conservative and wait for one more scan of hbase:backup table
++        if (file.getModificationTime() > secondPrevReadFromBackupTbl) {
++          return false;
++        }
++        String hfile = file.getPath().getName();
++        boolean foundHFileRef = hfileRefs.contains(hfile);
++        return !foundHFileRef;
++      }
++    });
++    return deletables;
++  }
++
++  @Override
++  public boolean isFileDeletable(FileStatus fStat) {
++    // work is done in getDeletableFiles()
++    return true;
++  }
++
++  @Override
++  public void setConf(Configuration config) {
++    this.conf = config;
++    this.connection = null;
++    try {
++      this.connection = ConnectionFactory.createConnection(conf);
++    } catch (IOException ioe) {
++      LOG.error("Couldn't establish connection", ioe);
++    }
++  }
++
++  @Override
++  public void stop(String why) {
++    if (this.stopped) {
++      return;
++    }
++    this.stopped = true;
++  }
++
++  @Override
++  public boolean isStopped() {
++    return this.stopped;
++  }
++
++  @Override
++  public void abort(String why, Throwable e) {
++    LOG.warn("Aborting ReplicationHFileCleaner because " + why, e);
++    this.aborted = true;
++    stop(why);
++  }
++
++  @Override
++  public boolean isAborted() {
++    return this.aborted;
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupHFileCleaner.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupHFileCleaner.java
+new file mode 100644
+index 0000000..f5c039e
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestBackupHFileCleaner.java
+@@ -0,0 +1,142 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.backup;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.hbase.testclassification.MasterTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category({ MasterTests.class, SmallTests.class })
++public class TestBackupHFileCleaner {
++  private static final Log LOG = LogFactory.getLog(TestBackupHFileCleaner.class);
++  private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private static Configuration conf = TEST_UTIL.getConfiguration();
++  private static TableName tableName = TableName.valueOf("backup.hfile.cleaner");
++  private static String famName = "fam";
++  static FileSystem fs = null;
++  Path root;
++
++  /**
++   * @throws java.lang.Exception
++   */
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    conf.setBoolean(BackupRestoreConstants.BACKUP_ENABLE_KEY, true);
++    TEST_UTIL.startMiniZKCluster();
++    TEST_UTIL.startMiniCluster(1);
++    TestBackupBase.waitForSystemTable(TEST_UTIL);
++    fs = FileSystem.get(conf);
++  }
++
++  /**
++   * @throws java.lang.Exception
++   */
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    if (fs != null) {
++      fs.close();
++    }
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++  @Before
++  public void setup() throws IOException {
++    root = TEST_UTIL.getDataTestDirOnTestFS();
++  }
++
++  @After
++  public void cleanup() {
++    try {
++      fs.delete(root, true);
++    } catch (IOException e) {
++      LOG.warn("Failed to delete files recursively from path " + root);
++    }
++  }
++
++  @Test
++  public void testGetDeletableFiles() throws IOException {
++    // 1. Create a file
++    Path file = new Path(root, "testIsFileDeletableWithNoHFileRefs");
++    fs.createNewFile(file);
++    // 2. Assert file is successfully created
++    assertTrue("Test file not created!", fs.exists(file));
++    BackupHFileCleaner cleaner = new BackupHFileCleaner();
++    cleaner.setConf(conf);
++    cleaner.setCheckForFullyBackedUpTables(false);
++    // 3. Assert that file as is should be deletable
++    List<FileStatus> stats = new ArrayList<>();
++    FileStatus stat = fs.getFileStatus(file);
++    stats.add(stat);
++    Iterable<FileStatus> deletable = cleaner.getDeletableFiles(stats);
++    deletable = cleaner.getDeletableFiles(stats);
++    boolean found = false;
++    for (FileStatus stat1 : deletable) {
++      if (stat.equals(stat1)) found = true;
++    }
++    assertTrue("Cleaner should allow to delete this file as there is no hfile reference "
++        + "for it.", found);
++
++    // 4. Add the file as bulk load
++    List<Path> list = new ArrayList<>(1);
++    list.add(file);
++    try (Connection conn = ConnectionFactory.createConnection(conf);
++        BackupSystemTable sysTbl = new BackupSystemTable(conn)) {
++      List<TableName> sTableList = new ArrayList<>();
++      sTableList.add(tableName);
++      Map<byte[], List<Path>>[] maps = new Map[1];
++      maps[0] = new HashMap<>();
++      maps[0].put(famName.getBytes(), list);
++      sysTbl.writeBulkLoadedFiles(sTableList, maps, "1");
++    }
++
++    // 5. Assert file should not be deletable
++    deletable = cleaner.getDeletableFiles(stats);
++    deletable = cleaner.getDeletableFiles(stats);
++    found = false;
++    for (FileStatus stat1 : deletable) {
++      if (stat.equals(stat1)) found = true;
++    }
++    assertFalse("Cleaner should not allow to delete this file as there is a hfile reference "
++        + "for it.", found);
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupObserver.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupObserver.java
+new file mode 100644
+index 0000000..3a4503e
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/backup/BackupObserver.java
+@@ -0,0 +1,78 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hadoop.hbase.backup;
++
++import java.io.IOException;
++import java.util.List;
++import java.util.Map;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.hadoop.hbase.HRegionInfo;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.backup.impl.BackupManager;
++import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
++import org.apache.hadoop.hbase.coprocessor.ObserverContext;
++import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
++import org.apache.hadoop.hbase.util.Pair;
++
++/**
++ * An Observer to facilitate backup operations
++ */
++@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
++public class BackupObserver extends BaseRegionObserver {
++  private static final Log LOG = LogFactory.getLog(BackupObserver.class);
++  @Override
++  public boolean postBulkLoadHFile(ObserverContext<RegionCoprocessorEnvironment> ctx,
++    List<Pair<byte[], String>> stagingFamilyPaths, Map<byte[], List<Path>> finalPaths,
++    boolean hasLoaded) throws IOException {
++    Configuration cfg = ctx.getEnvironment().getConfiguration();
++    if (!hasLoaded) {
++      // there is no need to record state
++      return hasLoaded;
++    }
++    if (stagingFamilyPaths == null || !BackupManager.isBackupEnabled(cfg)) {
++      LOG.debug("skipping recording bulk load");
++      return hasLoaded;
++    }
++    List<TableName> fullyBackedUpTables;
++    try (Connection connection = ConnectionFactory.createConnection(cfg);
++        BackupSystemTable tbl = new BackupSystemTable(connection)) {
++      fullyBackedUpTables = tbl.getTablesForBackupType(BackupType.FULL);
++      HRegionInfo info = ctx.getEnvironment().getRegionInfo();
++      TableName tableName = info.getTable();
++      if (!fullyBackedUpTables.contains(tableName)) {
++        LOG.debug(tableName + " has not gone thru full backup");
++        return hasLoaded;
++      }
++      tbl.writeOrigBulkLoad(tableName, info.getRegionName(), stagingFamilyPaths);
++      return hasLoaded;
++    } catch (IOException ioe) {
++      LOG.error("Failed to get tables which have been fully backed up", ioe);
++      return false;
++    }
++  }
++}

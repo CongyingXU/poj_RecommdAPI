@@ -1,0 +1,153 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index d104a86..d73c71a 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -874,37 +874,52 @@ public class HTable implements HTableInterface {
+    */
+   @Override
+   public boolean checkAndMutate(final byte [] row, final byte [] family, final byte [] qualifier,
+-      final CompareOp compareOp, final byte [] value, final RowMutations rm)
+-  throws IOException {
+-    RegionServerCallable<Boolean> callable =
+-        new RegionServerCallable<Boolean>(connection, getName(), row) {
+-          @Override
+-          public Boolean call(int callTimeout) throws IOException {
+-            PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+-            controller.setPriority(tableName);
+-            controller.setCallTimeout(callTimeout);
+-            try {
+-              CompareType compareType = CompareType.valueOf(compareOp.name());
+-              MultiRequest request = RequestConverter.buildMutateRequest(
+-                  getLocation().getRegionInfo().getRegionName(), row, family, qualifier,
+-                  new BinaryComparator(value), compareType, rm);
+-              ClientProtos.MultiResponse response = getStub().multi(controller, request);
+-              ClientProtos.RegionActionResult res = response.getRegionActionResultList().get(0);
+-              if (res.hasException()) {
+-                Throwable ex = ProtobufUtil.toException(res.getException());
+-                if(ex instanceof IOException) {
+-                  throw (IOException)ex;
+-                }
+-                throw new IOException("Failed to checkAndMutate row: "+
+-                    Bytes.toStringBinary(rm.getRow()), ex);
++    final CompareOp compareOp, final byte [] value, final RowMutations rm)
++    throws IOException {
++    final RetryingTimeTracker tracker = new RetryingTimeTracker();
++    PayloadCarryingServerCallable<MultiResponse> callable =
++      new PayloadCarryingServerCallable<MultiResponse>(connection, getName(), rm.getRow(),
++        rpcControllerFactory) {
++        @Override
++        public MultiResponse call(int callTimeout) throws IOException {
++          tracker.start();
++          controller.setPriority(tableName);
++          int remainingTime = tracker.getRemainingTime(callTimeout);
++          if (remainingTime == 0) {
++            throw new DoNotRetryIOException("Timeout for mutate row");
++          }
++          controller.setCallTimeout(remainingTime);
++          try {
++            CompareType compareType = CompareType.valueOf(compareOp.name());
++            MultiRequest request = RequestConverter.buildMutateRequest(
++              getLocation().getRegionInfo().getRegionName(), row, family, qualifier,
++              new BinaryComparator(value), compareType, rm);
++            ClientProtos.MultiResponse response = getStub().multi(controller, request);
++            ClientProtos.RegionActionResult res = response.getRegionActionResultList().get(0);
++            if (res.hasException()) {
++              Throwable ex = ProtobufUtil.toException(res.getException());
++              if(ex instanceof IOException) {
++                throw (IOException)ex;
+               }
+-              return Boolean.valueOf(response.getProcessed());
+-            } catch (ServiceException se) {
+-              throw ProtobufUtil.getRemoteException(se);
++              throw new IOException("Failed to checkAndMutate row: "+
++                                    Bytes.toStringBinary(rm.getRow()), ex);
+             }
++            return ResponseConverter.getResults(request, response, controller.cellScanner());
++          } catch (ServiceException se) {
++            throw ProtobufUtil.getRemoteException(se);
+           }
+-        };
+-    return rpcCallerFactory.<Boolean> newCaller().callWithRetries(callable, this.operationTimeout);
++        }
++      };
++
++    Object[] results = new Object[rm.getMutations().size()];
++    AsyncRequestFuture ars = multiAp.submitAll(pool, tableName, rm.getMutations(),
++      null, results, callable, operationTimeout);
++    ars.waitUntilDone();
++    if (ars.hasError()) {
++      throw ars.getErrors();
++    }
++
++    return ((Result)results[0]).getExists();
+   }
+ 
+   /**
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index 7519391..f9e4c01 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -188,9 +188,9 @@ public final class ProtobufUtil {
+    *  we reuse them across calls.
+    */
+   private final static Cell[] EMPTY_CELL_ARRAY = new Cell[]{};
+-  public final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
+-  private final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
+-  private final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
++  private final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
++  public final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
++  public final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
+   private final static Result EMPTY_RESULT_STALE = Result.create(EMPTY_CELL_ARRAY, null, true);
+   private final static Result EMPTY_RESULT_EXISTS_TRUE_STALE
+     = Result.create((Cell[])null, true, true);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+index 664849f..421907d 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+@@ -127,15 +127,13 @@ public final class ResponseConverter {
+           responseValue = ProtobufUtil.toResult(roe.getResult(), cells);
+         } else if (roe.hasServiceResult()) {
+           responseValue = roe.getServiceResult();
+-        } else if (response.getProcessed()) {
++        } else{
+           // Sometimes, the response is just "it was processed". Generally, this occurs for things
+           // like mutateRows where either we get back 'processed' (or not) and optionally some
+           // statistics about the regions we touched.
+-          responseValue = ProtobufUtil.EMPTY_RESULT;
+-        } else {
+-          // no result & no exception. Unexpected.
+-          throw new IllegalStateException("No result & no exception roe=" + roe +
+-              " for region " + actions.getRegion());
++          responseValue = response.getProcessed() ?
++                          ProtobufUtil.EMPTY_RESULT_EXISTS_TRUE :
++                          ProtobufUtil.EMPTY_RESULT_EXISTS_FALSE;
+         }
+         results.add(regionName, roe.getIndex(), responseValue);
+       }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
+index 082de09..1234194 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
+@@ -53,7 +53,7 @@ public class TestCheckAndMutate {
+   }
+ 
+   @Test
+-  public void testCheckAndMutate() throws Exception {
++  public void testCheckAndMutate() throws Throwable {
+     final TableName tableName = TableName.valueOf("TestPutWithDelete");
+     final byte[] rowKey = Bytes.toBytes("12345");
+     final byte[] family = Bytes.toBytes("cf");
+@@ -109,7 +109,12 @@ public class TestCheckAndMutate {
+         table.checkAndMutate(rowKey, family, Bytes.toBytes("A"), CompareFilter.CompareOp.EQUAL,
+             Bytes.toBytes("a"), rm);
+         fail("Expected NoSuchColumnFamilyException");
+-      } catch(NoSuchColumnFamilyException e) {
++      } catch (RetriesExhaustedWithDetailsException e) {
++        try {
++          throw e.getCause(0);
++        } catch (NoSuchColumnFamilyException e1) {
++          // expected
++        }
+       }
+     } finally {
+       table.close();

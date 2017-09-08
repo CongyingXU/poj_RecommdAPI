@@ -1,0 +1,205 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 97360d2..ee9634c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -1425,6 +1425,13 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { //
+   }
+ 
+   /**
++   * @return split policy for this region.
++   */
++  public RegionSplitPolicy getSplitPolicy() {
++    return this.splitPolicy;
++  }
++
++  /**
+    * A split takes the config from the parent region & passes it to the daughter
+    * region's constructor. If 'conf' was passed, you would end up using the HTD
+    * of the parent region in addition to the new daughter HTD. Pass 'baseConf'
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
+index 4f728ae..b6beab3 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
+@@ -567,33 +567,37 @@ public class HRegionFileSystem {
+    * @param f File to split.
+    * @param splitRow Split Row
+    * @param top True if we are referring to the top half of the hfile.
++   * @param splitPolicy
+    * @return Path to created reference.
+    * @throws IOException
+    */
+-  Path splitStoreFile(final HRegionInfo hri, final String familyName,
+-      final StoreFile f, final byte[] splitRow, final boolean top) throws IOException {
+-
+-    // Check whether the split row lies in the range of the store file
+-    // If it is outside the range, return directly.
+-    if (top) {
+-      //check if larger than last key.
+-      KeyValue splitKey = KeyValueUtil.createFirstOnRow(splitRow);
+-      byte[] lastKey = f.createReader().getLastKey();
+-      // If lastKey is null means storefile is empty.
+-      if (lastKey == null) return null;
+-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
++  Path splitStoreFile(final HRegionInfo hri, final String familyName, final StoreFile f,
++      final byte[] splitRow, final boolean top, RegionSplitPolicy splitPolicy)
++          throws IOException {
++
++    if (splitPolicy == null || !splitPolicy.skipStoreFileRangeCheck()) {
++      // Check whether the split row lies in the range of the store file
++      // If it is outside the range, return directly.
++      if (top) {
++        //check if larger than last key.
++        KeyValue splitKey = KeyValueUtil.createFirstOnRow(splitRow);
++        byte[] lastKey = f.createReader().getLastKey();
++        // If lastKey is null means storefile is empty.
++        if (lastKey == null) return null;
++        if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+           splitKey.getKeyOffset(), splitKey.getKeyLength(), lastKey, 0, lastKey.length) > 0) {
+-        return null;
+-      }
+-    } else {
+-      //check if smaller than first key
+-      KeyValue splitKey = KeyValueUtil.createLastOnRow(splitRow);
+-      byte[] firstKey = f.createReader().getFirstKey();
+-      // If firstKey is null means storefile is empty.
+-      if (firstKey == null) return null;
+-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
++          return null;
++        }
++      } else {
++        //check if smaller than first key
++        KeyValue splitKey = KeyValueUtil.createLastOnRow(splitRow);
++        byte[] firstKey = f.createReader().getFirstKey();
++        // If firstKey is null means storefile is empty.
++        if (firstKey == null) return null;
++        if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+           splitKey.getKeyOffset(), splitKey.getKeyLength(), firstKey, 0, firstKey.length) < 0) {
+-        return null;
++          return null;
++        }
+       }
+     }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
+index 53979af..77d26a0 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
+@@ -125,4 +125,16 @@ public abstract class RegionSplitPolicy extends Configured {
+           e);
+     }
+   }
++
++  /**
++   * In {@link HRegionFileSystem#splitStoreFile(org.apache.hadoop.hbase.HRegionInfo,
++   * String, StoreFile, byte[], boolean)} we are not creating the split reference if split row
++   * not lies in the StoreFile range. But some use cases we may need to create the split reference
++   * even the split row not lies in the range.
++   * This method can be used to whether to skip the the StoreRile range check or not.
++   * @return whether to skip the StoreFile range check or or not
++   */
++  protected boolean skipStoreFileRangeCheck() {
++    return false;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java
+index 388cb6a..feb1f70 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java
+@@ -666,9 +666,12 @@ public class SplitTransaction {
+   private Pair<Path, Path> splitStoreFile(final byte[] family, final StoreFile sf) throws IOException {
+     HRegionFileSystem fs = this.parent.getRegionFileSystem();
+     String familyName = Bytes.toString(family);
+-
+-    Path path_a = fs.splitStoreFile(this.hri_a, familyName, sf, this.splitrow, false);
+-    Path path_b = fs.splitStoreFile(this.hri_b, familyName, sf, this.splitrow, true);
++    Path path_a =
++        fs.splitStoreFile(this.hri_a, familyName, sf, this.splitrow, false,
++          this.parent.getSplitPolicy());
++    Path path_b =
++        fs.splitStoreFile(this.hri_b, familyName, sf, this.splitrow, true,
++          this.parent.getSplitPolicy());
+     return new Pair<Path,Path>(path_a, path_b);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+index 99e8443..4138027 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+@@ -27,6 +27,7 @@ import static org.junit.Assert.fail;
+ 
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
++import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.CountDownLatch;
+@@ -969,6 +970,37 @@ public class TestSplitTransactionOnCluster {
+       TESTING_UTIL.deleteTable(tableName);
+     }
+   }
++
++  @Test
++  public void testStoreFileReferenceCreationWhenSplitPolicySaysToSkipRangeCheck()
++      throws Exception {
++    final TableName tableName =
++        TableName.valueOf("testStoreFileReferenceCreationWhenSplitPolicySaysToSkipRangeCheck");
++    try {
++      HTableDescriptor htd = new HTableDescriptor(tableName);
++      htd.addFamily(new HColumnDescriptor("f"));
++      htd.setRegionSplitPolicyClassName(CustomSplitPolicy.class.getName());
++      admin.createTable(htd);
++      List<HRegion> regions = awaitTableRegions(tableName);
++      HRegion region = regions.get(0);
++      for(int i = 3;i<9;i++) {
++        Put p = new Put(Bytes.toBytes("row"+i));
++        p.add(Bytes.toBytes("f"), Bytes.toBytes("q"), Bytes.toBytes("value"+i));
++        region.put(p);
++      }
++      region.flushcache();
++      Store store = region.getStore(Bytes.toBytes("f"));
++      Collection<StoreFile> storefiles = store.getStorefiles();
++      assertEquals(storefiles.size(), 1);
++      assertFalse(region.hasReferences());
++      Path referencePath = region.getRegionFileSystem().splitStoreFile(region.getRegionInfo(), "f",
++        storefiles.iterator().next(), Bytes.toBytes("row1"), false, region.getSplitPolicy());
++      assertNotNull(referencePath);
++    } finally {
++      TESTING_UTIL.deleteTable(tableName);
++    }
++  }
++
+     public static class MockedCoordinatedStateManager extends ZkCoordinatedStateManager {
+ 
+         public void initialize(Server server, HRegion region) {
+@@ -1268,5 +1300,18 @@ public class TestSplitTransactionOnCluster {
+       st.stepsAfterPONR(rs, rs, daughterRegions);
+     }
+   }
++
++  static class CustomSplitPolicy extends RegionSplitPolicy {
++
++    @Override
++    protected boolean shouldSplit() {
++      return true;
++    }
++
++    @Override
++    public boolean skipStoreFileRangeCheck() {
++      return true;
++    }
++  }
+ }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+index 95f6696..e5a5022 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+@@ -955,7 +955,7 @@ public class TestStoreFile extends HBaseTestCase {
+       final String family, final StoreFile sf, final byte[] splitKey, boolean isTopRef)
+       throws IOException {
+     FileSystem fs = regionFs.getFileSystem();
+-    Path path = regionFs.splitStoreFile(hri, family, sf, splitKey, isTopRef);
++    Path path = regionFs.splitStoreFile(hri, family, sf, splitKey, isTopRef, null);
+     if (null == path) {
+       return null;
+     }

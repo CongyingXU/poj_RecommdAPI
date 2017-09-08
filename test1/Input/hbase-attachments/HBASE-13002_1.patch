@@ -1,0 +1,328 @@
+From b82e2b931bb72a851c74f0afebaee47d5426ee9d Mon Sep 17 00:00:00 2001
+From: Ashish Singhi <ashish.singhi@huawei.com>
+Date: Wed, 11 Feb 2015 11:54:54 +0530
+Subject: [PATCH] HBASE-13002 Make encryption cipher configurable
+
+---
+ .../apache/hadoop/hbase/security/EncryptionUtil.java | 20 +++++++++++---------
+ .../hadoop/hbase/security/TestEncryptionUtil.java    |  4 +++-
+ .../java/org/apache/hadoop/hbase/HConstants.java     |  6 ++++++
+ .../hadoop/hbase/io/crypto/TestCipherProvider.java   |  8 +++++---
+ .../hadoop/hbase/io/crypto/TestEncryption.java       |  7 +++++--
+ .../org/apache/hadoop/hbase/regionserver/HStore.java |  4 ++--
+ .../regionserver/wal/SecureProtobufLogWriter.java    |  5 ++---
+ .../hadoop/hbase/io/hfile/TestHFileEncryption.java   |  4 +++-
+ .../regionserver/TestEncryptionKeyRotation.java      | 14 ++++++++++----
+ .../regionserver/TestEncryptionRandomKeying.java     |  4 +++-
+ .../apache/hadoop/hbase/util/TestEncryptionTest.java |  8 +++++---
+ .../hadoop/hbase/util/TestHBaseFsckEncryption.java   |  6 ++++--
+ 12 files changed, 59 insertions(+), 31 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/EncryptionUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/EncryptionUtil.java
+index f4bc3e9..7f93144 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/EncryptionUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/EncryptionUtil.java
+@@ -63,8 +63,7 @@ public class EncryptionUtil {
+ 
+   /**
+    * Protect a key by encrypting it with the secret key of the given subject.
+-   * The configuration must be set up correctly for key alias resolution. Keys
+-   * are always wrapped using AES.
++   * The configuration must be set up correctly for key alias resolution.
+    * @param conf configuration
+    * @param subject subject key alias
+    * @param key the key
+@@ -72,10 +71,12 @@ public class EncryptionUtil {
+    */
+   public static byte[] wrapKey(Configuration conf, String subject, Key key)
+       throws IOException {
+-    // Wrap the key with AES
+-    Cipher cipher = Encryption.getCipher(conf, "AES");
++    // Wrap the key with the configured encryption algorithm.
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    Cipher cipher = Encryption.getCipher(conf, algorithm);
+     if (cipher == null) {
+-      throw new RuntimeException("Cipher 'AES' not available");
++      throw new RuntimeException("Cipher '" + algorithm + "' not available");
+     }
+     EncryptionProtos.WrappedKey.Builder builder = EncryptionProtos.WrappedKey.newBuilder();
+     builder.setAlgorithm(key.getAlgorithm());
+@@ -100,8 +101,7 @@ public class EncryptionUtil {
+ 
+   /**
+    * Unwrap a key by decrypting it with the secret key of the given subject.
+-   * The configuration must be set up correctly for key alias resolution. Keys
+-   * are always unwrapped using AES.
++   * The configuration must be set up correctly for key alias resolution.
+    * @param conf configuration
+    * @param subject subject key alias
+    * @param value the encrypted key bytes
+@@ -113,9 +113,11 @@ public class EncryptionUtil {
+       throws IOException, KeyException {
+     EncryptionProtos.WrappedKey wrappedKey = EncryptionProtos.WrappedKey.PARSER
+         .parseDelimitedFrom(new ByteArrayInputStream(value));
+-    Cipher cipher = Encryption.getCipher(conf, "AES");
++    String algorithm = conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY,
++      HConstants.DEFAULT_CIPHER);
++    Cipher cipher = Encryption.getCipher(conf, algorithm);
+     if (cipher == null) {
+-      throw new RuntimeException("Algorithm 'AES' not available");
++      throw new RuntimeException("Cipher '" + algorithm + "' not available");
+     }
+     ByteArrayOutputStream out = new ByteArrayOutputStream();
+     byte[] iv = wrappedKey.hasIv() ? wrappedKey.getIv().toByteArray() : null;
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/security/TestEncryptionUtil.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/security/TestEncryptionUtil.java
+index ed6f49b..f305e1f 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/security/TestEncryptionUtil.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/security/TestEncryptionUtil.java
+@@ -49,7 +49,9 @@ public class TestEncryptionUtil {
+     // generate a test key
+     byte[] keyBytes = new byte[AES.KEY_LENGTH];
+     new SecureRandom().nextBytes(keyBytes);
+-    Key key = new SecretKeySpec(keyBytes, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    Key key = new SecretKeySpec(keyBytes, algorithm);
+ 
+     // wrap the test key
+     byte[] wrappedKeyBytes = EncryptionUtil.wrapKey(conf, "hbase", key);
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 2ee55f7..a2025d8 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -1041,6 +1041,9 @@ public final class HConstants {
+ 
+   public static final long NO_NONCE = 0;
+ 
++  /** Default cipher for encryption */
++  public static final String DEFAULT_CIPHER = "AES";
++
+   /** Configuration key for the crypto algorithm provider, a class name */
+   public static final String CRYPTO_CIPHERPROVIDER_CONF_KEY = "hbase.crypto.cipherprovider";
+ 
+@@ -1064,6 +1067,9 @@ public final class HConstants {
+   /** Configuration key for the name of the master WAL encryption key for the cluster, a string */
+   public static final String CRYPTO_WAL_KEY_NAME_CONF_KEY = "hbase.crypto.wal.key.name";
+ 
++  /** Configuration key for the algorithm used for creating jks key, a string */
++  public static final String CRYPTO_KEY_ALGORITHM_CONF_KEY = "hbase.crypto.key.algorithm";
++
+   /** Configuration key for enabling WAL encryption, a boolean */
+   public static final String ENABLE_WAL_ENCRYPTION = "hbase.regionserver.wal.encryption";
+ 
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestCipherProvider.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestCipherProvider.java
+index fdb9448..8416fd4 100644
+--- a/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestCipherProvider.java
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestCipherProvider.java
+@@ -142,11 +142,13 @@ public class TestCipherProvider {
+     Configuration conf = HBaseConfiguration.create();
+     CipherProvider provider = Encryption.getCipherProvider(conf);
+     assertTrue(provider instanceof DefaultCipherProvider);
+-    assertTrue(Arrays.asList(provider.getSupportedCiphers()).contains("AES"));
+-    Cipher a = Encryption.getCipher(conf, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    assertTrue(Arrays.asList(provider.getSupportedCiphers()).contains(algorithm));
++    Cipher a = Encryption.getCipher(conf, algorithm);
+     assertNotNull(a);
+     assertTrue(a.getProvider() instanceof DefaultCipherProvider);
+-    assertEquals(a.getName(), "AES");
++    assertEquals(a.getName(), algorithm);
+     assertEquals(a.getKeyLength(), AES.KEY_LENGTH);
+   }
+ 
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestEncryption.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestEncryption.java
+index d36333e..0603986 100644
+--- a/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestEncryption.java
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/io/crypto/TestEncryption.java
+@@ -29,6 +29,7 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.testclassification.MiscTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -89,8 +90,10 @@ public class TestEncryption {
+     LOG.info("checkTransformSymmetry: AES, plaintext length = " + plaintext.length);
+ 
+     Configuration conf = HBaseConfiguration.create();
+-    Cipher aes = Encryption.getCipher(conf, "AES");
+-    Key key = new SecretKeySpec(keyBytes, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    Cipher aes = Encryption.getCipher(conf, algorithm);
++    Key key = new SecretKeySpec(keyBytes, algorithm);
+ 
+     Encryptor e = aes.getEncryptor();
+     e.setKey(key);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+index 252e5e1..b4c374d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+@@ -318,7 +318,7 @@ public class HStore implements Store {
+         // Use the algorithm the key wants
+         cipher = Encryption.getCipher(conf, key.getAlgorithm());
+         if (cipher == null) {
+-          throw new RuntimeException("Cipher '" + cipher + "' is not available");
++          throw new RuntimeException("Cipher '" + key.getAlgorithm() + "' is not available");
+         }
+         // Fail if misconfigured
+         // We use the encryption type specified in the column schema as a sanity check on
+@@ -332,7 +332,7 @@ public class HStore implements Store {
+         // Family does not provide key material, create a random key
+         cipher = Encryption.getCipher(conf, cipherName);
+         if (cipher == null) {
+-          throw new RuntimeException("Cipher '" + cipher + "' is not available");
++          throw new RuntimeException("Cipher '" + cipherName + "' is not available");
+         }
+         key = cipher.getRandomKey();
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SecureProtobufLogWriter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SecureProtobufLogWriter.java
+index e850485..dbac0ca 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SecureProtobufLogWriter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SecureProtobufLogWriter.java
+@@ -43,8 +43,6 @@ import org.apache.hadoop.hbase.security.User;
+ public class SecureProtobufLogWriter extends ProtobufLogWriter {
+ 
+   private static final Log LOG = LogFactory.getLog(SecureProtobufLogWriter.class);
+-  private static final String DEFAULT_CIPHER = "AES";
+-
+   private Encryptor encryptor = null;
+ 
+   @Override
+@@ -56,7 +54,8 @@ public class SecureProtobufLogWriter extends ProtobufLogWriter {
+       EncryptionTest.testCipherProvider(conf);
+ 
+       // Get an instance of our cipher
+-      final String cipherName = conf.get(HConstants.CRYPTO_WAL_ALGORITHM_CONF_KEY, DEFAULT_CIPHER);
++      final String cipherName =
++          conf.get(HConstants.CRYPTO_WAL_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
+       Cipher cipher = Encryption.getCipher(conf, cipherName);
+       if (cipher == null) {
+         throw new RuntimeException("Cipher '" + cipherName + "' is not available");
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
+index 0cb3c3c..6958cee 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
+@@ -70,7 +70,9 @@ public class TestHFileEncryption {
+     fs = FileSystem.get(conf);
+ 
+     cryptoContext = Encryption.newContext(conf);
+-    Cipher aes = Encryption.getCipher(conf, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    Cipher aes = Encryption.getCipher(conf, algorithm);
+     assertNotNull(aes);
+     cryptoContext.setCipher(aes);
+     byte[] key = new byte[aes.getKeyLength()];
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionKeyRotation.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionKeyRotation.java
+index af86b4e..ce1392e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionKeyRotation.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionKeyRotation.java
+@@ -67,9 +67,11 @@ public class TestEncryptionKeyRotation {
+     SecureRandom rng = new SecureRandom();
+     byte[] keyBytes = new byte[AES.KEY_LENGTH];
+     rng.nextBytes(keyBytes);
+-    initialCFKey = new SecretKeySpec(keyBytes, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    initialCFKey = new SecretKeySpec(keyBytes, algorithm);
+     rng.nextBytes(keyBytes);
+-    secondCFKey = new SecretKeySpec(keyBytes, "AES");
++    secondCFKey = new SecretKeySpec(keyBytes, algorithm);
+   }
+ 
+   @BeforeClass
+@@ -95,7 +97,9 @@ public class TestEncryptionKeyRotation {
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("default",
+       "testCFKeyRotation"));
+     HColumnDescriptor hcd = new HColumnDescriptor("cf");
+-    hcd.setEncryptionType("AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    hcd.setEncryptionType(algorithm);
+     hcd.setEncryptionKey(EncryptionUtil.wrapKey(conf, "hbase", initialCFKey));
+     htd.addFamily(hcd);
+ 
+@@ -154,7 +158,9 @@ public class TestEncryptionKeyRotation {
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("default",
+       "testMasterKeyRotation"));
+     HColumnDescriptor hcd = new HColumnDescriptor("cf");
+-    hcd.setEncryptionType("AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    hcd.setEncryptionType(algorithm);
+     hcd.setEncryptionKey(EncryptionUtil.wrapKey(conf, "hbase", initialCFKey));
+     htd.addFamily(hcd);
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionRandomKeying.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionRandomKeying.java
+index 29a58a6..67c8138 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionRandomKeying.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEncryptionRandomKeying.java
+@@ -92,7 +92,9 @@ public class TestEncryptionRandomKeying {
+     // Specify an encryption algorithm without a key
+     htd = new HTableDescriptor(TableName.valueOf("default", "TestEncryptionRandomKeying"));
+     HColumnDescriptor hcd = new HColumnDescriptor("cf");
+-    hcd.setEncryptionType("AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    hcd.setEncryptionType(algorithm);
+     htd.addFamily(hcd);
+ 
+     // Start the minicluster
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestEncryptionTest.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestEncryptionTest.java
+index d615a29..d13f8da 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestEncryptionTest.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestEncryptionTest.java
+@@ -75,10 +75,12 @@ public class TestEncryptionTest {
+   public void testTestCipher() {
+     Configuration conf = HBaseConfiguration.create();
+     conf.set(HConstants.CRYPTO_KEYPROVIDER_CONF_KEY, KeyProviderForTesting.class.getName());
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
+     try {
+-      EncryptionTest.testEncryption(conf, "AES", null);
++      EncryptionTest.testEncryption(conf, algorithm, null);
+     } catch (Exception e) {
+-      fail("Test for cipher AES should have succeeded");
++      fail("Test for cipher " + algorithm + " should have succeeded");
+     }
+     try {
+       EncryptionTest.testEncryption(conf, "foobar", null);
+@@ -135,6 +137,6 @@ public class TestEncryptionTest {
+     public Cipher getCipher(String name) {
+       return null;
+     }
+-    
++
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckEncryption.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckEncryption.java
+index 69ffa55..1f1c34a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckEncryption.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsckEncryption.java
+@@ -78,7 +78,9 @@ public class TestHBaseFsckEncryption {
+     SecureRandom rng = new SecureRandom();
+     byte[] keyBytes = new byte[AES.KEY_LENGTH];
+     rng.nextBytes(keyBytes);
+-    cfKey = new SecretKeySpec(keyBytes, "AES");
++    String algorithm =
++        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.DEFAULT_CIPHER);
++    cfKey = new SecretKeySpec(keyBytes,algorithm);
+ 
+     // Start the minicluster
+     TEST_UTIL.startMiniCluster(3);
+@@ -86,7 +88,7 @@ public class TestHBaseFsckEncryption {
+     // Create the table
+     htd = new HTableDescriptor(TableName.valueOf("default", "TestHBaseFsckEncryption"));
+     HColumnDescriptor hcd = new HColumnDescriptor("cf");
+-    hcd.setEncryptionType("AES");
++    hcd.setEncryptionType(algorithm);
+     hcd.setEncryptionKey(EncryptionUtil.wrapKey(conf,
+       conf.get(HConstants.CRYPTO_MASTERKEY_NAME_CONF_KEY, User.getCurrent().getShortName()),
+       cfKey));
+-- 
+1.9.2.msysgit.0
+

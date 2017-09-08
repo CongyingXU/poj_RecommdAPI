@@ -1,0 +1,167 @@
+ .../java/org/apache/hadoop/hbase/CellUtil.java     | 64 ++++++++++++++++++++++
+ .../hbase/regionserver/ScanQueryMatcher.java       |  2 +-
+ .../hadoop/hbase/regionserver/StoreFile.java       | 13 ++---
+ .../hbase/io/encoding/TestPrefixTreeEncoding.java  | 18 ++----
+ 4 files changed, 76 insertions(+), 21 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+index 207f275..fdc81d5 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+@@ -1287,6 +1287,19 @@ public final class CellUtil {
+         cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength());
+   }
+ 
++  /**
++   * Create a Delete Family Cell for the specified row and family that would
++   * be smaller than all other possible Delete Family KeyValues that have the
++   * same row and family.
++   * Used for seeking.
++   * @param row - row key (arbitrary byte array)
++   * @param family - family name
++   * @return First Delete Family possible key on passed <code>row</code>.
++   */
++  public static Cell createFirstOnRowDeleteFamilyCell(final byte[] row, final byte[] fam) {
++    return new FirstOnRowDeleteFamilyCell(row, fam);
++  }
++
+   @InterfaceAudience.Private
+   private static abstract class FakeCell implements Cell {
+ 
+@@ -1565,4 +1578,55 @@ public final class CellUtil {
+       return this.qlength;
+     }
+   }
++
++  @InterfaceAudience.Private
++  private static class FirstOnRowDeleteFamilyCell extends FakeCell {
++    private final byte[] row;
++    private final byte[] fam;
++
++    public FirstOnRowDeleteFamilyCell(byte[] row, byte[] fam) {
++      this.row = row;
++      this.fam = fam;
++    }
++
++    @Override
++    public byte[] getRowArray() {
++      return this.row;
++    }
++
++    @Override
++    public int getRowOffset() {
++      return 0;
++    }
++
++    @Override
++    public short getRowLength() {
++      return (short) row.length;
++    }
++
++    @Override
++    public byte[] getFamilyArray() {
++      return this.fam;
++    }
++
++    @Override
++    public int getFamilyOffset() {
++      return 0;
++    }
++
++    @Override
++    public byte getFamilyLength() {
++      return (byte) this.fam.length;
++    }
++
++    @Override
++    public long getTimestamp() {
++      return HConstants.LATEST_TIMESTAMP;
++    }
++
++    @Override
++    public byte getTypeByte() {
++      return Type.DeleteFamily.getCode();
++    }
++  }
+ }
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
+index 02a73f8..6d819d6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
+@@ -165,7 +165,7 @@ public class ScanQueryMatcher {
+     this.regionCoprocessorHost = regionCoprocessorHost;
+     this.deletes =  instantiateDeleteTracker();
+     this.stopRow = scan.getStopRow();
+-    this.startKey = KeyValueUtil.createFirstDeleteFamilyOnRow(scan.getStartRow(),
++    this.startKey = CellUtil.createFirstOnRowDeleteFamilyCell(scan.getStartRow(),
+         scanInfo.getFamily());
+     this.filter = scan.getFilter();
+     this.earliestPutTs = earliestPutTs;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+index eb76440..daea870 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+@@ -1362,19 +1362,16 @@ public class StoreFile {
+           && Bytes.equals(scan.getStopRow(), HConstants.EMPTY_END_ROW)) {
+         return true;
+       }
+-      KeyValue smallestScanKeyValue = scan.isReversed() ? KeyValueUtil
+-          .createFirstOnRow(scan.getStopRow()) : KeyValueUtil.createFirstOnRow(scan
+-          .getStartRow());
+-      KeyValue largestScanKeyValue = scan.isReversed() ? KeyValueUtil
+-          .createLastOnRow(scan.getStartRow()) : KeyValueUtil.createLastOnRow(scan
+-          .getStopRow());
++      byte[] smallestScanRow = scan.isReversed() ? scan.getStopRow() : scan.getStartRow();
++      byte[] largestScanRow = scan.isReversed() ? scan.getStartRow() : scan.getStopRow();
+       Cell firstKeyKV = this.getFirstKey();
+       Cell lastKeyKV = this.getLastKey();
+-      boolean nonOverLapping = ((getComparator().compare(firstKeyKV, largestScanKeyValue)) > 0
++      boolean nonOverLapping = (getComparator().compareRows(firstKeyKV,
++          largestScanRow, 0, largestScanRow.length) > 0 
+           && !Bytes
+           .equals(scan.isReversed() ? scan.getStartRow() : scan.getStopRow(),
+               HConstants.EMPTY_END_ROW))
+-          || (getComparator().compare(lastKeyKV, smallestScanKeyValue)) < 0;
++          || getComparator().compareRows(lastKeyKV, smallestScanRow, 0, smallestScanRow.length) < 0;
+       return !nonOverLapping;
+     }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestPrefixTreeEncoding.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestPrefixTreeEncoding.java
+index 91115c1..f6c1af8 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestPrefixTreeEncoding.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestPrefixTreeEncoding.java
+@@ -120,27 +120,21 @@ public class TestPrefixTreeEncoding {
+     seeker.setCurrentBuffer(readBuffer);
+ 
+     // Seek before the first keyvalue;
+-    KeyValue seekKey = KeyValueUtil.createFirstDeleteFamilyOnRow(getRowKey(batchId, 0), CF_BYTES);
+-    seeker.seekToKeyInBlock(
+-        new KeyValue.KeyOnlyKeyValue(seekKey.getBuffer(), seekKey.getKeyOffset(), seekKey
+-            .getKeyLength()), true);
++    Cell seekKey = CellUtil.createFirstOnRowDeleteFamilyCell(getRowKey(batchId, 0), CF_BYTES);
++    seeker.seekToKeyInBlock(seekKey, true);
+     assertEquals(null, seeker.getKeyValue());
+ 
+     // Seek before the middle keyvalue;
+-    seekKey = KeyValueUtil.createFirstDeleteFamilyOnRow(getRowKey(batchId, NUM_ROWS_PER_BATCH / 3),
++    seekKey = CellUtil.createFirstOnRowDeleteFamilyCell(getRowKey(batchId, NUM_ROWS_PER_BATCH / 3),
+         CF_BYTES);
+-    seeker.seekToKeyInBlock(
+-        new KeyValue.KeyOnlyKeyValue(seekKey.getBuffer(), seekKey.getKeyOffset(), seekKey
+-            .getKeyLength()), true);
++    seeker.seekToKeyInBlock(seekKey, true);
+     assertNotNull(seeker.getKeyValue());
+     assertArrayEquals(getRowKey(batchId, NUM_ROWS_PER_BATCH / 3 - 1),
+       CellUtil.cloneRow(seeker.getKeyValue()));
+ 
+     // Seek before the last keyvalue;
+-    seekKey = KeyValueUtil.createFirstDeleteFamilyOnRow(Bytes.toBytes("zzzz"), CF_BYTES);
+-    seeker.seekToKeyInBlock(
+-        new KeyValue.KeyOnlyKeyValue(seekKey.getBuffer(), seekKey.getKeyOffset(), seekKey
+-            .getKeyLength()), true);
++    seekKey = CellUtil.createFirstOnRowDeleteFamilyCell(Bytes.toBytes("zzzz"), CF_BYTES);
++    seeker.seekToKeyInBlock(seekKey, true);
+     assertNotNull(seeker.getKeyValue());
+     assertArrayEquals(getRowKey(batchId, NUM_ROWS_PER_BATCH - 1),
+       CellUtil.cloneRow(seeker.getKeyValue()));

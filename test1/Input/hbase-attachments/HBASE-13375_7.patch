@@ -1,0 +1,1053 @@
+From acb7e1c2aecd67f7214bd16b7eeb85fdd6e0e75c Mon Sep 17 00:00:00 2001
+From: Mikhail Antonov <olorinbant@gmail.com>
+Date: Thu, 14 May 2015 16:04:54 -0700
+Subject: [PATCH] HBASE-13375 Provide HBase superuser higher priority over
+ other users in the RPC handling
+
+---
+ .../org/apache/hadoop/hbase/security/User.java     | 101 ++++++++++++++++++++-
+ .../apache/hadoop/hbase/ipc/PriorityFunction.java  |   4 +-
+ .../hadoop/hbase/ipc/SimpleRpcScheduler.java       |   2 +-
+ .../AnnotationReadingPriorityFunction.java         |  19 +++-
+ .../hadoop/hbase/regionserver/RSRpcServices.java   |   5 +-
+ .../hbase/security/access/AccessControlLists.java  |  29 +-----
+ .../hbase/security/access/AccessController.java    |  25 ++---
+ .../hbase/security/access/TableAuthManager.java    |  22 ++---
+ .../DefaultVisibilityLabelServiceImpl.java         |  27 +-----
+ .../security/visibility/VisibilityController.java  |  25 +----
+ .../security/visibility/VisibilityLabelsCache.java |   6 +-
+ .../hbase/security/visibility/VisibilityUtils.java |  34 -------
+ .../org/apache/hadoop/hbase/client/TestAdmin2.java |   2 +-
+ .../hadoop/hbase/ipc/TestSimpleRpcScheduler.java   |  11 ++-
+ .../hadoop/hbase/master/TestMasterPriorityRpc.java |   5 +-
+ .../hadoop/hbase/regionserver/TestPriorityRpc.java |  38 +++++++-
+ .../hadoop/hbase/regionserver/TestQosFunction.java |  25 +++--
+ .../hbase/security/access/SecureTestUtil.java      |   2 +-
+ .../ExpAsStringVisibilityLabelServiceImpl.java     |  51 +----------
+ .../apache/hadoop/hbase/util/TestHBaseFsck.java    |   2 +-
+ 20 files changed, 217 insertions(+), 218 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/security/User.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/security/User.java
+index 58a3c66..e11a8c4 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/security/User.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/security/User.java
+@@ -23,8 +23,12 @@ import java.io.IOException;
+ import java.lang.reflect.UndeclaredThrowableException;
+ import java.security.PrivilegedAction;
+ import java.security.PrivilegedExceptionAction;
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.List;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+@@ -50,6 +54,14 @@ import org.apache.hadoop.security.token.TokenIdentifier;
+ @InterfaceAudience.Public
+ @InterfaceStability.Stable
+ public abstract class User {
++  private static final Log LOG = LogFactory.getLog(User.class);
++
++  /** Prefix character to denote group names */
++  public static final String GROUP_PREFIX = "@";
++
++  /** Configuration key for superusers */
++  public static final String SUPERUSER_CONF_KEY = "hbase.superuser";
++
+   public static final String HBASE_SECURITY_CONF_KEY =
+       "hbase.security.authentication";
+   public static final String HBASE_SECURITY_AUTHORIZATION_CONF_KEY =
+@@ -57,11 +69,92 @@ public abstract class User {
+ 
+   protected UserGroupInformation ugi;
+ 
++  /**
++   * Super users as defined in configuration.
++   */
++  protected static List<String> superUsers;
++
++  /**
++   * Super groups as defined in configuration.
++   */
++  protected static List<String> superGroups;
++
++  /**
++   * Should be called only once to pre-load list of super users and super
++   * groups from Configuration. This operation is idempotent.
++   * @param conf configuration to load users from
++   * @throws IOException
++   */
++  public static void loadSuperUsers(Configuration conf) throws IOException {
++    superUsers = new ArrayList<>();
++    superGroups = new ArrayList<>();
++    User user = User.getCurrent();
++    if (user == null) {
++      throw new IOException("Unable to obtain the current user, "
++        + "authorization checks for internal operations will not work correctly!");
++    }
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Current user name is " + user.getShortName());
++    }
++    String currentUser = user.getShortName();
++    String[] superUserList = conf.getStrings(SUPERUSER_CONF_KEY, new String[0]);
++    for (String name : superUserList) {
++      if (isGroupPrincipal(name)) {
++        superGroups.add(getGroupName(name));
++      } else {
++        superUsers.add(name);
++      }
++    }
++    superUsers.add(currentUser);
++  }
++
++  /**
++   * Returns whether or not the given name should be interpreted as a group
++   * principal.  Currently this simply checks if the name starts with the
++   * special group prefix character ("@").
++   */
++  public static boolean isGroupPrincipal(String name) {
++    return name != null && name.startsWith(GROUP_PREFIX);
++  }
++
++  /**
++   * Returns the actual name for a group principal (stripped of the
++   * group prefix).
++   */
++  public static String getGroupName(String aclKey) {
++    if (!isGroupPrincipal(aclKey)) {
++      return aclKey;
++    }
++
++    return aclKey.substring(GROUP_PREFIX.length());
++  }
++
+   public UserGroupInformation getUGI() {
+     return ugi;
+   }
+ 
+   /**
++   * @return true if current user is a super user (whether as user running process,
++   * declared as individual superuser or member of supergroup), false otherwise.
++   */
++  public boolean isSuperUser()
++    throws IOException {
++    if (superUsers == null || superGroups == null) {
++      throw new IOException("Super users/super groups lists haven't been initialized properly,");
++    }
++    if (superUsers.contains(getShortName())) {
++      return true;
++    }
++
++    for (String group : getGroupNames()) {
++      if (superGroups.contains(group)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  /**
+    * Returns the full user name.  For Kerberos principals this will include
+    * the host and realm portions of the principal name.
+    *
+@@ -228,7 +321,13 @@ public abstract class User {
+    */
+   public static User createUserForTesting(Configuration conf,
+       String name, String[] groups) {
+-    return SecureHadoopUser.createUserForTesting(conf, name, groups);
++    User userForTesting = SecureHadoopUser.createUserForTesting(conf, name, groups);
++    try {
++      User.loadSuperUsers(conf);
++    } catch (IOException e) {
++      e.printStackTrace();
++    }
++    return userForTesting;
+   }
+ 
+   /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/PriorityFunction.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/PriorityFunction.java
+index e323e78..f56bf6f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/PriorityFunction.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/PriorityFunction.java
+@@ -22,6 +22,7 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+ import org.apache.hadoop.hbase.protobuf.generated.RPCProtos.RequestHeader;
++import org.apache.hadoop.hbase.security.User;
+ 
+ /**
+  * Function to figure priority of incoming request.
+@@ -34,9 +35,10 @@ public interface PriorityFunction {
+    * The returned value is mainly used to select the dispatch queue.
+    * @param header
+    * @param param
++   * @param user
+    * @return Priority of this request.
+    */
+-  int getPriority(RequestHeader header, Message param);
++  int getPriority(RequestHeader header, Message param, User user);
+ 
+   /**
+    * Returns the deadline of the specified request.
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+index 2889d8d..b8e9c52 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+@@ -192,7 +192,7 @@ public class SimpleRpcScheduler extends RpcScheduler {
+   @Override
+   public void dispatch(CallRunner callTask) throws InterruptedException {
+     RpcServer.Call call = callTask.getCall();
+-    int level = priority.getPriority(call.getHeader(), call.param);
++    int level = priority.getPriority(call.getHeader(), call.param, call.getRequestUser());
+     if (priorityExecutor != null && level > highPriorityLevel) {
+       priorityExecutor.dispatch(callTask);
+     } else if (replicationExecutor != null && level == HConstants.REPLICATION_QOS) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/AnnotationReadingPriorityFunction.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/AnnotationReadingPriorityFunction.java
+index 880710a..c4c57c4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/AnnotationReadingPriorityFunction.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/AnnotationReadingPriorityFunction.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
++import java.io.IOException;
+ import java.lang.reflect.Method;
+ import java.util.HashMap;
+ import java.util.Map;
+@@ -49,7 +50,7 @@ import org.apache.hadoop.hbase.protobuf.generated.RPCProtos.RequestHeader;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.Message;
+ import com.google.protobuf.TextFormat;
+-
++import org.apache.hadoop.hbase.security.User;
+ 
+ /**
+  * Reads special method annotations and table names to figure a priority for use by QoS facility in
+@@ -175,12 +176,26 @@ class AnnotationReadingPriorityFunction implements PriorityFunction {
+    * NORMAL_QOS (user requests).
+    */
+   @Override
+-  public int getPriority(RequestHeader header, Message param) {
++  public int getPriority(RequestHeader header, Message param,
++                         User user) {
+     String methodName = header.getMethodName();
+     Integer priorityByAnnotation = annotatedQos.get(methodName);
+     if (priorityByAnnotation != null) {
+       return priorityByAnnotation;
+     }
++
++    // all requests executed by super users have high QoS
++    try {
++      if (user.isSuperUser()) {
++        return HConstants.ADMIN_QOS;
++      }
++    } catch (IOException ex) {
++      // Not good throwing an exception out of here, a runtime anyways.  Let the query go into the
++      // server and have it throw the exception if still an issue.  Just mark it normal priority.
++      if (LOG.isTraceEnabled()) LOG.trace("Marking normal priority after getting exception=" + ex);
++      return HConstants.NORMAL_QOS;
++    }
++
+     if (param == null) {
+       return HConstants.NORMAL_QOS;
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 6491a5c..d3dcbd1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -158,6 +158,7 @@ import org.apache.hadoop.hbase.regionserver.ScannerContext.LimitScope;
+ import org.apache.hadoop.hbase.regionserver.handler.OpenMetaHandler;
+ import org.apache.hadoop.hbase.regionserver.handler.OpenRegionHandler;
+ import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Counter;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+@@ -1005,8 +1006,8 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+   }
+ 
+   @Override
+-  public int getPriority(RequestHeader header, Message param) {
+-    return priority.getPriority(header, param);
++  public int getPriority(RequestHeader header, Message param, User user) {
++    return priority.getPriority(header, param, user);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+index 7ff2284..c2f5ceb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+@@ -114,10 +114,6 @@ public class AccessControlLists {
+    * Delimiter to separate user, column family, and qualifier in
+    * _acl_ table info: column keys */
+   public static final char ACL_KEY_DELIMITER = ',';
+-  /** Prefix character to denote group names */
+-  public static final String GROUP_PREFIX = "@";
+-  /** Configuration key for superusers */
+-  public static final String SUPERUSER_CONF_KEY = "hbase.superuser";
+ 
+   private static final Log LOG = LogFactory.getLog(AccessControlLists.class);
+ 
+@@ -620,31 +616,10 @@ public class AccessControlLists {
+   }
+ 
+   /**
+-   * Returns whether or not the given name should be interpreted as a group
+-   * principal.  Currently this simply checks if the name starts with the
+-   * special group prefix character ("@").
+-   */
+-  public static boolean isGroupPrincipal(String name) {
+-    return name != null && name.startsWith(GROUP_PREFIX);
+-  }
+-
+-  /**
+-   * Returns the actual name for a group principal (stripped of the
+-   * group prefix).
+-   */
+-  public static String getGroupName(String aclKey) {
+-    if (!isGroupPrincipal(aclKey)) {
+-      return aclKey;
+-    }
+-
+-    return aclKey.substring(GROUP_PREFIX.length());
+-  }
+-
+-  /**
+    * Returns the group entry with the group prefix for a group principal.
+    */
+   public static String toGroupEntry(String name) {
+-    return GROUP_PREFIX + name;
++    return User.GROUP_PREFIX + name;
+   }
+ 
+   public static boolean isNamespaceEntry(String entryName) {
+@@ -705,7 +680,7 @@ public class AccessControlLists {
+          String groupNames[] = user.getGroupNames();
+          if (groupNames != null) {
+            for (String group : groupNames) {
+-             List<Permission> groupPerms = kvPerms.get(GROUP_PREFIX + group);
++             List<Permission> groupPerms = kvPerms.get(User.GROUP_PREFIX + group);
+              if (results != null) {
+                results.addAll(groupPerms);
+              }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+index 4d22309..6cc2a65 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+@@ -181,9 +181,6 @@ public class AccessController extends BaseMasterAndRegionObserver
+   /** Provider for mapping principal names to Users */
+   private UserProvider userProvider;
+ 
+-  /** The list of users with superuser authority */
+-  private List<String> superusers;
+-
+   /** if we are active, usually true, only not true if "hbase.security.authorization"
+    has been set to false in site configuration */
+   boolean authorizationEnabled;
+@@ -891,7 +888,7 @@ public class AccessController extends BaseMasterAndRegionObserver
+       return;
+     }
+     // Superusers are allowed to store cells unconditionally.
+-    if (superusers.contains(user.getShortName())) {
++    if (user.isSuperUser()) {
+       m.setAttribute(TAG_CHECK_PASSED, TRUE);
+       return;
+     }
+@@ -955,11 +952,6 @@ public class AccessController extends BaseMasterAndRegionObserver
+     // set the user-provider.
+     this.userProvider = UserProvider.instantiate(env.getConfiguration());
+ 
+-    // set up the list of users with superuser privilege
+-    User user = userProvider.getCurrent();
+-    superusers = Lists.asList(user.getShortName(),
+-      conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+-
+     // If zk is null or IOException while obtaining auth manager,
+     // throw RuntimeException so that the coprocessor is unloaded.
+     if (zk != null) {
+@@ -1356,7 +1348,7 @@ public class AccessController extends BaseMasterAndRegionObserver
+     } else {
+       HRegionInfo regionInfo = region.getRegionInfo();
+       if (regionInfo.getTable().isSystemTable()) {
+-        isSystemOrSuperUser(regionEnv.getConfiguration());
++        checkSystemOrSuperUser(regionEnv.getConfiguration());
+       } else {
+         requirePermission("preOpen", Action.ADMIN);
+       }
+@@ -2395,20 +2387,15 @@ public class AccessController extends BaseMasterAndRegionObserver
+     requirePermission("preClose", Action.ADMIN);
+   }
+ 
+-  private void isSystemOrSuperUser(Configuration conf) throws IOException {
++  private void checkSystemOrSuperUser(Configuration conf) throws IOException {
+     // No need to check if we're not going to throw
+     if (!authorizationEnabled) {
+       return;
+     }
+-    User user = userProvider.getCurrent();
+-    if (user == null) {
+-      throw new IOException("Unable to obtain the current user, " +
+-        "authorization checks for internal operations will not work correctly!");
+-    }
+     User activeUser = getActiveUser();
+-    if (!(superusers.contains(activeUser.getShortName()))) {
+-      throw new AccessDeniedException("User '" + (user != null ? user.getShortName() : "null") +
+-        "is not system or super user.");
++    if (!activeUser.isSuperUser()) {
++      throw new AccessDeniedException("User '" + (activeUser != null ?
++        activeUser.getShortName() : "null") + "is not system or super user.");
+     }
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/TableAuthManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/TableAuthManager.java
+index a6ac4ae..309f139 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/TableAuthManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/TableAuthManager.java
+@@ -79,13 +79,13 @@ public class TableAuthManager {
+ 
+     /**
+      * Returns a combined map of user and group permissions, with group names prefixed by
+-     * {@link AccessControlLists#GROUP_PREFIX}.
++     * {@link org.apache.hadoop.hbase.security.User#GROUP_PREFIX}.
+      */
+     public ListMultimap<String,T> getAllPermissions() {
+       ListMultimap<String,T> tmp = ArrayListMultimap.create();
+       tmp.putAll(userCache);
+       for (String group : groupCache.keySet()) {
+-        tmp.putAll(AccessControlLists.GROUP_PREFIX + group, groupCache.get(group));
++        tmp.putAll(User.GROUP_PREFIX + group, groupCache.get(group));
+       }
+       return tmp;
+     }
+@@ -139,11 +139,11 @@ public class TableAuthManager {
+ 
+     // the system user is always included
+     List<String> superusers = Lists.asList(currentUser, conf.getStrings(
+-        AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
++        User.SUPERUSER_CONF_KEY, new String[0]));
+     if (superusers != null) {
+       for (String name : superusers) {
+-        if (AccessControlLists.isGroupPrincipal(name)) {
+-          newCache.putGroup(AccessControlLists.getGroupName(name),
++        if (User.isGroupPrincipal(name)) {
++          newCache.putGroup(User.getGroupName(name),
+               new Permission(Permission.Action.values()));
+         } else {
+           newCache.putUser(name, new Permission(Permission.Action.values()));
+@@ -205,8 +205,8 @@ public class TableAuthManager {
+     try {
+       newCache = initGlobal(conf);
+       for (Map.Entry<String,TablePermission> entry : userPerms.entries()) {
+-        if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
+-          newCache.putGroup(AccessControlLists.getGroupName(entry.getKey()),
++        if (User.isGroupPrincipal(entry.getKey())) {
++          newCache.putGroup(User.getGroupName(entry.getKey()),
+               new Permission(entry.getValue().getActions()));
+         } else {
+           newCache.putUser(entry.getKey(), new Permission(entry.getValue().getActions()));
+@@ -233,8 +233,8 @@ public class TableAuthManager {
+     PermissionCache<TablePermission> newTablePerms = new PermissionCache<TablePermission>();
+ 
+     for (Map.Entry<String,TablePermission> entry : tablePerms.entries()) {
+-      if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
+-        newTablePerms.putGroup(AccessControlLists.getGroupName(entry.getKey()), entry.getValue());
++      if (User.isGroupPrincipal(entry.getKey())) {
++        newTablePerms.putGroup(User.getGroupName(entry.getKey()), entry.getValue());
+       } else {
+         newTablePerms.putUser(entry.getKey(), entry.getValue());
+       }
+@@ -257,8 +257,8 @@ public class TableAuthManager {
+     PermissionCache<TablePermission> newTablePerms = new PermissionCache<TablePermission>();
+ 
+     for (Map.Entry<String, TablePermission> entry : tablePerms.entries()) {
+-      if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
+-        newTablePerms.putGroup(AccessControlLists.getGroupName(entry.getKey()), entry.getValue());
++      if (User.isGroupPrincipal(entry.getKey())) {
++        newTablePerms.putGroup(User.getGroupName(entry.getKey()), entry.getValue());
+       } else {
+         newTablePerms.putUser(entry.getKey(), entry.getValue());
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
+index 34ccb4a..bdfef83 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
+@@ -80,8 +80,6 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   private Region labelsRegion;
+   private VisibilityLabelsCache labelsCache;
+   private List<ScanLabelGenerator> scanLabelGenerators;
+-  private List<String> superUsers;
+-  private List<String> superGroups;
+ 
+   static {
+     ByteArrayOutputStream baos = new ByteArrayOutputStream();
+@@ -118,10 +116,6 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+       throw ioe;
+     }
+     this.scanLabelGenerators = VisibilityUtils.getScanLabelGenerators(this.conf);
+-    Pair<List<String>, List<String>> superUsersAndGroups =
+-        VisibilityUtils.getSystemAndSuperUsers(this.conf);
+-    this.superUsers = superUsersAndGroups.getFirst();
+-    this.superGroups = superUsersAndGroups.getSecond();
+     if (e.getRegion().getRegionInfo().getTable().equals(LABELS_TABLE_NAME)) {
+       this.labelsRegion = e.getRegion();
+       Pair<Map<String, Integer>, Map<String, List<Integer>>> labelsAndUserAuths =
+@@ -266,8 +260,8 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+     assert labelsRegion != null;
+     OperationStatus[] finalOpStatus = new OperationStatus[authLabels.size()];
+     List<String> currentAuths;
+-    if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
+-      String group = AccessControlLists.getGroupName(Bytes.toString(user));
++    if (User.isGroupPrincipal(Bytes.toString(user))) {
++      String group = User.getGroupName(Bytes.toString(user));
+       currentAuths = this.getGroupAuths(new String[]{group}, true);
+     }
+     else {
+@@ -539,7 +533,7 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   @Override
+   public boolean havingSystemAuth(User user) throws IOException {
+     // A super user has 'system' auth.
+-    if (isSystemOrSuperUser(user)) {
++    if (user.isSuperUser()) {
+       return true;
+     }
+     // A user can also be explicitly granted 'system' auth.
+@@ -557,21 +551,6 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+     return auths.contains(SYSTEM_LABEL);
+   }
+ 
+-  private boolean isSystemOrSuperUser(User user) throws IOException {
+-    if (this.superUsers.contains(user.getShortName())) {
+-      return true;
+-    }
+-    String[] groups = user.getGroupNames();
+-    if (groups != null && groups.length > 0) {
+-      for (String group : groups) {
+-        if (this.superGroups.contains(group)) {
+-          return true;
+-        }
+-      }
+-    }
+-    return false;
+-  }
+-
+   @Override
+   public boolean matchVisibility(List<Tag> putVisTags, Byte putTagsFormat, List<Tag> deleteVisTags,
+       Byte deleteTagsFormat) throws IOException {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+index 922e8a5..bc2e356 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+@@ -98,7 +98,6 @@ import org.apache.hadoop.hbase.regionserver.RegionScanner;
+ import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
+ import org.apache.hadoop.hbase.security.AccessDeniedException;
+ import org.apache.hadoop.hbase.security.User;
+-import org.apache.hadoop.hbase.security.access.AccessControlLists;
+ import org.apache.hadoop.hbase.security.access.AccessController;
+ import org.apache.hadoop.hbase.util.ByteStringer;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -133,8 +132,6 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+   private Map<InternalScanner,String> scannerOwners =
+       new MapMaker().weakKeys().makeMap();
+ 
+-  private List<String> superUsers;
+-  private List<String> superGroups;
+   private VisibilityLabelService visibilityLabelService;
+ 
+   /** if we are active, usually true, only not true if "hbase.security.authorization"
+@@ -173,10 +170,6 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+       visibilityLabelService = VisibilityLabelServiceManager.getInstance()
+           .getVisibilityLabelService(this.conf);
+     }
+-    Pair<List<String>, List<String>> superUsersAndGroups =
+-        VisibilityUtils.getSystemAndSuperUsers(this.conf);
+-    this.superUsers = superUsersAndGroups.getFirst();
+-    this.superGroups = superUsersAndGroups.getSecond();
+   }
+ 
+   @Override
+@@ -686,19 +679,7 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+   }
+ 
+   private boolean isSystemOrSuperUser() throws IOException {
+-    User activeUser = VisibilityUtils.getActiveUser();
+-    if (this.superUsers.contains(activeUser.getShortName())) {
+-      return true;
+-    }
+-    String[] groups = activeUser.getGroupNames();
+-    if (groups != null && groups.length > 0) {
+-      for (String group : groups) {
+-        if (this.superGroups.contains(group)) {
+-          return true;
+-        }
+-      }
+-    }
+-    return false;
++    return VisibilityUtils.getActiveUser().isSuperUser();
+   }
+ 
+   @Override
+@@ -926,8 +907,8 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+               + (requestingUser != null ? requestingUser.getShortName() : "null")
+               + "' is not authorized to perform this action.");
+         }
+-        if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
+-          String group = AccessControlLists.getGroupName(Bytes.toString(user));
++        if (User.isGroupPrincipal(Bytes.toString(user))) {
++          String group = User.getGroupName(Bytes.toString(user));
+           labels = this.visibilityLabelService.getGroupAuths(new String[]{group}, false);
+         }
+         else {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
+index ed2998a..09892e9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
+@@ -35,7 +35,7 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.MultiUserAuthorizations;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.UserAuthorizations;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabel;
+-import org.apache.hadoop.hbase.security.access.AccessControlLists;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+ import org.apache.zookeeper.KeeperException;
+@@ -145,8 +145,8 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
+       this.groupAuths.clear();
+       for (UserAuthorizations userAuths : multiUserAuths.getUserAuthsList()) {
+         String user = Bytes.toString(userAuths.getUser().toByteArray());
+-        if (AccessControlLists.isGroupPrincipal(user)) {
+-          this.groupAuths.put(AccessControlLists.getGroupName(user),
++        if (User.isGroupPrincipal(user)) {
++          this.groupAuths.put(User.getGroupName(user),
+             new HashSet<Integer>(userAuths.getAuthList()));
+         } else {
+           this.userAuths.put(user, new HashSet<Integer>(userAuths.getAuthList()));
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
+index 916a34c..92f9d93 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
+@@ -53,7 +53,6 @@ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.Visibil
+ import org.apache.hadoop.hbase.regionserver.Region;
+ import org.apache.hadoop.hbase.security.AccessDeniedException;
+ import org.apache.hadoop.hbase.security.User;
+-import org.apache.hadoop.hbase.security.access.AccessControlLists;
+ import org.apache.hadoop.hbase.security.visibility.expression.ExpressionNode;
+ import org.apache.hadoop.hbase.security.visibility.expression.LeafExpressionNode;
+ import org.apache.hadoop.hbase.security.visibility.expression.NonLeafExpressionNode;
+@@ -61,7 +60,6 @@ import org.apache.hadoop.hbase.security.visibility.expression.Operator;
+ import org.apache.hadoop.hbase.util.ByteRange;
+ import org.apache.hadoop.hbase.util.ByteStringer;
+ import org.apache.hadoop.hbase.util.Bytes;
+-import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.SimpleMutableByteRange;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+@@ -103,38 +101,6 @@ public class VisibilityUtils {
+   }
+ 
+   /**
+-   * Get the super users and groups defined in the configuration.
+-   * The user running the hbase server is always included.
+-   * @param conf
+-   * @return Pair of super user list and super group list.
+-   * @throws IOException
+-   */
+-  public static Pair<List<String>, List<String>> getSystemAndSuperUsers(Configuration conf)
+-      throws IOException {
+-    ArrayList<String> superUsers = new ArrayList<String>();
+-    ArrayList<String> superGroups = new ArrayList<String>();
+-    User user = User.getCurrent();
+-    if (user == null) {
+-      throw new IOException("Unable to obtain the current user, "
+-          + "authorization checks for internal operations will not work correctly!");
+-    }
+-    if (LOG.isTraceEnabled()) {
+-      LOG.trace("Current user name is " + user.getShortName());
+-    }
+-    String currentUser = user.getShortName();
+-    String[] superUserList = conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]);
+-    for (String name : superUserList) {
+-      if (AccessControlLists.isGroupPrincipal(name)) {
+-        superGroups.add(AccessControlLists.getGroupName(name));
+-      } else {
+-        superUsers.add(name);
+-      }
+-    }
+-    superUsers.add(currentUser);
+-    return new Pair<List<String>, List<String>>(superUsers, superGroups);
+-  }
+-
+-  /**
+    * Creates the user auth data to be written to zookeeper.
+    * @param userAuths
+    * @return Bytes form of user auths details to be written to zookeeper.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin2.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin2.java
+index b121c37..ffeb125 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin2.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin2.java
+@@ -50,7 +50,6 @@ import org.apache.hadoop.hbase.constraint.ConstraintException;
+ import org.apache.hadoop.hbase.master.AssignmentManager;
+ import org.apache.hadoop.hbase.master.HMaster;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+-import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.HRegionServer;
+ import org.apache.hadoop.hbase.regionserver.Region;
+ import org.apache.hadoop.hbase.testclassification.ClientTests;
+@@ -88,6 +87,7 @@ public class TestAdmin2 {
+     TEST_UTIL.getConfiguration().setInt("hbase.regionserver.metahandler.count", 30);
+     TEST_UTIL.getConfiguration().setBoolean(
+         "hbase.master.enabletable.roundrobin", true);
++    TEST_UTIL.getConfiguration().setInt("hbase.regionserver.metahandler.count", 40);
+     TEST_UTIL.startMiniCluster(3);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
+index 144da14..33d44da 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
+@@ -27,6 +27,7 @@ import com.google.protobuf.Message;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.testclassification.RPCTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.ipc.RpcServer.Call;
+@@ -125,7 +126,8 @@ public class TestSimpleRpcScheduler {
+     scheduler.init(CONTEXT);
+     scheduler.start();
+     for (CallRunner task : tasks) {
+-      when(qosFunction.getPriority((RPCProtos.RequestHeader) anyObject(), (Message) anyObject()))
++      when(qosFunction.getPriority((RPCProtos.RequestHeader) anyObject(),
++        (Message) anyObject(), (User) anyObject()))
+           .thenReturn(qos.get(task));
+       scheduler.dispatch(task);
+     }
+@@ -157,7 +159,8 @@ public class TestSimpleRpcScheduler {
+     schedConf.set(SimpleRpcScheduler.CALL_QUEUE_TYPE_CONF_KEY, queueType);
+ 
+     PriorityFunction priority = mock(PriorityFunction.class);
+-    when(priority.getPriority(any(RequestHeader.class), any(Message.class)))
++    when(priority.getPriority(any(RequestHeader.class),
++      any(Message.class), any(User.class)))
+       .thenReturn(HConstants.NORMAL_QOS);
+ 
+     RpcScheduler scheduler = new SimpleRpcScheduler(schedConf, 1, 1, 1, priority,
+@@ -235,8 +238,8 @@ public class TestSimpleRpcScheduler {
+     schedConf.setFloat(SimpleRpcScheduler.CALL_QUEUE_SCAN_SHARE_CONF_KEY, 0.5f);
+ 
+     PriorityFunction priority = mock(PriorityFunction.class);
+-    when(priority.getPriority(any(RequestHeader.class), any(Message.class)))
+-      .thenReturn(HConstants.NORMAL_QOS);
++    when(priority.getPriority(any(RequestHeader.class), any(Message.class),
++      any(User.class))).thenReturn(HConstants.NORMAL_QOS);
+ 
+     RpcScheduler scheduler = new SimpleRpcScheduler(schedConf, 3, 1, 1, priority,
+                                                     HConstants.QOS_THRESHOLD);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterPriorityRpc.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterPriorityRpc.java
+index a72f96b..7605345 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterPriorityRpc.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterPriorityRpc.java
+@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.ipc.PriorityFunction;
+ import org.apache.hadoop.hbase.protobuf.generated.RPCProtos.RequestHeader;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.testclassification.MasterTests;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.junit.Before;
+@@ -43,6 +44,7 @@ import com.google.common.collect.Sets;
+ public class TestMasterPriorityRpc {
+   private HMaster master = null;
+   private PriorityFunction priority = null;
++  private User user = null;
+ 
+   private final Set<String> ADMIN_METHODS = Sets.newHashSet("GetLastFlushedSequenceId",
+       "RegionServerReport", "RegionServerStartup", "ReportRSFatalError",
+@@ -58,6 +60,7 @@ public class TestMasterPriorityRpc {
+     CoordinatedStateManager cp = CoordinatedStateManagerFactory.getCoordinatedStateManager(conf);
+     master = HMaster.constructMaster(HMaster.class, conf, cp);
+     priority = master.getMasterRpcServices().getPriority();
++    user = User.createUserForTesting(conf, "someuser", new String[]{"somegroup"});
+   }
+ 
+   /**
+@@ -70,7 +73,7 @@ public class TestMasterPriorityRpc {
+    */
+   private void assertPriority(String methodName, int expectedPriority) {
+     assertEquals(methodName + " had unexpected priority", expectedPriority,
+-        priority.getPriority(RequestHeader.newBuilder().setMethodName(methodName).build(), null));
++        priority.getPriority(RequestHeader.newBuilder().setMethodName(methodName).build(), null, user));
+   }
+ 
+   @Test
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPriorityRpc.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPriorityRpc.java
+index dc18408..8d945f0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPriorityRpc.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPriorityRpc.java
+@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
+ 
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.testclassification.RegionServerTests;
+ import org.apache.hadoop.hbase.util.ByteStringer;
+@@ -95,7 +96,8 @@ public class TestPriorityRpc {
+     Mockito.when(mockRegionInfo.isSystemTable()).thenReturn(true);
+     // Presume type.
+     ((AnnotationReadingPriorityFunction)priority).setRegionServer(mockRS);
+-    assertEquals(HConstants.SYSTEMTABLE_QOS, priority.getPriority(header, getRequest));
++    assertEquals(HConstants.SYSTEMTABLE_QOS, priority.getPriority(header, getRequest,
++      User.createUserForTesting(regionServer.conf, "someuser", new String[]{"somegroup"})));
+   }
+ 
+   @Test
+@@ -108,7 +110,30 @@ public class TestPriorityRpc {
+     headerBuilder.setMethodName("foo");
+     RequestHeader header = headerBuilder.build();
+     PriorityFunction qosFunc = regionServer.rpcServices.getPriority();
+-    assertEquals(HConstants.NORMAL_QOS, qosFunc.getPriority(header, null));
++    assertEquals(HConstants.NORMAL_QOS, qosFunc.getPriority(header, null,
++      User.createUserForTesting(regionServer.conf, "someuser", new String[]{"somegroup"})));
++  }
++
++  @Test
++  public void testQosFunctionForRequestCalledBySuperUser() throws Exception {
++    RequestHeader.Builder headerBuilder = RequestHeader.newBuilder();
++    headerBuilder.setMethodName("foo");
++    RequestHeader header = headerBuilder.build();
++    PriorityFunction qosFunc = regionServer.rpcServices.getPriority();
++
++    //test superusers
++    regionServer.conf.set(User.SUPERUSER_CONF_KEY, "samplesuperuser");
++    User.loadSuperUsers(regionServer.conf);
++    assertEquals(HConstants.ADMIN_QOS, qosFunc.getPriority(header, null,
++      User.createUserForTesting(regionServer.conf, "samplesuperuser",
++        new String[]{"somegroup"})));
++
++    //test supergroups
++    regionServer.conf.set(User.SUPERUSER_CONF_KEY, "@samplesupergroup");
++    User.loadSuperUsers(regionServer.conf);
++    assertEquals(HConstants.ADMIN_QOS, qosFunc.getPriority(header, null,
++      User.createUserForTesting(regionServer.conf, "regularuser",
++        new String[]{"samplesupergroup"})));
+   }
+ 
+   @Test
+@@ -130,7 +155,8 @@ public class TestPriorityRpc {
+     Mockito.when(mockRegionInfo.isSystemTable()).thenReturn(false);
+     // Presume type.
+     ((AnnotationReadingPriorityFunction)priority).setRegionServer(mockRS);
+-    int qos = priority.getPriority(header, scanRequest);
++    int qos = priority.getPriority(header, scanRequest,
++      User.createUserForTesting(regionServer.conf, "someuser", new String[]{"somegroup"}));
+     assertTrue ("" + qos, qos == HConstants.NORMAL_QOS);
+ 
+     //build a scan request with scannerID
+@@ -148,10 +174,12 @@ public class TestPriorityRpc {
+     // Presume type.
+     ((AnnotationReadingPriorityFunction)priority).setRegionServer(mockRS);
+ 
+-    assertEquals(HConstants.SYSTEMTABLE_QOS, priority.getPriority(header, scanRequest));
++    assertEquals(HConstants.SYSTEMTABLE_QOS, priority.getPriority(header, scanRequest,
++      User.createUserForTesting(regionServer.conf, "someuser", new String[]{"somegroup"})));
+ 
+     //the same as above but with non-meta region
+     Mockito.when(mockRegionInfo.isSystemTable()).thenReturn(false);
+-    assertEquals(HConstants.NORMAL_QOS, priority.getPriority(header, scanRequest));
++    assertEquals(HConstants.NORMAL_QOS, priority.getPriority(header, scanRequest,
++      User.createUserForTesting(regionServer.conf, "someuser", new String[]{"somegroup"})));
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQosFunction.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQosFunction.java
+index 2de4622..20c73a5 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQosFunction.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQosFunction.java
+@@ -1,4 +1,3 @@
+-package org.apache.hadoop.hbase.regionserver;
+ /**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+@@ -16,12 +15,16 @@ package org.apache.hadoop.hbase.regionserver;
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
++
++package org.apache.hadoop.hbase.regionserver;
++
+ import static org.junit.Assert.assertEquals;
+ import static org.mockito.Mockito.when;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+@@ -55,11 +58,11 @@ public class TestQosFunction {
+       new AnnotationReadingPriorityFunction(rpcServices, RSRpcServices.class);
+ 
+     // Set method name in pb style with the method name capitalized.
+-    checkMethod("ReplicateWALEntry", HConstants.REPLICATION_QOS, qosFunction);
++    checkMethod(conf, "ReplicateWALEntry", HConstants.REPLICATION_QOS, qosFunction);
+     // Set method name in pb style with the method name capitalized.
+-    checkMethod("OpenRegion", HConstants.ADMIN_QOS, qosFunction);
++    checkMethod(conf, "OpenRegion", HConstants.ADMIN_QOS, qosFunction);
+     // Check multi works.
+-    checkMethod("Multi", HConstants.NORMAL_QOS, qosFunction, MultiRequest.getDefaultInstance());
++    checkMethod(conf, "Multi", HConstants.NORMAL_QOS, qosFunction, MultiRequest.getDefaultInstance());
+ 
+   }
+ 
+@@ -103,19 +106,21 @@ public class TestQosFunction {
+             .addTransition(normalTransition).build();
+ 
+     final String reportFuncName = "ReportRegionStateTransition";
+-    checkMethod(reportFuncName, HConstants.SYSTEMTABLE_QOS, qosFunction, metaTransitionRequest);
+-    checkMethod(reportFuncName, HConstants.NORMAL_QOS, qosFunction, normalTransitionRequest);
++    checkMethod(conf, reportFuncName, HConstants.SYSTEMTABLE_QOS, qosFunction, metaTransitionRequest);
++    checkMethod(conf, reportFuncName, HConstants.NORMAL_QOS, qosFunction, normalTransitionRequest);
++    checkMethod(conf, "Multi", HConstants.NORMAL_QOS, qosFunction, MultiRequest.getDefaultInstance());
+   }
+ 
+-  private void checkMethod(final String methodName, final int expected,
++  private void checkMethod(Configuration conf, final String methodName, final int expected,
+       final AnnotationReadingPriorityFunction qosf) {
+-    checkMethod(methodName, expected, qosf, null);
++    checkMethod(conf, methodName, expected, qosf, null);
+   }
+ 
+-  private void checkMethod(final String methodName, final int expected,
++  private void checkMethod(Configuration conf, final String methodName, final int expected,
+       final AnnotationReadingPriorityFunction qosf, final Message param) {
+     RequestHeader.Builder builder = RequestHeader.newBuilder();
+     builder.setMethodName(methodName);
+-    assertEquals(methodName, expected, qosf.getPriority(builder.build(), param));
++    assertEquals(methodName, expected, qosf.getPriority(builder.build(), param,
++      User.createUserForTesting(conf, "someuser", new String[]{"somegroup"})));
+   }
+ }
+\ No newline at end of file
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/SecureTestUtil.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/SecureTestUtil.java
+index fb06c05..072bd16 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/SecureTestUtil.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/SecureTestUtil.java
+@@ -720,7 +720,7 @@ public class SecureTestUtil {
+   }
+ 
+   public static String convertToGroup(String group) {
+-    return AccessControlLists.GROUP_PREFIX + group;
++    return User.GROUP_PREFIX + group;
+   }
+ 
+   public static void checkGlobalPerms(HBaseTestingUtility testUtil, Permission.Action... actions)
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
+index 63fe418..c28164a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
+@@ -59,8 +59,6 @@ import org.apache.hadoop.hbase.security.visibility.expression.NonLeafExpressionN
+ import org.apache.hadoop.hbase.security.visibility.expression.Operator;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+-import com.google.common.collect.Lists;
+-
+ /**
+  * This is a VisibilityLabelService where labels in Mutation's visibility
+  * expression will be persisted as Strings itself rather than ordinals in
+@@ -82,8 +80,6 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   private Configuration conf;
+   private Region labelsRegion;
+   private List<ScanLabelGenerator> scanLabelGenerators;
+-  private List<String> superUsers;
+-  private List<String> superGroups;
+ 
+   @Override
+   public OperationStatus[] addLabels(List<byte[]> labels) throws IOException {
+@@ -118,8 +114,8 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+     assert labelsRegion != null;
+     OperationStatus[] finalOpStatus = new OperationStatus[authLabels.size()];
+     List<String> currentAuths;
+-    if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
+-      String group = AccessControlLists.getGroupName(Bytes.toString(user));
++    if (User.isGroupPrincipal(Bytes.toString(user))) {
++      String group = User.getGroupName(Bytes.toString(user));
+       currentAuths = this.getGroupAuths(new String[]{group}, true);
+     }
+     else {
+@@ -393,55 +389,14 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   @Override
+   public void init(RegionCoprocessorEnvironment e) throws IOException {
+     this.scanLabelGenerators = VisibilityUtils.getScanLabelGenerators(this.conf);
+-    initSystemAndSuperUsers();
+     if (e.getRegion().getRegionInfo().getTable().equals(LABELS_TABLE_NAME)) {
+       this.labelsRegion = e.getRegion();
+     }
+   }
+ 
+-  private void initSystemAndSuperUsers() throws IOException {
+-    this.superUsers = new ArrayList<String>();
+-    this.superGroups = new ArrayList<String>();
+-    User user = User.getCurrent();
+-    if (user == null) {
+-      throw new IOException("Unable to obtain the current user, "
+-          + "authorization checks for internal operations will not work correctly!");
+-    }
+-    if (LOG.isTraceEnabled()) {
+-      LOG.trace("Current user name is " + user.getShortName());
+-    }
+-    String currentUser = user.getShortName();
+-    List<String> superUserList = Lists.asList(currentUser,
+-        this.conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+-    if (superUserList != null) {
+-      for (String name : superUserList) {
+-        if (AccessControlLists.isGroupPrincipal(name)) {
+-          this.superGroups.add(AccessControlLists.getGroupName(name));
+-        } else {
+-          this.superUsers.add(name);
+-        }
+-      }
+-    };
+-  }
+-
+-  protected boolean isSystemOrSuperUser(User user) throws IOException {
+-    if (this.superUsers.contains(user.getShortName())) {
+-      return true;
+-    }
+-    String[] groups = user.getGroupNames();
+-    if (groups != null) {
+-      for (String group : groups) {
+-        if (this.superGroups.contains(group)) {
+-          return true;
+-        }
+-      }
+-    }
+-    return false;
+-  }
+-
+   @Override
+   public boolean havingSystemAuth(User user) throws IOException {
+-    if (isSystemOrSuperUser(user)) {
++    if (user.isSuperUser()) {
+       return true;
+     }
+     Set<String> auths = new HashSet<String>();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+index 28b80ff..3e9b72e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+@@ -158,7 +158,7 @@ public class TestHBaseFsck {
+       MasterSyncObserver.class.getName());
+ 
+     conf.setInt("hbase.regionserver.handler.count", 2);
+-    conf.setInt("hbase.regionserver.metahandler.count", 30);
++    conf.setInt("hbase.regionserver.metahandler.count", 40);
+ 
+     conf.setInt("hbase.htable.threads.max", POOL_SIZE);
+     conf.setInt("hbase.hconnection.threads.max", 2 * POOL_SIZE);
+-- 
+2.3.2 (Apple Git-55)
+

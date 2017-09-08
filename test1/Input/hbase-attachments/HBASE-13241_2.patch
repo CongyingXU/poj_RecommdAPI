@@ -1,0 +1,302 @@
+From 504d739f7e4eaaab8dd27980782402dc1e2cd5c4 Mon Sep 17 00:00:00 2001
+From: Ashish Singhi <ashish.singhi@huawei.com>
+Date: Sun, 15 Mar 2015 01:08:14 +0530
+Subject: [PATCH] HBASE-13241 Add tests for group level grants
+
+---
+ .../access/TestAccessControllerWithGroups.java     | 283 +++++++++++++++++++++
+ 1 file changed, 283 insertions(+)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControllerWithGroups.java
+
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControllerWithGroups.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControllerWithGroups.java
+new file mode 100644
+index 0000000..fd15ea3
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControllerWithGroups.java
+@@ -0,0 +1,283 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable
++ * law or agreed to in writing, software distributed under the License is distributed on an "AS IS"
++ * BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
++ * for the specific language governing permissions and limitations under the License.
++ */
++package org.apache.hadoop.hbase.security.access;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import java.io.IOException;
++import java.security.PrivilegedExceptionAction;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.CellUtil;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.TableNotFoundException;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.client.ResultScanner;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
++import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos.AccessControlService;
++import org.apache.hadoop.hbase.security.User;
++import org.apache.hadoop.hbase.security.access.Permission.Action;
++import org.apache.hadoop.hbase.testclassification.LargeTests;
++import org.apache.hadoop.hbase.testclassification.SecurityTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++import com.google.protobuf.BlockingRpcChannel;
++
++@Category({ SecurityTests.class, LargeTests.class })
++public class TestAccessControllerWithGroups extends SecureTestUtil {
++  private static final Log LOG = LogFactory.getLog(TestAccessControllerWithGroups.class);
++
++  public TableName TEST_TABLE = TableName.valueOf("testtable1");
++  private static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private static Configuration conf;
++  private static Connection connection;
++
++  private static byte[] TEST_FAMILY = Bytes.toBytes("f1");
++  private static byte[] TEST_ROW = Bytes.toBytes("r1");
++  private final static byte[] Q1 = Bytes.toBytes("q1");
++  private final static byte[] value1 = Bytes.toBytes("value1");
++
++  private static final String SUPERGROUP = "supergroup";
++  private static final String TESTGROUP_TABLE = "testgroup_table";
++  private static final String TESTGROUP_FAMILY = "testgroup_family";
++  private static final String TESTGROUP_QUAIFIER = "testgroup_qualifier";
++
++  private static User SUPERUSER;
++  private static User USER1_TESTGROUP_QUALIFIER;
++  private static User USER2_TESTGROUP_QUALIFIER;
++  private static User USER1_TESTGROUP_TABLE;
++  private static User USER2_TESTGROUP_TABLE;
++  private static User USER1_TESTGROUP_FAMILY;
++  private static User USER2_TESTGROUP_FAMILY;
++
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++    // setup configuration
++    conf = TEST_UTIL.getConfiguration();
++    // Enable security
++    enableSecurity(conf);
++    // In this particular test case, we can't use SecureBulkLoadEndpoint because its doAs will fail
++    // to move a file for a random user
++    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, AccessController.class.getName());
++
++    // Enable EXEC permission checking
++    conf.setBoolean(AccessControlConstants.EXEC_PERMISSION_CHECKS_KEY, true);
++
++    // Verify enableSecurity sets up what we require
++    verifyConfiguration(conf);
++
++    TEST_UTIL.startMiniCluster();
++
++    TEST_UTIL.waitUntilAllRegionsAssigned(AccessControlLists.ACL_TABLE_NAME);
++
++    // 'admin' has super user permission because it is part of the 'supergroup'
++    SUPERUSER = User.createUserForTesting(conf, "admin", new String[] { SUPERGROUP });
++
++    USER1_TESTGROUP_TABLE =
++        User.createUserForTesting(conf, "test_table1", new String[] { TESTGROUP_TABLE });
++    USER2_TESTGROUP_TABLE =
++        User.createUserForTesting(conf, "test_table2", new String[] { TESTGROUP_TABLE });
++
++    USER1_TESTGROUP_FAMILY =
++        User.createUserForTesting(conf, "test_family1", new String[] { TESTGROUP_FAMILY });
++    USER2_TESTGROUP_FAMILY =
++        User.createUserForTesting(conf, "test_family2", new String[] { TESTGROUP_FAMILY });
++
++    USER1_TESTGROUP_QUALIFIER =
++        User.createUserForTesting(conf, "test_qualifier1", new String[] { TESTGROUP_QUAIFIER });
++    USER2_TESTGROUP_QUALIFIER =
++        User.createUserForTesting(conf, "test_qualifier2", new String[] { TESTGROUP_QUAIFIER });
++
++    connection = ConnectionFactory.createConnection(conf);
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    connection.close();
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++  @Before
++  public void setUp() throws Exception {
++    try (Table table = TEST_UTIL.createTable(TEST_TABLE, TEST_FAMILY)) {
++      TEST_UTIL.waitTableEnabled(TEST_TABLE);
++      Put put = new Put(TEST_ROW);
++      put.addColumn(TEST_FAMILY, Q1, value1);
++      table.put(put);
++    }
++    // Set up initial grants
++    grantGlobal(TEST_UTIL, '@' + SUPERGROUP, Permission.Action.ADMIN, Permission.Action.CREATE,
++      Permission.Action.READ, Permission.Action.WRITE);
++
++    assertEquals(1, AccessControlLists.getTablePermissions(conf, TEST_TABLE).size());
++    try {
++      assertEquals(1, AccessControlClient.getUserPermissions(connection, TEST_TABLE.toString())
++          .size());
++    } catch (Throwable e) {
++      LOG.error("Error during call of AccessControlClient.getUserPermissions. ", e);
++    }
++  }
++
++  @After
++  public void tearDown() throws Exception {
++    // Clean the _acl_ table
++    try {
++      deleteTable(TEST_UTIL, TEST_TABLE);
++    } catch (TableNotFoundException ex) {
++      // Test deleted the table, no problem
++      LOG.info("Test deleted table " + TEST_TABLE);
++    }
++    // Verify all table/namespace permissions are erased
++    assertEquals(0, AccessControlLists.getTablePermissions(conf, TEST_TABLE).size());
++    assertEquals(0, AccessControlLists.getNamespacePermissions(conf, TEST_TABLE.getNameAsString())
++        .size());
++  }
++
++  /*
++   * Test group level grants at table level.
++   */
++  @Test(timeout = 300000)
++  public void testGrantAtTableLevel() throws Exception {
++    AccessTestAction grantActionAtTableLevel = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        // Connection connection = ConnectionFactory.createConnection(conf);
++        Table acl = connection.getTable(AccessControlLists.ACL_TABLE_NAME);
++        try {
++          BlockingRpcChannel service = acl.coprocessorService(TEST_TABLE.getName());
++          AccessControlService.BlockingInterface protocol =
++              AccessControlService.newBlockingStub(service);
++          ProtobufUtil.grant(protocol, '@' + TESTGROUP_TABLE, TEST_TABLE, null, null, Action.ADMIN,
++            Action.READ);
++        } finally {
++          acl.close();
++        }
++        return null;
++      }
++    };
++
++    verifyAllowed(grantActionAtTableLevel, SUPERUSER, USER1_TESTGROUP_TABLE, USER2_TESTGROUP_TABLE);
++    verifyDenied(grantActionAtTableLevel, USER1_TESTGROUP_FAMILY, USER2_TESTGROUP_FAMILY,
++      USER1_TESTGROUP_QUALIFIER, USER2_TESTGROUP_QUALIFIER);
++
++    validateAccessForScanForASpecificUserInTheGroup(USER1_TESTGROUP_TABLE);
++  }
++
++  /*
++   * Test group level grants at family level.
++   */
++  @Test(timeout = 300000)
++  public void testGrantAtFamilyLevel() throws Exception {
++    AccessTestAction grantActionAtFamilyLevel = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        Table acl = connection.getTable(AccessControlLists.ACL_TABLE_NAME);
++        try {
++          BlockingRpcChannel service = acl.coprocessorService(TEST_TABLE.getName());
++          AccessControlService.BlockingInterface protocol =
++              AccessControlService.newBlockingStub(service);
++          ProtobufUtil.grant(protocol, '@' + TESTGROUP_FAMILY, TEST_TABLE, TEST_FAMILY, null,
++            Action.ADMIN, Action.READ);
++        } finally {
++          acl.close();
++        }
++        return null;
++      }
++    };
++
++    verifyAllowed(grantActionAtFamilyLevel, SUPERUSER, USER1_TESTGROUP_TABLE,
++      USER2_TESTGROUP_TABLE, USER1_TESTGROUP_FAMILY, USER2_TESTGROUP_FAMILY);
++    verifyDenied(grantActionAtFamilyLevel, USER1_TESTGROUP_QUALIFIER, USER2_TESTGROUP_QUALIFIER);
++
++    validateAccessForScanForASpecificUserInTheGroup(USER2_TESTGROUP_FAMILY);
++  }
++
++  /*
++   * Test group level grants at column qualifier level.
++   */
++  @Test(timeout = 300000)
++  public void testGrantAtQualifierLevel() throws Exception {
++
++    AccessTestAction grantActionAtQualifierLevel = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        Table acl = connection.getTable(AccessControlLists.ACL_TABLE_NAME);
++        try {
++          BlockingRpcChannel service = acl.coprocessorService(TEST_TABLE.getName());
++          AccessControlService.BlockingInterface protocol =
++              AccessControlService.newBlockingStub(service);
++          ProtobufUtil.grant(protocol, '@' + TESTGROUP_QUAIFIER, TEST_TABLE, TEST_FAMILY, Q1,
++            Action.ADMIN, Action.READ);
++        } finally {
++          acl.close();
++        }
++        return null;
++      }
++    };
++
++    verifyAllowed(grantActionAtQualifierLevel, SUPERUSER, USER1_TESTGROUP_TABLE,
++      USER2_TESTGROUP_TABLE, USER1_TESTGROUP_FAMILY, USER2_TESTGROUP_FAMILY,
++      USER1_TESTGROUP_QUALIFIER, USER2_TESTGROUP_QUALIFIER);
++
++    validateAccessForScanForASpecificUserInTheGroup(USER1_TESTGROUP_QUALIFIER);
++
++  }
++
++  private void validateAccessForScanForASpecificUserInTheGroup(User user) throws IOException,
++      InterruptedException {
++    user.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        Connection connection = ConnectionFactory.createConnection(conf);
++        Table table = connection.getTable(TEST_TABLE);
++        try {
++          Scan s1 = new Scan();
++          ResultScanner scanner1 = table.getScanner(s1);
++          Result[] next1 = scanner1.next(1);
++
++          assertTrue(next1.length == 1);
++          CellScanner cellScanner1 = next1[0].cellScanner();
++          cellScanner1.advance();
++          Cell current1 = cellScanner1.current();
++          // test user can only see value3 (no label)
++          assertTrue(Bytes.equals(current1.getRowArray(), current1.getRowOffset(),
++            current1.getRowLength(), TEST_ROW, 0, TEST_ROW.length));
++          assertTrue(Bytes.equals(CellUtil.cloneQualifier(current1), Q1));
++          assertTrue(Bytes.equals(CellUtil.cloneValue(current1), value1));
++
++          assertFalse(cellScanner1.advance());
++        } finally {
++          table.close();
++          connection.close();
++        }
++        return null;
++      }
++    });
++  }
++}
+-- 
+1.9.5.msysgit.0
+

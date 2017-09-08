@@ -1,0 +1,165 @@
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 19bd484..8952a66 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -1601,6 +1601,30 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+     return procId;
+   }
+ 
++  @Override
++  public long createSystemTable(final HTableDescriptor hTableDescriptor) throws IOException {
++    if (isStopped()) {
++      throw new MasterNotRunningException();
++    }
++
++    TableName tableName = hTableDescriptor.getTableName();
++    if (!(tableName.isSystemTable())) {
++      throw new IllegalArgumentException(
++        "Only system table creation can use this createSystemTable API");
++    }
++
++    HRegionInfo[] newRegions = ModifyRegionUtils.createHRegionInfos(hTableDescriptor, null);
++
++    LOG.info(getClientIdAuditPrefix() + " create " + hTableDescriptor);
++
++    // This special create table is called locally to master.  Therefore, no RPC means no need
++    // to use nonce to detect duplicated RPC call.
++    long procId = this.procedureExecutor.submitProcedure(
++      new CreateTableProcedure(procedureExecutor.getEnvironment(), hTableDescriptor, newRegions));
++
++    return procId;
++  }
++
+   /**
+    * Checks whether the table conforms to some sane limits, and configured
+    * values (compression, etc) work. Throws an exception if something is wrong.
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterServices.java hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterServices.java
+index e42fae5..015e201 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterServices.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterServices.java
+@@ -128,6 +128,13 @@ public interface MasterServices extends Server {
+       final long nonce) throws IOException;
+ 
+   /**
++   * Create a system table using the given table definition.
++   * @param hTableDescriptor The system table definition
++   *     a single region is created.
++   */
++  long createSystemTable(final HTableDescriptor hTableDescriptor) throws IOException;
++
++  /**
+    * Delete a table
+    * @param tableName The table name
+    * @param nonceGroup
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java
+index e82cb31..afc8a21 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java
+@@ -30,7 +30,6 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.DoNotRetryIOException;
+ import org.apache.hadoop.hbase.HConstants;
+-import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.NamespaceDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+@@ -44,7 +43,6 @@ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Table;
+ import org.apache.hadoop.hbase.constraint.ConstraintException;
+ import org.apache.hadoop.hbase.master.procedure.CreateNamespaceProcedure;
+-import org.apache.hadoop.hbase.master.procedure.CreateTableProcedure;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -196,15 +194,7 @@ public class TableNamespaceManager {
+   }
+ 
+   private void createNamespaceTable(MasterServices masterServices) throws IOException {
+-    HRegionInfo[] newRegions = new HRegionInfo[]{
+-        new HRegionInfo(HTableDescriptor.NAMESPACE_TABLEDESC.getTableName(), null, null)};
+-
+-    // we need to create the table this way to bypass checkInitialized
+-    masterServices.getMasterProcedureExecutor()
+-      .submitProcedure(new CreateTableProcedure(
+-          masterServices.getMasterProcedureExecutor().getEnvironment(),
+-          HTableDescriptor.NAMESPACE_TABLEDESC,
+-          newRegions));
++    masterServices.createSystemTable(HTableDescriptor.NAMESPACE_TABLEDESC);
+   }
+ 
+   @SuppressWarnings("deprecation")
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
+index 1beecf7..5237393 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
+@@ -477,13 +477,7 @@ public class MasterQuotaManager implements RegionStateListener {
+   }
+ 
+   private void createQuotaTable() throws IOException {
+-    HRegionInfo[] newRegions = new HRegionInfo[] { new HRegionInfo(QuotaUtil.QUOTA_TABLE_NAME) };
+-
+-    masterServices.getMasterProcedureExecutor()
+-      .submitProcedure(new CreateTableProcedure(
+-          masterServices.getMasterProcedureExecutor().getEnvironment(),
+-          QuotaUtil.QUOTA_TABLE_DESC,
+-          newRegions));
++    masterServices.createSystemTable(QuotaUtil.QUOTA_TABLE_DESC);
+   }
+ 
+   private static class NamedLock<T> {
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+index 6849790..4f992b4 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+@@ -124,7 +124,8 @@ public class AccessControlLists {
+    * @throws IOException
+    */
+   static void createACLTable(MasterServices master) throws IOException {
+-    master.createTable(new HTableDescriptor(ACL_TABLE_NAME)
++    /** Table descriptor for ACL table */
++    final HTableDescriptor ACL_TABLEDESC = new HTableDescriptor(ACL_TABLE_NAME)
+       .addFamily(new HColumnDescriptor(ACL_LIST_FAMILY)
+         .setMaxVersions(1)
+         .setInMemory(true)
+@@ -134,10 +135,8 @@ public class AccessControlLists {
+         .setScope(HConstants.REPLICATION_SCOPE_LOCAL)
+         // Set cache data blocks in L1 if more than one cache tier deployed; e.g. this will
+         // be the case if we are using CombinedBlockCache (Bucket Cache).
+-        .setCacheDataInL1(true)),
+-    null,
+-    HConstants.NO_NONCE,
+-    HConstants.NO_NONCE);
++        .setCacheDataInL1(true));
++    master.createSystemTable(ACL_TABLEDESC);
+   }
+ 
+   /**
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+index 475d986..ac9dc79 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+@@ -209,7 +209,7 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+           DisabledRegionSplitPolicy.class.getName());
+       labelsTable.setValue(Bytes.toBytes(HConstants.DISALLOW_WRITES_IN_RECOVERING),
+           Bytes.toBytes(true));
+-      master.createTable(labelsTable, null, HConstants.NO_NONCE, HConstants.NO_NONCE);
++      master.createSystemTable(labelsTable);
+     }
+   }
+ 
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+index 30f4932..1fc74bc 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+@@ -238,6 +238,11 @@ public class TestCatalogJanitor {
+     }
+ 
+     @Override
++    public long createSystemTable(final HTableDescriptor hTableDescriptor) throws IOException {
++      return -1;
++    }
++
++    @Override
+     public SnapshotManager getSnapshotManager() {
+       return null;
+     }

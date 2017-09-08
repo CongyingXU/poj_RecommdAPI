@@ -1,0 +1,368 @@
+From 76bcf0723bd98c3ccbc7c241cea8ceb83f0d00cd Mon Sep 17 00:00:00 2001
+From: Elliott Clark <eclark@apache.org>
+Date: Tue, 27 Oct 2015 12:16:37 -0700
+Subject: [PATCH] HBASE-14708 Use copy on write TreeMap for region location
+ cache
+
+Summary: Create and use a copy on write tree map for region location.
+
+Test Plan: unit tests, followed by IT tests.
+
+Differential Revision: https://reviews.facebook.net/D49545
+---
+ .../org/apache/hadoop/hbase/client/MetaCache.java  |  19 +-
+ .../hadoop/hbase/types/CopyOnWriteTreeMap.java     | 269 +++++++++++++++++++++
+ 2 files changed, 280 insertions(+), 8 deletions(-)
+ create mode 100644 hbase-common/src/main/java/org/apache/hadoop/hbase/types/CopyOnWriteTreeMap.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
+index b23ca70..fed5db0 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
+@@ -23,8 +23,10 @@ import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.ConcurrentNavigableMap;
+ import java.util.concurrent.ConcurrentSkipListMap;
+ import java.util.concurrent.ConcurrentSkipListSet;
++import java.util.concurrent.CopyOnWriteArraySet;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -35,6 +37,7 @@ import org.apache.hadoop.hbase.RegionLocations;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.types.CopyOnWriteTreeMap;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+ /**
+@@ -48,16 +51,16 @@ public class MetaCache {
+   /**
+    * Map of table to table {@link HRegionLocation}s.
+    */
+-  private final ConcurrentMap<TableName, ConcurrentSkipListMap<byte[], RegionLocations>>
++  private final ConcurrentMap<TableName, ConcurrentNavigableMap<byte[], RegionLocations>>
+   cachedRegionLocations =
+-  new ConcurrentHashMap<TableName, ConcurrentSkipListMap<byte[], RegionLocations>>();
++  new CopyOnWriteTreeMap<>();
+ 
+   // The presence of a server in the map implies it's likely that there is an
+   // entry in cachedRegionLocations that map to this server; but the absence
+   // of a server in this map guarentees that there is no entry in cache that
+   // maps to the absent server.
+   // The access to this attribute must be protected by a lock on cachedRegionLocations
+-  private final Set<ServerName> cachedServers = new ConcurrentSkipListSet<ServerName>();
++  private final Set<ServerName> cachedServers = new CopyOnWriteArraySet<>();
+ 
+   private final MetricsConnection metrics;
+ 
+@@ -75,7 +78,7 @@ public class MetaCache {
+    * @return Null or region location found in cache.
+    */
+   public RegionLocations getCachedLocation(final TableName tableName, final byte [] row) {
+-    ConcurrentSkipListMap<byte[], RegionLocations> tableLocations =
++    ConcurrentNavigableMap<byte[], RegionLocations> tableLocations =
+       getTableLocations(tableName);
+ 
+     Entry<byte[], RegionLocations> e = tableLocations.floorEntry(row);
+@@ -194,15 +197,15 @@ public class MetaCache {
+    * @param tableName
+    * @return Map of cached locations for passed <code>tableName</code>
+    */
+-  private ConcurrentSkipListMap<byte[], RegionLocations>
++  private ConcurrentNavigableMap<byte[], RegionLocations>
+     getTableLocations(final TableName tableName) {
+     // find the map of cached locations for this table
+-    ConcurrentSkipListMap<byte[], RegionLocations> result;
++    ConcurrentNavigableMap<byte[], RegionLocations> result;
+     result = this.cachedRegionLocations.get(tableName);
+     // if tableLocations for this table isn't built yet, make one
+     if (result == null) {
+-      result = new ConcurrentSkipListMap<byte[], RegionLocations>(Bytes.BYTES_COMPARATOR);
+-      ConcurrentSkipListMap<byte[], RegionLocations> old =
++      result = new CopyOnWriteTreeMap<byte[], RegionLocations>(Bytes.BYTES_COMPARATOR);
++      ConcurrentNavigableMap<byte[], RegionLocations> old =
+           this.cachedRegionLocations.putIfAbsent(tableName, result);
+       if (old != null) {
+         return old;
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/types/CopyOnWriteTreeMap.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/types/CopyOnWriteTreeMap.java
+new file mode 100644
+index 0000000..5b76535
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/types/CopyOnWriteTreeMap.java
+@@ -0,0 +1,269 @@
++package org.apache.hadoop.hbase.types;
++
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.Map;
++import java.util.NavigableSet;
++import java.util.Set;
++import java.util.TreeMap;
++
++import java.util.concurrent.ConcurrentNavigableMap;
++
++
++/**
++ * Copy on Write concurrent version of TreeMap
++ *
++ * @param <K>
++ * @param <V>
++ */
++public class CopyOnWriteTreeMap<K,V> implements Map<K,V>, ConcurrentNavigableMap<K,V> {
++
++  volatile TreeMap<K,V> map = null;
++
++  public CopyOnWriteTreeMap() {
++    this.map = new TreeMap<>();
++  }
++
++  public CopyOnWriteTreeMap(Comparator<K> comparator) {
++    map = new TreeMap<>(comparator);
++  }
++
++
++  private CopyOnWriteTreeMap(Map<K, V> subMap) {
++    map = new TreeMap<>(subMap);
++  }
++
++  /*
++   * Supported Non-modifying operations.
++   * These should all be fast and un-synchronized.
++   */
++  @Override
++  public int size() {
++    return map.size();
++  }
++
++  @Override
++  public boolean isEmpty() {
++    return map.isEmpty();
++  }
++
++  @Override
++  public boolean containsKey(Object key) {
++    return map.containsKey(key);
++  }
++
++  @Override
++  public boolean containsValue(Object value) {
++    return map.containsValue(value);
++  }
++
++  @Override
++  public V get(Object key) {
++    return map.get(key);
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> subMap(K fromKey,
++                                             boolean fromInclusive,
++                                             K toKey,
++                                             boolean toInclusive) {
++    return new CopyOnWriteTreeMap<>(map.subMap(fromKey, fromInclusive, toKey, toInclusive));
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> headMap(K toKey, boolean inclusive) {
++    return new CopyOnWriteTreeMap<>(map.headMap(toKey, inclusive));
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> tailMap(K fromKey, boolean inclusive) {
++    return new CopyOnWriteTreeMap<>(map.tailMap(fromKey, inclusive));
++  }
++
++  @Override
++  public Comparator<? super K> comparator() {
++    return map.comparator();
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> subMap(K fromKey, K toKey) {
++    return new CopyOnWriteTreeMap<>(map.subMap(fromKey, toKey));
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> headMap(K toKey) {
++    return new CopyOnWriteTreeMap<>(map.headMap(toKey));
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> tailMap(K fromKey) {
++    return new CopyOnWriteTreeMap<>(map.tailMap(fromKey));
++  }
++
++  @Override
++  public K firstKey() {
++    return map.firstKey();
++  }
++
++  @Override
++  public K lastKey() {
++    return map.lastKey();
++  }
++
++  @Override
++  public Entry<K, V> lowerEntry(K key) {
++    return map.lowerEntry(key);
++  }
++
++  @Override
++  public K lowerKey(K key) {
++    return map.lowerKey(key);
++  }
++
++  @Override
++  public Entry<K, V> floorEntry(K key) {
++    return map.floorEntry(key);
++  }
++
++  @Override
++  public K floorKey(K key) {
++    return map.floorKey(key);
++  }
++
++  @Override
++  public Entry<K, V> ceilingEntry(K key) {
++    return map.ceilingEntry(key);
++  }
++
++  @Override
++  public K ceilingKey(K key) {
++    return map.ceilingKey(key);
++  }
++
++  @Override
++  public Entry<K, V> higherEntry(K key) {
++    return map.higherEntry(key);
++  }
++
++  @Override
++  public K higherKey(K key) {
++    return map.higherKey(key);
++  }
++
++  @Override
++  public Entry<K, V> firstEntry() {
++    return map.firstEntry();
++  }
++
++  @Override
++  public Entry<K, V> lastEntry() {
++    return map.lastEntry();
++  }
++
++  @Override
++  public Entry<K, V> pollFirstEntry() {
++    return map.pollFirstEntry();
++  }
++
++  @Override
++  public Entry<K, V> pollLastEntry() {
++    return map.pollLastEntry();
++  }
++
++  @Override
++  public ConcurrentNavigableMap<K, V> descendingMap() {
++    return new CopyOnWriteTreeMap<>(map.descendingMap());
++  }
++
++  @Override
++  public NavigableSet<K> navigableKeySet() {
++    return map.navigableKeySet();
++  }
++
++  @Override
++  public NavigableSet<K> keySet() {
++    return map.navigableKeySet();
++  }
++
++  @Override
++  public NavigableSet<K> descendingKeySet() {
++    return map.descendingKeySet();
++  }
++
++  @Override
++  public Collection<V> values() {
++    return map.values();
++  }
++
++  @Override
++  public Set<Entry<K, V>> entrySet() {
++    return map.entrySet();
++  }
++
++  /*
++   * Supported but modifying operations.
++   * EVERYTHING that changes map should be synchronized.
++   *
++   */
++
++  @Override
++  public synchronized V put(K key, V value) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    V returnValue = newMap.put(key, value);
++    map = newMap;
++    return returnValue;
++  }
++
++  @Override
++  public synchronized V remove(Object key) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    V returnValue = newMap.remove(key);
++    map = newMap;
++    return returnValue;
++  }
++
++  @Override
++  public synchronized void putAll(Map<? extends K, ? extends V> m) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    newMap.putAll(m);
++    map = newMap;
++  }
++
++  @Override
++  public synchronized void clear() {
++    map = new TreeMap<>(comparator());
++  }
++
++  @Override
++  public synchronized V putIfAbsent(K key, V value) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++
++    V returnValue = newMap.putIfAbsent(key, value);
++    map = newMap;
++    return returnValue;
++  }
++
++  @Override
++  public synchronized boolean remove(Object key, Object value) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    boolean returnValue = newMap.remove(key, value);
++    map = newMap;
++    return returnValue;
++  }
++
++  @Override
++  public synchronized boolean replace(K key, V oldValue, V newValue) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    boolean returnValue = newMap.replace(key, oldValue, newValue);
++    map = newMap;
++    return returnValue;
++  }
++
++  @Override
++  public synchronized V replace(K key, V value) {
++    TreeMap<K,V> newMap = new TreeMap<>(map);
++    V returnValue = newMap.replace(key, value);
++    map = newMap;
++    return returnValue;
++  }
++}
+\ No newline at end of file
+-- 
+2.6.1
+

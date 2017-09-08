@@ -1,0 +1,319 @@
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/TableName.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/TableName.java
+index 245bef5..17fd3b7 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/TableName.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/TableName.java
+@@ -241,6 +241,19 @@ public final class TableName implements Comparable<TableName> {
+     return namespaceAsString;
+   }
+ 
++  /**
++   * Ideally, getNameAsString should contain namespace within it,
++   * but if the namespace is default, it just returns the name. This method
++   * takes care of this corner case.
++   */
++  public String getNameWithNamespaceInclAsString() {
++    if(getNamespaceAsString().equals(NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR)) {
++      return NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR +
++          TableName.NAMESPACE_DELIM + getNameAsString();
++    }
++    return getNameAsString();
++  }
++
+   public byte[] getQualifier() {
+     return qualifier;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+index 3029413..140534d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+@@ -432,6 +432,39 @@ public class AccessController extends BaseMasterAndRegionObserver
+   }
+ 
+   /**
++   * Authorizes that the current user has any of the given permissions for the
++   * given table, column family and column qualifier.
++   * @param tableName Table requested
++   * @param family Column family param
++   * @param qualifier Column qualifier param
++   * @throws IOException if obtaining the current user fails
++   * @throws AccessDeniedException if user has no authorization
++   */
++  private void requireTablePermission(String request, TableName tableName, byte[] family,
++      byte[] qualifier, Action... permissions) throws IOException {
++    User user = getActiveUser();
++    AuthResult result = null;
++
++    for (Action permission : permissions) {
++      if (authManager.authorize(user, tableName, null, null, permission)) {
++        result = AuthResult.allow(request, "Table permission granted", user,
++            permission, tableName, null, null);
++        result.getParams().setFamily(family).setQualifier(qualifier);
++        break;
++      } else {
++        // rest of the world
++        result = AuthResult.deny(request, "Insufficient permissions", user,
++            permission, tableName, family, qualifier);
++        result.getParams().setFamily(family).setQualifier(qualifier);
++      }
++    }
++    logResult(result);
++    if (!result.isAllowed()) {
++      throw new AccessDeniedException("Insufficient permissions " + result.toContextString());
++    }
++  }
++
++  /**
+    * Authorizes that the current user has any of the given permissions to access the table.
+    *
+    * @param tableName Table requested
+@@ -507,10 +540,15 @@ public class AccessController extends BaseMasterAndRegionObserver
+   private void requireGlobalPermission(String request, Action perm, TableName tableName,
+       Map<byte[], ? extends Collection<byte[]>> familyMap) throws IOException {
+     User user = getActiveUser();
++    AuthResult result = null;
+     if (authManager.authorize(user, perm)) {
+-      logResult(AuthResult.allow(request, "Global check allowed", user, perm, tableName, familyMap));
++      result = AuthResult.allow(request, "Global check allowed", user, perm, tableName, familyMap);
++      result.getParams().setTableName(tableName).setFamilies(familyMap);
++      logResult(result);
+     } else {
+-      logResult(AuthResult.deny(request, "Global check failed", user, perm, tableName, familyMap));
++      result = AuthResult.deny(request, "Global check failed", user, perm, tableName, familyMap);
++      result.getParams().setTableName(tableName).setFamilies(familyMap);
++      logResult(result);
+       throw new AccessDeniedException("Insufficient permissions for user '" +
+           (user != null ? user.getShortName() : "null") +"' (global, action=" +
+           perm.toString() + ")");
+@@ -527,10 +565,15 @@ public class AccessController extends BaseMasterAndRegionObserver
+   private void requireGlobalPermission(String request, Action perm,
+                                        String namespace) throws IOException {
+     User user = getActiveUser();
++    AuthResult authResult = null;
+     if (authManager.authorize(user, perm)) {
+-      logResult(AuthResult.allow(request, "Global check allowed", user, perm, namespace));
++      authResult = AuthResult.allow(request, "Global check allowed", user, perm, null);
++      authResult.getParams().setNamespace(namespace);
++      logResult(authResult);
+     } else {
+-      logResult(AuthResult.deny(request, "Global check failed", user, perm, namespace));
++      authResult = AuthResult.deny(request, "Global check failed", user, perm, null);
++      authResult.getParams().setNamespace(namespace);
++      logResult(authResult);
+       throw new AccessDeniedException("Insufficient permissions for user '" +
+           (user != null ? user.getShortName() : "null") +"' (global, action=" +
+           perm.toString() + ")");
+@@ -566,6 +609,37 @@ public class AccessController extends BaseMasterAndRegionObserver
+   }
+ 
+   /**
++   * Checks that the user has the given global or namespace permission.
++   * @param namespace
++   * @param permissions Actions being requested
++   */
++  public void requireNamespacePermission(String request, String namespace, TableName tableName,
++      Map<byte[], ? extends Collection<byte[]>> familyMap, Action... permissions)
++      throws IOException {
++    User user = getActiveUser();
++    AuthResult result = null;
++
++    for (Action permission : permissions) {
++      if (authManager.authorize(user, namespace, permission)) {
++        result = AuthResult.allow(request, "Namespace permission granted",
++            user, permission, namespace);
++        result.getParams().setTableName(tableName).setFamilies(familyMap);
++        break;
++      } else {
++        // rest of the world
++        result = AuthResult.deny(request, "Insufficient permissions", user,
++            permission, namespace);
++        result.getParams().setTableName(tableName).setFamilies(familyMap);
++      }
++    }
++    logResult(result);
++    if (!result.isAllowed()) {
++      throw new AccessDeniedException("Insufficient permissions "
++          + result.toContextString());
++    }
++  }
++
++  /**
+    * Returns <code>true</code> if the current user is allowed the given action
+    * over at least one of the column qualifiers in the given column families.
+    */
+@@ -919,7 +993,8 @@ public class AccessController extends BaseMasterAndRegionObserver
+     for (byte[] family: families) {
+       familyMap.put(family, null);
+     }
+-    requireNamespacePermission("createTable", desc.getTableName().getNamespaceAsString(), Action.CREATE);
++    requireNamespacePermission("createTable", desc.getTableName().getNamespaceAsString(),
++        desc.getTableName(), familyMap, Action.CREATE);
+   }
+ 
+   @Override
+@@ -1050,7 +1125,8 @@ public class AccessController extends BaseMasterAndRegionObserver
+   @Override
+   public void preAddColumn(ObserverContext<MasterCoprocessorEnvironment> c, TableName tableName,
+       HColumnDescriptor column) throws IOException {
+-    requirePermission("addColumn", tableName, null, null, Action.ADMIN, Action.CREATE);
++    requireTablePermission("addColumn", tableName, column.getName(), null, Action.ADMIN,
++        Action.CREATE);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AuthResult.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AuthResult.java
+index c4bc35e..c4dc9df 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AuthResult.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AuthResult.java
+@@ -27,6 +27,8 @@ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
++import com.google.common.base.Joiner;
++
+ /**
+  * Represents the result of an authorization check for logging and error
+  * reporting.
+@@ -40,6 +42,7 @@ public class AuthResult {
+   private final String request;
+   private String reason;
+   private final User user;
++  private AuthResult.Params params;
+ 
+   // "family" and "qualifier" should only be used if "families" is null.
+   private final byte[] family;
+@@ -58,6 +61,7 @@ public class AuthResult {
+     this.action = action;
+     this.families = null;
+     this.namespace = null;
++    this.params = this.new Params().setTableName(table).setFamily(family).setQualifier(qualifier);
+   }
+ 
+   public AuthResult(boolean allowed, String request, String reason, User user,
+@@ -73,6 +77,7 @@ public class AuthResult {
+     this.action = action;
+     this.families = families;
+     this.namespace = null;
++    this.params = this.new Params().setTableName(table).setFamilies(families);
+   }
+ 
+   public AuthResult(boolean allowed, String request, String reason, User user,
+@@ -87,6 +92,7 @@ public class AuthResult {
+     this.family = null;
+     this.qualifier = null;
+     this.families = null;
++    this.params = this.new Params().setNamespace(namespace);
+   }
+ 
+   public boolean isAllowed() {
+@@ -121,6 +127,8 @@ public class AuthResult {
+     return request;
+   }
+ 
++  public Params getParams() { return this.params;}
++
+   public void setAllowed(boolean allowed) {
+     this.allowed = allowed;
+   }
+@@ -129,7 +137,8 @@ public class AuthResult {
+     this.reason = reason;
+   }
+ 
+-  String toFamilyString() {
++  private static String toFamiliesString(Map<byte[], ? extends Collection<?>> families,
++      byte[] family, byte[] qual) {
+     StringBuilder sb = new StringBuilder();
+     if (families != null) {
+       boolean first = true;
+@@ -164,8 +173,8 @@ public class AuthResult {
+       }
+     } else if (family != null) {
+       sb.append(Bytes.toString(family));
+-      if (qualifier != null) {
+-        sb.append(":").append(Bytes.toString(qualifier));
++      if (qual != null) {
++        sb.append(":").append(Bytes.toString(qual));
+       }
+     }
+     return sb.toString();
+@@ -173,17 +182,25 @@ public class AuthResult {
+ 
+   public String toContextString() {
+     StringBuilder sb = new StringBuilder();
++    String familiesString = toFamiliesString(families, family, qualifier);
+     sb.append("(user=")
+         .append(user != null ? user.getName() : "UNKNOWN")
+         .append(", ");
+     sb.append("scope=")
+-        .append(namespace != null ? namespace : table == null ? "GLOBAL" : table)
++        .append(namespace != null ? namespace :
++            table == null ? "GLOBAL" : table.getNameWithNamespaceInclAsString())
+         .append(", ");
+-    if(namespace == null) {
++    if(namespace == null && familiesString.length() > 0) {
+       sb.append("family=")
+-        .append(toFamilyString())
++        .append(familiesString)
+         .append(", ");
+     }
++    String paramsString = params.toString();
++    if(paramsString.length() > 0) {
++      sb.append("params=[")
++          .append(paramsString)
++          .append("],");
++    }
+     sb.append("action=")
+         .append(action != null ? action.toString() : "")
+         .append(")");
+@@ -225,4 +242,52 @@ public class AuthResult {
+         Map<byte[], ? extends Collection<?>> families) {
+     return new AuthResult(false, request, reason, user, action, table, families);
+   }
++
++  public String toFamilyString() {
++    return toFamiliesString(families, family, qualifier);
++  }
++
++  public class Params {
++    private String namespace = null;
++    private TableName tableName = null;
++    private Map<byte[], ? extends Collection<?>> families = null;
++    byte[] family = null;
++    byte[] qualifier = null;
++
++    public Params setNamespace(String namespace) {
++      this.namespace = namespace;
++      return this;
++    }
++
++    public Params setTableName(TableName table) {
++      this.tableName = table;
++      return this;
++    }
++
++    public Params setFamilies(Map<byte[], ? extends Collection<?>> families) {
++      this.families = families;
++      return this;
++    }
++
++    public Params setFamily(byte[] family) {
++      this.family = family;
++      return this;
++    }
++
++    public Params setQualifier(byte[] qualifier) {
++      this.qualifier = qualifier;
++      return this;
++    }
++
++    public String toString() {
++      String familiesString = toFamiliesString(families, family, qualifier);
++      String[] params = new String[] {
++          namespace != null ? "namespace=" + namespace : null,
++          tableName != null ? "table=" + tableName.getNameWithNamespaceInclAsString() : null,
++          familiesString.length() > 0 ? "family=" + familiesString : null
++      };
++      return Joiner.on(",").skipNulls().join(params);
++    }
++
++  }
+ }

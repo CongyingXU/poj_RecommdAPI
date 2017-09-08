@@ -1,0 +1,2521 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+index 671b6a7..42e0809 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+@@ -53,6 +53,7 @@ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.backoff.ServerStatistics;
+ import org.apache.hadoop.hbase.client.coprocessor.Batch;
+ import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.htrace.Trace;
+@@ -715,19 +716,13 @@ class AsyncProcess {
+           }
+           RpcRetryingCaller<MultiResponse> caller = createCaller(callable);
+           try {
+-              // we only track these callables b/c they are cancelable. The other
+-              if (callsInProgress != null) callsInProgress.add(callable);
++
++              if (callsInProgress != null) {
++                callsInProgress.add(callable);
++              }
+               res = caller.callWithoutRetries(callable, currentCallTotalTimeout);
+-              if (currentCallable != null) {
+-                if (res == null|| res.getResults().size() == 0) {
+-                  // As mutateRow, if statistic off, nothing will return. So let's stop.
+-                  actionsInProgress.set(0);
+-                  return;
+-                }
+-              } else {
+-                if (res == null) {
+-                  return;
+-                }
++              if (res == null|| res.getResults().size() == 0) {
++                return;
+               }
+           } catch (IOException e) {
+             // The service itself failed . It may be an error coming from the communication
+@@ -1257,11 +1252,17 @@ class AsyncProcess {
+       int failureCount = 0;
+       boolean canRetry = true;
+ 
++      Map<byte[], MultiResponse.RegionResult> results = responses.getResults();
++      updateStats(server, results);
++      // update the stats about the region, if its a user table. We don't want to slow down
++      // updates to meta tables, especially from internal updates (master, etc).
++
++
+       // Go by original action.
+       int failed = 0, stopped = 0;
+       for (Map.Entry<byte[], List<Action<Row>>> regionEntry : multiAction.actions.entrySet()) {
+         byte[] regionName = regionEntry.getKey();
+-        Map<Integer, Object> regionResults = responses.getResults().get(regionName);
++        Map<Integer, Object> regionResults = results.get(regionName).result;
+         if (regionResults == null) {
+           if (!responses.getExceptions().containsKey(regionName)) {
+             LOG.error("Server sent us neither results nor exceptions for "
+@@ -1646,6 +1647,22 @@ class AsyncProcess {
+     }
+   }
+ 
++  private void updateStats(ServerName server, Map<byte[], MultiResponse.RegionResult> results) {
++    boolean metrics = AsyncProcess.this.connection.getConnectionMetrics() != null;
++    boolean stats = AsyncProcess.this.connection.getStatisticsTracker() != null;
++    if (!stats && !metrics) {
++      return;
++    }
++    for (Map.Entry<byte[], MultiResponse.RegionResult> regionStats : results.entrySet()) {
++      byte[] regionName = regionStats.getKey();
++      ClientProtos.RegionLoadStats stat = regionStats.getValue().getStat();
++        ResultStatsUtil.updateStats(AsyncProcess.this.connection.getStatisticsTracker(), server,
++          regionName, stat);
++        ResultStatsUtil.updateStats(AsyncProcess.this.connection.getConnectionMetrics(),
++          server, regionName, stat);
++    }
++  }
++
+   protected <CResult> AsyncRequestFutureImpl<CResult> createAsyncRequestFuture(
+       TableName tableName, List<Action<Row>> actions, long nonceGroup, ExecutorService pool,
+       Batch.Callback<CResult> callback, Object[] results, boolean needResults,
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index 5333aa0..6553364 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -618,13 +618,6 @@ public class HTable implements HTableInterface {
+             throw new IOException("Failed to mutate row: "+Bytes.toStringBinary(rm.getRow()), ex);
+           }
+ 
+-          if (response.getRegionActionResultCount() == 1 &&
+-              response.getRegionActionResult(0).getResultOrExceptionCount() == 0) {
+-            // Currently If there is no statistic tracker,
+-            // server will return empty RegionActionResult.
+-            // There is nothing in it. So we just return null.
+-            return null;
+-          }
+           return ResponseConverter.getResults(request, response, controller.cellScanner());
+         } catch (ServiceException se) {
+           throw ProtobufUtil.getRemoteException(se);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
+index 3863c37..7641c03 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
+@@ -50,7 +50,7 @@ import java.util.concurrent.TimeUnit;
+  * {@link #shutdown()} to terminate the thread pools they allocate.
+  */
+ @InterfaceAudience.Private
+-public class MetricsConnection {
++public class MetricsConnection implements StatisticTrackable{
+ 
+   /** Set this key to {@code true} to enable metrics collection of client requests. */
+   public static final String CLIENT_SIDE_METRICS_ENABLED_KEY = "hbase.client.metrics.enable";
+@@ -191,9 +191,15 @@ public class MetricsConnection {
+     }
+     Result result = (Result) r;
+     ClientProtos.RegionLoadStats stats = result.getStats();
+-    if(stats == null){
++    if (stats == null) {
+       return;
+     }
++    updateRegionStats(serverName, regionName, stats);
++  }
++
++  @Override
++  public void updateRegionStats(ServerName serverName, byte[] regionName,
++    ClientProtos.RegionLoadStats stats) {
+     String name = serverName.getServerName() + "," + Bytes.toStringBinary(regionName);
+     ConcurrentMap<byte[], RegionStats> rsStats = null;
+     if (serverStats.containsKey(serverName)) {
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiResponse.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiResponse.java
+index 089ccff..5fc84f3 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiResponse.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiResponse.java
+@@ -24,6 +24,7 @@ import java.util.Map;
+ import java.util.TreeMap;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+ /**
+@@ -33,8 +34,7 @@ import org.apache.hadoop.hbase.util.Bytes;
+ public class MultiResponse {
+ 
+   // map of regionName to map of Results by the original index for that Result
+-  private Map<byte[], Map<Integer, Object>> results =
+-      new TreeMap<byte[], Map<Integer, Object>>(Bytes.BYTES_COMPARATOR);
++  private Map<byte[], RegionResult> results = new TreeMap<>(Bytes.BYTES_COMPARATOR);
+ 
+   /**
+    * The server can send us a failure for the region itself, instead of individual failure.
+@@ -52,8 +52,8 @@ public class MultiResponse {
+    */
+   public int size() {
+     int size = 0;
+-    for (Map<?,?> c : results.values()) {
+-      size += c.size();
++    for (RegionResult result: results.values()) {
++      size += result.size();
+     }
+     return size;
+   }
+@@ -66,16 +66,7 @@ public class MultiResponse {
+    * @param resOrEx the result or error; will be empty for successful Put and Delete actions.
+    */
+   public void add(byte[] regionName, int originalIndex, Object resOrEx) {
+-    Map<Integer, Object> rs = results.get(regionName);
+-    if (rs == null) {
+-      rs = new HashMap<Integer, Object>();
+-      results.put(regionName, rs);
+-    }
+-    rs.put(originalIndex, resOrEx);
+-  }
+-
+-  public Map<byte[], Map<Integer, Object>> getResults() {
+-    return results;
++    getResult(regionName).addResult(originalIndex, resOrEx);
+   }
+ 
+   public void addException(byte []regionName, Throwable ie){
+@@ -92,4 +83,42 @@ public class MultiResponse {
+   public Map<byte[], Throwable> getExceptions() {
+     return exceptions;
+   }
++
++  public void addStatistic(byte[] regionName, ClientProtos.RegionLoadStats stat) {
++    getResult(regionName).setStat(stat);
++  }
++
++  private RegionResult getResult(byte[] region){
++    RegionResult rs = results.get(region);
++    if (rs == null) {
++      rs = new RegionResult();
++      results.put(region, rs);
++    }
++   return rs;
++  }
++
++  public Map<byte[], RegionResult> getResults(){
++    return this.results;
++  }
++
++  public class RegionResult{
++    Map<Integer, Object> result = new HashMap<>();
++    ClientProtos.RegionLoadStats stat;
++
++    public void addResult(int index, Object result){
++      this.result.put(index, result);
++    }
++
++    public void setStat(ClientProtos.RegionLoadStats stat){
++      this.stat = stat;
++    }
++
++    public int size() {
++      return this.result.size();
++    }
++
++    public ClientProtos.RegionLoadStats getStat() {
++      return this.stat;
++    }
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ResultStatsUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ResultStatsUtil.java
+index 3caa63e..6537d79 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ResultStatsUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ResultStatsUtil.java
+@@ -55,13 +55,17 @@ public final class ResultStatsUtil {
+       return r;
+     }
+ 
+-    if (regionName != null) {
+-      serverStats.updateRegionStats(server, regionName, stats);
+-    }
+-
++    updateStats(serverStats, server, regionName, stats);
+     return r;
+   }
+ 
++  public static void updateStats(StatisticTrackable tracker, ServerName server, byte[] regionName,
++    ClientProtos.RegionLoadStats stats) {
++    if (regionName != null && stats != null && tracker != null) {
++      tracker.updateRegionStats(server, regionName, stats);
++    }
++  }
++
+   public static <T> T updateStats(T r, ServerStatisticTracker stats,
+       HRegionLocation regionLocation) {
+     byte[] regionName = null;
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ServerStatisticTracker.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ServerStatisticTracker.java
+index d03ecf6..b8e7923 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ServerStatisticTracker.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ServerStatisticTracker.java
+@@ -31,11 +31,12 @@ import java.util.concurrent.ConcurrentHashMap;
+  * Tracks the statistics for multiple regions
+  */
+ @InterfaceAudience.Private
+-public class ServerStatisticTracker {
++public class ServerStatisticTracker implements StatisticTrackable {
+ 
+   private final ConcurrentHashMap<ServerName, ServerStatistics> stats =
+       new ConcurrentHashMap<ServerName, ServerStatistics>();
+ 
++  @Override
+   public void updateRegionStats(ServerName server, byte[] region, ClientProtos.RegionLoadStats
+       currentStats) {
+     ServerStatistics stat = stats.get(server);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/StatisticTrackable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/StatisticTrackable.java
+new file mode 100644
+index 0000000..2035d1a
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/StatisticTrackable.java
+@@ -0,0 +1,28 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to you under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.client;
++
++import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
++
++/**
++ *
++ */
++public interface StatisticTrackable {
++  void updateRegionStats(ServerName server, byte[] region, ClientProtos.RegionLoadStats
++    stats);
++}
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index dd42fd5..7519391 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -188,7 +188,7 @@ public final class ProtobufUtil {
+    *  we reuse them across calls.
+    */
+   private final static Cell[] EMPTY_CELL_ARRAY = new Cell[]{};
+-  private final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
++  public final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
+   private final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
+   private final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
+   private final static Result EMPTY_RESULT_STALE = Result.create(EMPTY_CELL_ARRAY, null, true);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+index f1c8797..ad96e4c 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+@@ -131,6 +131,11 @@ public final class ResponseConverter {
+           }
+         } else if (roe.hasServiceResult()) {
+           responseValue = roe.getServiceResult();
++        } else if (response.getProcessed()) {
++          // Sometimes, the response is just "it was processed". Generally, this occurs for things
++          // like mutateRows where either we get back 'processed' (or not) and optionally some
++          // statistics about the regions we touched.
++          responseValue = ProtobufUtil.EMPTY_RESULT;
+         } else {
+           // no result & no exception. Unexpected.
+           throw new IllegalStateException("No result & no exception roe=" + roe +
+@@ -140,6 +145,13 @@ public final class ResponseConverter {
+       }
+     }
+ 
++    if (response.hasRegionStatistics()) {
++      ClientProtos.MultiRegionLoadStats stats = response.getRegionStatistics();
++      for (int i = 0; i < stats.getRegionCount(); i++) {
++        results.addStatistic(stats.getRegion(i).getValue().toByteArray(), stats.getStat(i));
++      }
++    }
++
+     return results;
+   }
+ 
+@@ -161,11 +173,9 @@ public final class ResponseConverter {
+    * @param r
+    * @return an action result builder
+    */
+-  public static ResultOrException.Builder buildActionResult(final ClientProtos.Result r,
+-      ClientProtos.RegionLoadStats stats) {
++  public static ResultOrException.Builder buildActionResult(final ClientProtos.Result r) {
+     ResultOrException.Builder builder = ResultOrException.newBuilder();
+     if (r != null) builder.setResult(r);
+-    if(stats != null) builder.setLoadStats(stats);
+     return builder;
+   }
+ 
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+index 5e17ad5..1bbbe7b 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+@@ -28267,6 +28267,32 @@ public final class ClientProtos {
+      * </pre>
+      */
+     int getCompactionPressure();
++
++    // optional bool enabled = 4 [default = false];
++    /**
++     * <code>optional bool enabled = 4 [default = false];</code>
++     *
++     * <pre>
++     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++     * there is no change to the local behavior because there is no load. Futher, even if the
++     * server sends back statistics, its up to the client to have the tracker enabled via a
++     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++     * for understanding the
++     * </pre>
++     */
++    boolean hasEnabled();
++    /**
++     * <code>optional bool enabled = 4 [default = false];</code>
++     *
++     * <pre>
++     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++     * there is no change to the local behavior because there is no load. Futher, even if the
++     * server sends back statistics, its up to the client to have the tracker enabled via a
++     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++     * for understanding the
++     * </pre>
++     */
++    boolean getEnabled();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.RegionLoadStats}
+@@ -28339,6 +28365,11 @@ public final class ClientProtos {
+               compactionPressure_ = input.readInt32();
+               break;
+             }
++            case 32: {
++              bitField0_ |= 0x00000008;
++              enabled_ = input.readBool();
++              break;
++            }
+           }
+         }
+       } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -28453,10 +28484,43 @@ public final class ClientProtos {
+       return compactionPressure_;
+     }
+ 
++    // optional bool enabled = 4 [default = false];
++    public static final int ENABLED_FIELD_NUMBER = 4;
++    private boolean enabled_;
++    /**
++     * <code>optional bool enabled = 4 [default = false];</code>
++     *
++     * <pre>
++     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++     * there is no change to the local behavior because there is no load. Futher, even if the
++     * server sends back statistics, its up to the client to have the tracker enabled via a
++     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++     * for understanding the
++     * </pre>
++     */
++    public boolean hasEnabled() {
++      return ((bitField0_ & 0x00000008) == 0x00000008);
++    }
++    /**
++     * <code>optional bool enabled = 4 [default = false];</code>
++     *
++     * <pre>
++     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++     * there is no change to the local behavior because there is no load. Futher, even if the
++     * server sends back statistics, its up to the client to have the tracker enabled via a
++     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++     * for understanding the
++     * </pre>
++     */
++    public boolean getEnabled() {
++      return enabled_;
++    }
++
+     private void initFields() {
+       memstoreLoad_ = 0;
+       heapOccupancy_ = 0;
+       compactionPressure_ = 0;
++      enabled_ = false;
+     }
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+@@ -28479,6 +28543,9 @@ public final class ClientProtos {
+       if (((bitField0_ & 0x00000004) == 0x00000004)) {
+         output.writeInt32(3, compactionPressure_);
+       }
++      if (((bitField0_ & 0x00000008) == 0x00000008)) {
++        output.writeBool(4, enabled_);
++      }
+       getUnknownFields().writeTo(output);
+     }
+ 
+@@ -28500,6 +28567,10 @@ public final class ClientProtos {
+         size += com.google.protobuf.CodedOutputStream
+           .computeInt32Size(3, compactionPressure_);
+       }
++      if (((bitField0_ & 0x00000008) == 0x00000008)) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeBoolSize(4, enabled_);
++      }
+       size += getUnknownFields().getSerializedSize();
+       memoizedSerializedSize = size;
+       return size;
+@@ -28538,6 +28609,11 @@ public final class ClientProtos {
+         result = result && (getCompactionPressure()
+             == other.getCompactionPressure());
+       }
++      result = result && (hasEnabled() == other.hasEnabled());
++      if (hasEnabled()) {
++        result = result && (getEnabled()
++            == other.getEnabled());
++      }
+       result = result &&
+           getUnknownFields().equals(other.getUnknownFields());
+       return result;
+@@ -28563,6 +28639,10 @@ public final class ClientProtos {
+         hash = (37 * hash) + COMPACTIONPRESSURE_FIELD_NUMBER;
+         hash = (53 * hash) + getCompactionPressure();
+       }
++      if (hasEnabled()) {
++        hash = (37 * hash) + ENABLED_FIELD_NUMBER;
++        hash = (53 * hash) + hashBoolean(getEnabled());
++      }
+       hash = (29 * hash) + getUnknownFields().hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -28683,6 +28763,8 @@ public final class ClientProtos {
+         bitField0_ = (bitField0_ & ~0x00000002);
+         compactionPressure_ = 0;
+         bitField0_ = (bitField0_ & ~0x00000004);
++        enabled_ = false;
++        bitField0_ = (bitField0_ & ~0x00000008);
+         return this;
+       }
+ 
+@@ -28723,6 +28805,10 @@ public final class ClientProtos {
+           to_bitField0_ |= 0x00000004;
+         }
+         result.compactionPressure_ = compactionPressure_;
++        if (((from_bitField0_ & 0x00000008) == 0x00000008)) {
++          to_bitField0_ |= 0x00000008;
++        }
++        result.enabled_ = enabled_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -28748,6 +28834,9 @@ public final class ClientProtos {
+         if (other.hasCompactionPressure()) {
+           setCompactionPressure(other.getCompactionPressure());
+         }
++        if (other.hasEnabled()) {
++          setEnabled(other.getEnabled());
++        }
+         this.mergeUnknownFields(other.getUnknownFields());
+         return this;
+       }
+@@ -28798,143 +28887,1297 @@ public final class ClientProtos {
+         return memstoreLoad_;
+       }
+       /**
+-       * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
++       *
++       * <pre>
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public Builder setMemstoreLoad(int value) {
++        bitField0_ |= 0x00000001;
++        memstoreLoad_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
++       *
++       * <pre>
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public Builder clearMemstoreLoad() {
++        bitField0_ = (bitField0_ & ~0x00000001);
++        memstoreLoad_ = 0;
++        onChanged();
++        return this;
++      }
++
++      // optional int32 heapOccupancy = 2 [default = 0];
++      private int heapOccupancy_ ;
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public boolean hasHeapOccupancy() {
++        return ((bitField0_ & 0x00000002) == 0x00000002);
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public int getHeapOccupancy() {
++        return heapOccupancy_;
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public Builder setHeapOccupancy(int value) {
++        bitField0_ |= 0x00000002;
++        heapOccupancy_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public Builder clearHeapOccupancy() {
++        bitField0_ = (bitField0_ & ~0x00000002);
++        heapOccupancy_ = 0;
++        onChanged();
++        return this;
++      }
++
++      // optional int32 compactionPressure = 3 [default = 0];
++      private int compactionPressure_ ;
++      /**
++       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
++       *
++       * <pre>
++       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public boolean hasCompactionPressure() {
++        return ((bitField0_ & 0x00000004) == 0x00000004);
++      }
++      /**
++       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
++       *
++       * <pre>
++       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public int getCompactionPressure() {
++        return compactionPressure_;
++      }
++      /**
++       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
++       *
++       * <pre>
++       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public Builder setCompactionPressure(int value) {
++        bitField0_ |= 0x00000004;
++        compactionPressure_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
++       *
++       * <pre>
++       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
++       * </pre>
++       */
++      public Builder clearCompactionPressure() {
++        bitField0_ = (bitField0_ & ~0x00000004);
++        compactionPressure_ = 0;
++        onChanged();
++        return this;
++      }
++
++      // optional bool enabled = 4 [default = false];
++      private boolean enabled_ ;
++      /**
++       * <code>optional bool enabled = 4 [default = false];</code>
++       *
++       * <pre>
++       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++       * there is no change to the local behavior because there is no load. Futher, even if the
++       * server sends back statistics, its up to the client to have the tracker enabled via a
++       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++       * for understanding the
++       * </pre>
++       */
++      public boolean hasEnabled() {
++        return ((bitField0_ & 0x00000008) == 0x00000008);
++      }
++      /**
++       * <code>optional bool enabled = 4 [default = false];</code>
++       *
++       * <pre>
++       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++       * there is no change to the local behavior because there is no load. Futher, even if the
++       * server sends back statistics, its up to the client to have the tracker enabled via a
++       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++       * for understanding the
++       * </pre>
++       */
++      public boolean getEnabled() {
++        return enabled_;
++      }
++      /**
++       * <code>optional bool enabled = 4 [default = false];</code>
++       *
++       * <pre>
++       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++       * there is no change to the local behavior because there is no load. Futher, even if the
++       * server sends back statistics, its up to the client to have the tracker enabled via a
++       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++       * for understanding the
++       * </pre>
++       */
++      public Builder setEnabled(boolean value) {
++        bitField0_ |= 0x00000008;
++        enabled_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional bool enabled = 4 [default = false];</code>
++       *
++       * <pre>
++       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++       * there is no change to the local behavior because there is no load. Futher, even if the
++       * server sends back statistics, its up to the client to have the tracker enabled via a
++       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++       * for understanding the
++       * </pre>
++       */
++      public Builder clearEnabled() {
++        bitField0_ = (bitField0_ & ~0x00000008);
++        enabled_ = false;
++        onChanged();
++        return this;
++      }
++
++      // @@protoc_insertion_point(builder_scope:hbase.pb.RegionLoadStats)
++    }
++
++    static {
++      defaultInstance = new RegionLoadStats(true);
++      defaultInstance.initFields();
++    }
++
++    // @@protoc_insertion_point(class_scope:hbase.pb.RegionLoadStats)
++  }
++
++  public interface MultiRegionLoadStatsOrBuilder
++      extends com.google.protobuf.MessageOrBuilder {
++
++    // repeated .hbase.pb.RegionSpecifier region = 1;
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> 
++        getRegionList();
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier getRegion(int index);
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    int getRegionCount();
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder> 
++        getRegionOrBuilderList();
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder getRegionOrBuilder(
++        int index);
++
++    // repeated .hbase.pb.RegionLoadStats stat = 2;
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> 
++        getStatList();
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getStat(int index);
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    int getStatCount();
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> 
++        getStatOrBuilderList();
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getStatOrBuilder(
++        int index);
++  }
++  /**
++   * Protobuf type {@code hbase.pb.MultiRegionLoadStats}
++   */
++  public static final class MultiRegionLoadStats extends
++      com.google.protobuf.GeneratedMessage
++      implements MultiRegionLoadStatsOrBuilder {
++    // Use MultiRegionLoadStats.newBuilder() to construct.
++    private MultiRegionLoadStats(com.google.protobuf.GeneratedMessage.Builder<?> builder) {
++      super(builder);
++      this.unknownFields = builder.getUnknownFields();
++    }
++    private MultiRegionLoadStats(boolean noInit) { this.unknownFields = com.google.protobuf.UnknownFieldSet.getDefaultInstance(); }
++
++    private static final MultiRegionLoadStats defaultInstance;
++    public static MultiRegionLoadStats getDefaultInstance() {
++      return defaultInstance;
++    }
++
++    public MultiRegionLoadStats getDefaultInstanceForType() {
++      return defaultInstance;
++    }
++
++    private final com.google.protobuf.UnknownFieldSet unknownFields;
++    @java.lang.Override
++    public final com.google.protobuf.UnknownFieldSet
++        getUnknownFields() {
++      return this.unknownFields;
++    }
++    private MultiRegionLoadStats(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      initFields();
++      int mutable_bitField0_ = 0;
++      com.google.protobuf.UnknownFieldSet.Builder unknownFields =
++          com.google.protobuf.UnknownFieldSet.newBuilder();
++      try {
++        boolean done = false;
++        while (!done) {
++          int tag = input.readTag();
++          switch (tag) {
++            case 0:
++              done = true;
++              break;
++            default: {
++              if (!parseUnknownField(input, unknownFields,
++                                     extensionRegistry, tag)) {
++                done = true;
++              }
++              break;
++            }
++            case 10: {
++              if (!((mutable_bitField0_ & 0x00000001) == 0x00000001)) {
++                region_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier>();
++                mutable_bitField0_ |= 0x00000001;
++              }
++              region_.add(input.readMessage(org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.PARSER, extensionRegistry));
++              break;
++            }
++            case 18: {
++              if (!((mutable_bitField0_ & 0x00000002) == 0x00000002)) {
++                stat_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats>();
++                mutable_bitField0_ |= 0x00000002;
++              }
++              stat_.add(input.readMessage(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.PARSER, extensionRegistry));
++              break;
++            }
++          }
++        }
++      } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++        throw e.setUnfinishedMessage(this);
++      } catch (java.io.IOException e) {
++        throw new com.google.protobuf.InvalidProtocolBufferException(
++            e.getMessage()).setUnfinishedMessage(this);
++      } finally {
++        if (((mutable_bitField0_ & 0x00000001) == 0x00000001)) {
++          region_ = java.util.Collections.unmodifiableList(region_);
++        }
++        if (((mutable_bitField0_ & 0x00000002) == 0x00000002)) {
++          stat_ = java.util.Collections.unmodifiableList(stat_);
++        }
++        this.unknownFields = unknownFields.build();
++        makeExtensionsImmutable();
++      }
++    }
++    public static final com.google.protobuf.Descriptors.Descriptor
++        getDescriptor() {
++      return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.internal_static_hbase_pb_MultiRegionLoadStats_descriptor;
++    }
++
++    protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++        internalGetFieldAccessorTable() {
++      return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.internal_static_hbase_pb_MultiRegionLoadStats_fieldAccessorTable
++          .ensureFieldAccessorsInitialized(
++              org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.class, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder.class);
++    }
++
++    public static com.google.protobuf.Parser<MultiRegionLoadStats> PARSER =
++        new com.google.protobuf.AbstractParser<MultiRegionLoadStats>() {
++      public MultiRegionLoadStats parsePartialFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws com.google.protobuf.InvalidProtocolBufferException {
++        return new MultiRegionLoadStats(input, extensionRegistry);
++      }
++    };
++
++    @java.lang.Override
++    public com.google.protobuf.Parser<MultiRegionLoadStats> getParserForType() {
++      return PARSER;
++    }
++
++    // repeated .hbase.pb.RegionSpecifier region = 1;
++    public static final int REGION_FIELD_NUMBER = 1;
++    private java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> region_;
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    public java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> getRegionList() {
++      return region_;
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    public java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder> 
++        getRegionOrBuilderList() {
++      return region_;
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    public int getRegionCount() {
++      return region_.size();
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier getRegion(int index) {
++      return region_.get(index);
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder getRegionOrBuilder(
++        int index) {
++      return region_.get(index);
++    }
++
++    // repeated .hbase.pb.RegionLoadStats stat = 2;
++    public static final int STAT_FIELD_NUMBER = 2;
++    private java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> stat_;
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    public java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> getStatList() {
++      return stat_;
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    public java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> 
++        getStatOrBuilderList() {
++      return stat_;
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    public int getStatCount() {
++      return stat_.size();
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getStat(int index) {
++      return stat_.get(index);
++    }
++    /**
++     * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getStatOrBuilder(
++        int index) {
++      return stat_.get(index);
++    }
++
++    private void initFields() {
++      region_ = java.util.Collections.emptyList();
++      stat_ = java.util.Collections.emptyList();
++    }
++    private byte memoizedIsInitialized = -1;
++    public final boolean isInitialized() {
++      byte isInitialized = memoizedIsInitialized;
++      if (isInitialized != -1) return isInitialized == 1;
++
++      for (int i = 0; i < getRegionCount(); i++) {
++        if (!getRegion(i).isInitialized()) {
++          memoizedIsInitialized = 0;
++          return false;
++        }
++      }
++      memoizedIsInitialized = 1;
++      return true;
++    }
++
++    public void writeTo(com.google.protobuf.CodedOutputStream output)
++                        throws java.io.IOException {
++      getSerializedSize();
++      for (int i = 0; i < region_.size(); i++) {
++        output.writeMessage(1, region_.get(i));
++      }
++      for (int i = 0; i < stat_.size(); i++) {
++        output.writeMessage(2, stat_.get(i));
++      }
++      getUnknownFields().writeTo(output);
++    }
++
++    private int memoizedSerializedSize = -1;
++    public int getSerializedSize() {
++      int size = memoizedSerializedSize;
++      if (size != -1) return size;
++
++      size = 0;
++      for (int i = 0; i < region_.size(); i++) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeMessageSize(1, region_.get(i));
++      }
++      for (int i = 0; i < stat_.size(); i++) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeMessageSize(2, stat_.get(i));
++      }
++      size += getUnknownFields().getSerializedSize();
++      memoizedSerializedSize = size;
++      return size;
++    }
++
++    private static final long serialVersionUID = 0L;
++    @java.lang.Override
++    protected java.lang.Object writeReplace()
++        throws java.io.ObjectStreamException {
++      return super.writeReplace();
++    }
++
++    @java.lang.Override
++    public boolean equals(final java.lang.Object obj) {
++      if (obj == this) {
++       return true;
++      }
++      if (!(obj instanceof org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats)) {
++        return super.equals(obj);
++      }
++      org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats other = (org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats) obj;
++
++      boolean result = true;
++      result = result && getRegionList()
++          .equals(other.getRegionList());
++      result = result && getStatList()
++          .equals(other.getStatList());
++      result = result &&
++          getUnknownFields().equals(other.getUnknownFields());
++      return result;
++    }
++
++    private int memoizedHashCode = 0;
++    @java.lang.Override
++    public int hashCode() {
++      if (memoizedHashCode != 0) {
++        return memoizedHashCode;
++      }
++      int hash = 41;
++      hash = (19 * hash) + getDescriptorForType().hashCode();
++      if (getRegionCount() > 0) {
++        hash = (37 * hash) + REGION_FIELD_NUMBER;
++        hash = (53 * hash) + getRegionList().hashCode();
++      }
++      if (getStatCount() > 0) {
++        hash = (37 * hash) + STAT_FIELD_NUMBER;
++        hash = (53 * hash) + getStatList().hashCode();
++      }
++      hash = (29 * hash) + getUnknownFields().hashCode();
++      memoizedHashCode = hash;
++      return hash;
++    }
++
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        com.google.protobuf.ByteString data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        com.google.protobuf.ByteString data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(byte[] data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        byte[] data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseDelimitedFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseDelimitedFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        com.google.protobuf.CodedInputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parseFrom(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++
++    public static Builder newBuilder() { return Builder.create(); }
++    public Builder newBuilderForType() { return newBuilder(); }
++    public static Builder newBuilder(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats prototype) {
++      return newBuilder().mergeFrom(prototype);
++    }
++    public Builder toBuilder() { return newBuilder(this); }
++
++    @java.lang.Override
++    protected Builder newBuilderForType(
++        com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++      Builder builder = new Builder(parent);
++      return builder;
++    }
++    /**
++     * Protobuf type {@code hbase.pb.MultiRegionLoadStats}
++     */
++    public static final class Builder extends
++        com.google.protobuf.GeneratedMessage.Builder<Builder>
++       implements org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder {
++      public static final com.google.protobuf.Descriptors.Descriptor
++          getDescriptor() {
++        return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.internal_static_hbase_pb_MultiRegionLoadStats_descriptor;
++      }
++
++      protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++          internalGetFieldAccessorTable() {
++        return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.internal_static_hbase_pb_MultiRegionLoadStats_fieldAccessorTable
++            .ensureFieldAccessorsInitialized(
++                org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.class, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder.class);
++      }
++
++      // Construct using org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.newBuilder()
++      private Builder() {
++        maybeForceBuilderInitialization();
++      }
++
++      private Builder(
++          com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++        super(parent);
++        maybeForceBuilderInitialization();
++      }
++      private void maybeForceBuilderInitialization() {
++        if (com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders) {
++          getRegionFieldBuilder();
++          getStatFieldBuilder();
++        }
++      }
++      private static Builder create() {
++        return new Builder();
++      }
++
++      public Builder clear() {
++        super.clear();
++        if (regionBuilder_ == null) {
++          region_ = java.util.Collections.emptyList();
++          bitField0_ = (bitField0_ & ~0x00000001);
++        } else {
++          regionBuilder_.clear();
++        }
++        if (statBuilder_ == null) {
++          stat_ = java.util.Collections.emptyList();
++          bitField0_ = (bitField0_ & ~0x00000002);
++        } else {
++          statBuilder_.clear();
++        }
++        return this;
++      }
++
++      public Builder clone() {
++        return create().mergeFrom(buildPartial());
++      }
++
++      public com.google.protobuf.Descriptors.Descriptor
++          getDescriptorForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.internal_static_hbase_pb_MultiRegionLoadStats_descriptor;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats getDefaultInstanceForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance();
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats build() {
++        org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats result = buildPartial();
++        if (!result.isInitialized()) {
++          throw newUninitializedMessageException(result);
++        }
++        return result;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats buildPartial() {
++        org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats result = new org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats(this);
++        int from_bitField0_ = bitField0_;
++        if (regionBuilder_ == null) {
++          if (((bitField0_ & 0x00000001) == 0x00000001)) {
++            region_ = java.util.Collections.unmodifiableList(region_);
++            bitField0_ = (bitField0_ & ~0x00000001);
++          }
++          result.region_ = region_;
++        } else {
++          result.region_ = regionBuilder_.build();
++        }
++        if (statBuilder_ == null) {
++          if (((bitField0_ & 0x00000002) == 0x00000002)) {
++            stat_ = java.util.Collections.unmodifiableList(stat_);
++            bitField0_ = (bitField0_ & ~0x00000002);
++          }
++          result.stat_ = stat_;
++        } else {
++          result.stat_ = statBuilder_.build();
++        }
++        onBuilt();
++        return result;
++      }
++
++      public Builder mergeFrom(com.google.protobuf.Message other) {
++        if (other instanceof org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats) {
++          return mergeFrom((org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats)other);
++        } else {
++          super.mergeFrom(other);
++          return this;
++        }
++      }
++
++      public Builder mergeFrom(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats other) {
++        if (other == org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance()) return this;
++        if (regionBuilder_ == null) {
++          if (!other.region_.isEmpty()) {
++            if (region_.isEmpty()) {
++              region_ = other.region_;
++              bitField0_ = (bitField0_ & ~0x00000001);
++            } else {
++              ensureRegionIsMutable();
++              region_.addAll(other.region_);
++            }
++            onChanged();
++          }
++        } else {
++          if (!other.region_.isEmpty()) {
++            if (regionBuilder_.isEmpty()) {
++              regionBuilder_.dispose();
++              regionBuilder_ = null;
++              region_ = other.region_;
++              bitField0_ = (bitField0_ & ~0x00000001);
++              regionBuilder_ = 
++                com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders ?
++                   getRegionFieldBuilder() : null;
++            } else {
++              regionBuilder_.addAllMessages(other.region_);
++            }
++          }
++        }
++        if (statBuilder_ == null) {
++          if (!other.stat_.isEmpty()) {
++            if (stat_.isEmpty()) {
++              stat_ = other.stat_;
++              bitField0_ = (bitField0_ & ~0x00000002);
++            } else {
++              ensureStatIsMutable();
++              stat_.addAll(other.stat_);
++            }
++            onChanged();
++          }
++        } else {
++          if (!other.stat_.isEmpty()) {
++            if (statBuilder_.isEmpty()) {
++              statBuilder_.dispose();
++              statBuilder_ = null;
++              stat_ = other.stat_;
++              bitField0_ = (bitField0_ & ~0x00000002);
++              statBuilder_ = 
++                com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders ?
++                   getStatFieldBuilder() : null;
++            } else {
++              statBuilder_.addAllMessages(other.stat_);
++            }
++          }
++        }
++        this.mergeUnknownFields(other.getUnknownFields());
++        return this;
++      }
++
++      public final boolean isInitialized() {
++        for (int i = 0; i < getRegionCount(); i++) {
++          if (!getRegion(i).isInitialized()) {
++            
++            return false;
++          }
++        }
++        return true;
++      }
++
++      public Builder mergeFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws java.io.IOException {
++        org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats parsedMessage = null;
++        try {
++          parsedMessage = PARSER.parsePartialFrom(input, extensionRegistry);
++        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++          parsedMessage = (org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats) e.getUnfinishedMessage();
++          throw e;
++        } finally {
++          if (parsedMessage != null) {
++            mergeFrom(parsedMessage);
++          }
++        }
++        return this;
++      }
++      private int bitField0_;
++
++      // repeated .hbase.pb.RegionSpecifier region = 1;
++      private java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> region_ =
++        java.util.Collections.emptyList();
++      private void ensureRegionIsMutable() {
++        if (!((bitField0_ & 0x00000001) == 0x00000001)) {
++          region_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier>(region_);
++          bitField0_ |= 0x00000001;
++         }
++      }
++
++      private com.google.protobuf.RepeatedFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder> regionBuilder_;
++
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> getRegionList() {
++        if (regionBuilder_ == null) {
++          return java.util.Collections.unmodifiableList(region_);
++        } else {
++          return regionBuilder_.getMessageList();
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public int getRegionCount() {
++        if (regionBuilder_ == null) {
++          return region_.size();
++        } else {
++          return regionBuilder_.getCount();
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier getRegion(int index) {
++        if (regionBuilder_ == null) {
++          return region_.get(index);
++        } else {
++          return regionBuilder_.getMessage(index);
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder setRegion(
++          int index, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier value) {
++        if (regionBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureRegionIsMutable();
++          region_.set(index, value);
++          onChanged();
++        } else {
++          regionBuilder_.setMessage(index, value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder setRegion(
++          int index, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder builderForValue) {
++        if (regionBuilder_ == null) {
++          ensureRegionIsMutable();
++          region_.set(index, builderForValue.build());
++          onChanged();
++        } else {
++          regionBuilder_.setMessage(index, builderForValue.build());
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder addRegion(org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier value) {
++        if (regionBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureRegionIsMutable();
++          region_.add(value);
++          onChanged();
++        } else {
++          regionBuilder_.addMessage(value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder addRegion(
++          int index, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier value) {
++        if (regionBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureRegionIsMutable();
++          region_.add(index, value);
++          onChanged();
++        } else {
++          regionBuilder_.addMessage(index, value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder addRegion(
++          org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder builderForValue) {
++        if (regionBuilder_ == null) {
++          ensureRegionIsMutable();
++          region_.add(builderForValue.build());
++          onChanged();
++        } else {
++          regionBuilder_.addMessage(builderForValue.build());
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder addRegion(
++          int index, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder builderForValue) {
++        if (regionBuilder_ == null) {
++          ensureRegionIsMutable();
++          region_.add(index, builderForValue.build());
++          onChanged();
++        } else {
++          regionBuilder_.addMessage(index, builderForValue.build());
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder addAllRegion(
++          java.lang.Iterable<? extends org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier> values) {
++        if (regionBuilder_ == null) {
++          ensureRegionIsMutable();
++          super.addAll(values, region_);
++          onChanged();
++        } else {
++          regionBuilder_.addAllMessages(values);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder clearRegion() {
++        if (regionBuilder_ == null) {
++          region_ = java.util.Collections.emptyList();
++          bitField0_ = (bitField0_ & ~0x00000001);
++          onChanged();
++        } else {
++          regionBuilder_.clear();
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public Builder removeRegion(int index) {
++        if (regionBuilder_ == null) {
++          ensureRegionIsMutable();
++          region_.remove(index);
++          onChanged();
++        } else {
++          regionBuilder_.remove(index);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder getRegionBuilder(
++          int index) {
++        return getRegionFieldBuilder().getBuilder(index);
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder getRegionOrBuilder(
++          int index) {
++        if (regionBuilder_ == null) {
++          return region_.get(index);  } else {
++          return regionBuilder_.getMessageOrBuilder(index);
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder> 
++           getRegionOrBuilderList() {
++        if (regionBuilder_ != null) {
++          return regionBuilder_.getMessageOrBuilderList();
++        } else {
++          return java.util.Collections.unmodifiableList(region_);
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder addRegionBuilder() {
++        return getRegionFieldBuilder().addBuilder(
++            org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.getDefaultInstance());
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder addRegionBuilder(
++          int index) {
++        return getRegionFieldBuilder().addBuilder(
++            index, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.getDefaultInstance());
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionSpecifier region = 1;</code>
++       */
++      public java.util.List<org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder> 
++           getRegionBuilderList() {
++        return getRegionFieldBuilder().getBuilderList();
++      }
++      private com.google.protobuf.RepeatedFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder> 
++          getRegionFieldBuilder() {
++        if (regionBuilder_ == null) {
++          regionBuilder_ = new com.google.protobuf.RepeatedFieldBuilder<
++              org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.Builder, org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifierOrBuilder>(
++                  region_,
++                  ((bitField0_ & 0x00000001) == 0x00000001),
++                  getParentForChildren(),
++                  isClean());
++          region_ = null;
++        }
++        return regionBuilder_;
++      }
++
++      // repeated .hbase.pb.RegionLoadStats stat = 2;
++      private java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> stat_ =
++        java.util.Collections.emptyList();
++      private void ensureStatIsMutable() {
++        if (!((bitField0_ & 0x00000002) == 0x00000002)) {
++          stat_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats>(stat_);
++          bitField0_ |= 0x00000002;
++         }
++      }
++
++      private com.google.protobuf.RepeatedFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> statBuilder_;
++
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> getStatList() {
++        if (statBuilder_ == null) {
++          return java.util.Collections.unmodifiableList(stat_);
++        } else {
++          return statBuilder_.getMessageList();
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public int getStatCount() {
++        if (statBuilder_ == null) {
++          return stat_.size();
++        } else {
++          return statBuilder_.getCount();
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getStat(int index) {
++        if (statBuilder_ == null) {
++          return stat_.get(index);
++        } else {
++          return statBuilder_.getMessage(index);
++        }
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public Builder setStat(
++          int index, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
++        if (statBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureStatIsMutable();
++          stat_.set(index, value);
++          onChanged();
++        } else {
++          statBuilder_.setMessage(index, value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public Builder setStat(
++          int index, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder builderForValue) {
++        if (statBuilder_ == null) {
++          ensureStatIsMutable();
++          stat_.set(index, builderForValue.build());
++          onChanged();
++        } else {
++          statBuilder_.setMessage(index, builderForValue.build());
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public Builder addStat(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
++        if (statBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureStatIsMutable();
++          stat_.add(value);
++          onChanged();
++        } else {
++          statBuilder_.addMessage(value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public Builder addStat(
++          int index, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
++        if (statBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          ensureStatIsMutable();
++          stat_.add(index, value);
++          onChanged();
++        } else {
++          statBuilder_.addMessage(index, value);
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
++       */
++      public Builder addStat(
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder builderForValue) {
++        if (statBuilder_ == null) {
++          ensureStatIsMutable();
++          stat_.add(builderForValue.build());
++          onChanged();
++        } else {
++          statBuilder_.addMessage(builderForValue.build());
++        }
++        return this;
++      }
++      /**
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder setMemstoreLoad(int value) {
+-        bitField0_ |= 0x00000001;
+-        memstoreLoad_ = value;
+-        onChanged();
++      public Builder addStat(
++          int index, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder builderForValue) {
++        if (statBuilder_ == null) {
++          ensureStatIsMutable();
++          stat_.add(index, builderForValue.build());
++          onChanged();
++        } else {
++          statBuilder_.addMessage(index, builderForValue.build());
++        }
+         return this;
+       }
+       /**
+-       * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder clearMemstoreLoad() {
+-        bitField0_ = (bitField0_ & ~0x00000001);
+-        memstoreLoad_ = 0;
+-        onChanged();
++      public Builder addAllStat(
++          java.lang.Iterable<? extends org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats> values) {
++        if (statBuilder_ == null) {
++          ensureStatIsMutable();
++          super.addAll(values, stat_);
++          onChanged();
++        } else {
++          statBuilder_.addAllMessages(values);
++        }
+         return this;
+       }
+-
+-      // optional int32 heapOccupancy = 2 [default = 0];
+-      private int heapOccupancy_ ;
+       /**
+-       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
+-       * We can move this to "ServerLoadStats" should we develop them.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public boolean hasHeapOccupancy() {
+-        return ((bitField0_ & 0x00000002) == 0x00000002);
++      public Builder clearStat() {
++        if (statBuilder_ == null) {
++          stat_ = java.util.Collections.emptyList();
++          bitField0_ = (bitField0_ & ~0x00000002);
++          onChanged();
++        } else {
++          statBuilder_.clear();
++        }
++        return this;
+       }
+       /**
+-       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
+-       * We can move this to "ServerLoadStats" should we develop them.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public int getHeapOccupancy() {
+-        return heapOccupancy_;
++      public Builder removeStat(int index) {
++        if (statBuilder_ == null) {
++          ensureStatIsMutable();
++          stat_.remove(index);
++          onChanged();
++        } else {
++          statBuilder_.remove(index);
++        }
++        return this;
+       }
+       /**
+-       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
+-       * We can move this to "ServerLoadStats" should we develop them.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder setHeapOccupancy(int value) {
+-        bitField0_ |= 0x00000002;
+-        heapOccupancy_ = value;
+-        onChanged();
+-        return this;
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder getStatBuilder(
++          int index) {
++        return getStatFieldBuilder().getBuilder(index);
+       }
+       /**
+-       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
+-       * We can move this to "ServerLoadStats" should we develop them.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder clearHeapOccupancy() {
+-        bitField0_ = (bitField0_ & ~0x00000002);
+-        heapOccupancy_ = 0;
+-        onChanged();
+-        return this;
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getStatOrBuilder(
++          int index) {
++        if (statBuilder_ == null) {
++          return stat_.get(index);  } else {
++          return statBuilder_.getMessageOrBuilder(index);
++        }
+       }
+-
+-      // optional int32 compactionPressure = 3 [default = 0];
+-      private int compactionPressure_ ;
+       /**
+-       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public boolean hasCompactionPressure() {
+-        return ((bitField0_ & 0x00000004) == 0x00000004);
++      public java.util.List<? extends org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> 
++           getStatOrBuilderList() {
++        if (statBuilder_ != null) {
++          return statBuilder_.getMessageOrBuilderList();
++        } else {
++          return java.util.Collections.unmodifiableList(stat_);
++        }
+       }
+       /**
+-       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public int getCompactionPressure() {
+-        return compactionPressure_;
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder addStatBuilder() {
++        return getStatFieldBuilder().addBuilder(
++            org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.getDefaultInstance());
+       }
+       /**
+-       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder setCompactionPressure(int value) {
+-        bitField0_ |= 0x00000004;
+-        compactionPressure_ = value;
+-        onChanged();
+-        return this;
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder addStatBuilder(
++          int index) {
++        return getStatFieldBuilder().addBuilder(
++            index, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.getDefaultInstance());
+       }
+       /**
+-       * <code>optional int32 compactionPressure = 3 [default = 0];</code>
+-       *
+-       * <pre>
+-       * Compaction pressure. Guaranteed to be positive, between 0 and 100.
+-       * </pre>
++       * <code>repeated .hbase.pb.RegionLoadStats stat = 2;</code>
+        */
+-      public Builder clearCompactionPressure() {
+-        bitField0_ = (bitField0_ & ~0x00000004);
+-        compactionPressure_ = 0;
+-        onChanged();
+-        return this;
++      public java.util.List<org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder> 
++           getStatBuilderList() {
++        return getStatFieldBuilder().getBuilderList();
++      }
++      private com.google.protobuf.RepeatedFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> 
++          getStatFieldBuilder() {
++        if (statBuilder_ == null) {
++          statBuilder_ = new com.google.protobuf.RepeatedFieldBuilder<
++              org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder>(
++                  stat_,
++                  ((bitField0_ & 0x00000002) == 0x00000002),
++                  getParentForChildren(),
++                  isClean());
++          stat_ = null;
++        }
++        return statBuilder_;
+       }
+ 
+-      // @@protoc_insertion_point(builder_scope:hbase.pb.RegionLoadStats)
++      // @@protoc_insertion_point(builder_scope:hbase.pb.MultiRegionLoadStats)
+     }
+ 
+     static {
+-      defaultInstance = new RegionLoadStats(true);
++      defaultInstance = new MultiRegionLoadStats(true);
+       defaultInstance.initFields();
+     }
+ 
+-    // @@protoc_insertion_point(class_scope:hbase.pb.RegionLoadStats)
++    // @@protoc_insertion_point(class_scope:hbase.pb.MultiRegionLoadStats)
+   }
+ 
+   public interface ResultOrExceptionOrBuilder
+@@ -32470,6 +33713,20 @@ public final class ClientProtos {
+      * </pre>
+      */
+     boolean getProcessed();
++
++    // optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    boolean hasRegionStatistics();
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats getRegionStatistics();
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder getRegionStatisticsOrBuilder();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.MultiResponse}
+@@ -32535,6 +33792,19 @@ public final class ClientProtos {
+               processed_ = input.readBool();
+               break;
+             }
++            case 26: {
++              org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder subBuilder = null;
++              if (((bitField0_ & 0x00000002) == 0x00000002)) {
++                subBuilder = regionStatistics_.toBuilder();
++              }
++              regionStatistics_ = input.readMessage(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.PARSER, extensionRegistry);
++              if (subBuilder != null) {
++                subBuilder.mergeFrom(regionStatistics_);
++                regionStatistics_ = subBuilder.buildPartial();
++              }
++              bitField0_ |= 0x00000002;
++              break;
++            }
+           }
+         }
+       } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -32638,9 +33908,32 @@ public final class ClientProtos {
+       return processed_;
+     }
+ 
++    // optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;
++    public static final int REGIONSTATISTICS_FIELD_NUMBER = 3;
++    private org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats regionStatistics_;
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    public boolean hasRegionStatistics() {
++      return ((bitField0_ & 0x00000002) == 0x00000002);
++    }
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats getRegionStatistics() {
++      return regionStatistics_;
++    }
++    /**
++     * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder getRegionStatisticsOrBuilder() {
++      return regionStatistics_;
++    }
++
+     private void initFields() {
+       regionActionResult_ = java.util.Collections.emptyList();
+       processed_ = false;
++      regionStatistics_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance();
+     }
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+@@ -32653,6 +33946,12 @@ public final class ClientProtos {
+           return false;
+         }
+       }
++      if (hasRegionStatistics()) {
++        if (!getRegionStatistics().isInitialized()) {
++          memoizedIsInitialized = 0;
++          return false;
++        }
++      }
+       memoizedIsInitialized = 1;
+       return true;
+     }
+@@ -32666,6 +33965,9 @@ public final class ClientProtos {
+       if (((bitField0_ & 0x00000001) == 0x00000001)) {
+         output.writeBool(2, processed_);
+       }
++      if (((bitField0_ & 0x00000002) == 0x00000002)) {
++        output.writeMessage(3, regionStatistics_);
++      }
+       getUnknownFields().writeTo(output);
+     }
+ 
+@@ -32683,6 +33985,10 @@ public final class ClientProtos {
+         size += com.google.protobuf.CodedOutputStream
+           .computeBoolSize(2, processed_);
+       }
++      if (((bitField0_ & 0x00000002) == 0x00000002)) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeMessageSize(3, regionStatistics_);
++      }
+       size += getUnknownFields().getSerializedSize();
+       memoizedSerializedSize = size;
+       return size;
+@@ -32713,6 +34019,11 @@ public final class ClientProtos {
+         result = result && (getProcessed()
+             == other.getProcessed());
+       }
++      result = result && (hasRegionStatistics() == other.hasRegionStatistics());
++      if (hasRegionStatistics()) {
++        result = result && getRegionStatistics()
++            .equals(other.getRegionStatistics());
++      }
+       result = result &&
+           getUnknownFields().equals(other.getUnknownFields());
+       return result;
+@@ -32734,6 +34045,10 @@ public final class ClientProtos {
+         hash = (37 * hash) + PROCESSED_FIELD_NUMBER;
+         hash = (53 * hash) + hashBoolean(getProcessed());
+       }
++      if (hasRegionStatistics()) {
++        hash = (37 * hash) + REGIONSTATISTICS_FIELD_NUMBER;
++        hash = (53 * hash) + getRegionStatistics().hashCode();
++      }
+       hash = (29 * hash) + getUnknownFields().hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -32836,6 +34151,7 @@ public final class ClientProtos {
+       private void maybeForceBuilderInitialization() {
+         if (com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders) {
+           getRegionActionResultFieldBuilder();
++          getRegionStatisticsFieldBuilder();
+         }
+       }
+       private static Builder create() {
+@@ -32852,6 +34168,12 @@ public final class ClientProtos {
+         }
+         processed_ = false;
+         bitField0_ = (bitField0_ & ~0x00000002);
++        if (regionStatisticsBuilder_ == null) {
++          regionStatistics_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance();
++        } else {
++          regionStatisticsBuilder_.clear();
++        }
++        bitField0_ = (bitField0_ & ~0x00000004);
+         return this;
+       }
+ 
+@@ -32893,6 +34215,14 @@ public final class ClientProtos {
+           to_bitField0_ |= 0x00000001;
+         }
+         result.processed_ = processed_;
++        if (((from_bitField0_ & 0x00000004) == 0x00000004)) {
++          to_bitField0_ |= 0x00000002;
++        }
++        if (regionStatisticsBuilder_ == null) {
++          result.regionStatistics_ = regionStatistics_;
++        } else {
++          result.regionStatistics_ = regionStatisticsBuilder_.build();
++        }
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -32938,6 +34268,9 @@ public final class ClientProtos {
+         if (other.hasProcessed()) {
+           setProcessed(other.getProcessed());
+         }
++        if (other.hasRegionStatistics()) {
++          mergeRegionStatistics(other.getRegionStatistics());
++        }
+         this.mergeUnknownFields(other.getUnknownFields());
+         return this;
+       }
+@@ -32949,6 +34282,12 @@ public final class ClientProtos {
+             return false;
+           }
+         }
++        if (hasRegionStatistics()) {
++          if (!getRegionStatistics().isInitialized()) {
++            
++            return false;
++          }
++        }
+         return true;
+       }
+ 
+@@ -33260,6 +34599,123 @@ public final class ClientProtos {
+         return this;
+       }
+ 
++      // optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;
++      private org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats regionStatistics_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance();
++      private com.google.protobuf.SingleFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder> regionStatisticsBuilder_;
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public boolean hasRegionStatistics() {
++        return ((bitField0_ & 0x00000004) == 0x00000004);
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats getRegionStatistics() {
++        if (regionStatisticsBuilder_ == null) {
++          return regionStatistics_;
++        } else {
++          return regionStatisticsBuilder_.getMessage();
++        }
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public Builder setRegionStatistics(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats value) {
++        if (regionStatisticsBuilder_ == null) {
++          if (value == null) {
++            throw new NullPointerException();
++          }
++          regionStatistics_ = value;
++          onChanged();
++        } else {
++          regionStatisticsBuilder_.setMessage(value);
++        }
++        bitField0_ |= 0x00000004;
++        return this;
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public Builder setRegionStatistics(
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder builderForValue) {
++        if (regionStatisticsBuilder_ == null) {
++          regionStatistics_ = builderForValue.build();
++          onChanged();
++        } else {
++          regionStatisticsBuilder_.setMessage(builderForValue.build());
++        }
++        bitField0_ |= 0x00000004;
++        return this;
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public Builder mergeRegionStatistics(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats value) {
++        if (regionStatisticsBuilder_ == null) {
++          if (((bitField0_ & 0x00000004) == 0x00000004) &&
++              regionStatistics_ != org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance()) {
++            regionStatistics_ =
++              org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.newBuilder(regionStatistics_).mergeFrom(value).buildPartial();
++          } else {
++            regionStatistics_ = value;
++          }
++          onChanged();
++        } else {
++          regionStatisticsBuilder_.mergeFrom(value);
++        }
++        bitField0_ |= 0x00000004;
++        return this;
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public Builder clearRegionStatistics() {
++        if (regionStatisticsBuilder_ == null) {
++          regionStatistics_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.getDefaultInstance();
++          onChanged();
++        } else {
++          regionStatisticsBuilder_.clear();
++        }
++        bitField0_ = (bitField0_ & ~0x00000004);
++        return this;
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder getRegionStatisticsBuilder() {
++        bitField0_ |= 0x00000004;
++        onChanged();
++        return getRegionStatisticsFieldBuilder().getBuilder();
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder getRegionStatisticsOrBuilder() {
++        if (regionStatisticsBuilder_ != null) {
++          return regionStatisticsBuilder_.getMessageOrBuilder();
++        } else {
++          return regionStatistics_;
++        }
++      }
++      /**
++       * <code>optional .hbase.pb.MultiRegionLoadStats regionStatistics = 3;</code>
++       */
++      private com.google.protobuf.SingleFieldBuilder<
++          org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder> 
++          getRegionStatisticsFieldBuilder() {
++        if (regionStatisticsBuilder_ == null) {
++          regionStatisticsBuilder_ = new com.google.protobuf.SingleFieldBuilder<
++              org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStatsOrBuilder>(
++                  regionStatistics_,
++                  getParentForChildren(),
++                  isClean());
++          regionStatistics_ = null;
++        }
++        return regionStatisticsBuilder_;
++      }
++
+       // @@protoc_insertion_point(builder_scope:hbase.pb.MultiResponse)
+     }
+ 
+@@ -34060,6 +35516,11 @@ public final class ClientProtos {
+     com.google.protobuf.GeneratedMessage.FieldAccessorTable
+       internal_static_hbase_pb_RegionLoadStats_fieldAccessorTable;
+   private static com.google.protobuf.Descriptors.Descriptor
++    internal_static_hbase_pb_MultiRegionLoadStats_descriptor;
++  private static
++    com.google.protobuf.GeneratedMessage.FieldAccessorTable
++      internal_static_hbase_pb_MultiRegionLoadStats_fieldAccessorTable;
++  private static com.google.protobuf.Descriptors.Descriptor
+     internal_static_hbase_pb_ResultOrException_descriptor;
+   private static
+     com.google.protobuf.GeneratedMessage.FieldAccessorTable
+@@ -34193,39 +35654,43 @@ public final class ClientProtos {
+       "orServiceCall\"k\n\014RegionAction\022)\n\006region\030" +
+       "\001 \002(\0132\031.hbase.pb.RegionSpecifier\022\016\n\006atom" +
+       "ic\030\002 \001(\010\022 \n\006action\030\003 \003(\0132\020.hbase.pb.Acti" +
+-      "on\"c\n\017RegionLoadStats\022\027\n\014memstoreLoad\030\001 " +
++      "on\"{\n\017RegionLoadStats\022\027\n\014memstoreLoad\030\001 " +
+       "\001(\005:\0010\022\030\n\rheapOccupancy\030\002 \001(\005:\0010\022\035\n\022comp" +
+-      "actionPressure\030\003 \001(\005:\0010\"\332\001\n\021ResultOrExce" +
+-      "ption\022\r\n\005index\030\001 \001(\r\022 \n\006result\030\002 \001(\0132\020.h" +
+-      "base.pb.Result\022*\n\texception\030\003 \001(\0132\027.hbas",
+-      "e.pb.NameBytesPair\022:\n\016service_result\030\004 \001" +
+-      "(\0132\".hbase.pb.CoprocessorServiceResult\022," +
+-      "\n\tloadStats\030\005 \001(\0132\031.hbase.pb.RegionLoadS" +
+-      "tats\"x\n\022RegionActionResult\0226\n\021resultOrEx" +
+-      "ception\030\001 \003(\0132\033.hbase.pb.ResultOrExcepti" +
+-      "on\022*\n\texception\030\002 \001(\0132\027.hbase.pb.NameByt" +
+-      "esPair\"x\n\014MultiRequest\022,\n\014regionAction\030\001" +
+-      " \003(\0132\026.hbase.pb.RegionAction\022\022\n\nnonceGro" +
+-      "up\030\002 \001(\004\022&\n\tcondition\030\003 \001(\0132\023.hbase.pb.C" +
+-      "ondition\"\\\n\rMultiResponse\0228\n\022regionActio",
+-      "nResult\030\001 \003(\0132\034.hbase.pb.RegionActionRes" +
+-      "ult\022\021\n\tprocessed\030\002 \001(\010*\'\n\013Consistency\022\n\n" +
+-      "\006STRONG\020\000\022\014\n\010TIMELINE\020\0012\203\004\n\rClientServic" +
+-      "e\0222\n\003Get\022\024.hbase.pb.GetRequest\032\025.hbase.p" +
+-      "b.GetResponse\022;\n\006Mutate\022\027.hbase.pb.Mutat" +
+-      "eRequest\032\030.hbase.pb.MutateResponse\0225\n\004Sc" +
+-      "an\022\025.hbase.pb.ScanRequest\032\026.hbase.pb.Sca" +
+-      "nResponse\022P\n\rBulkLoadHFile\022\036.hbase.pb.Bu" +
+-      "lkLoadHFileRequest\032\037.hbase.pb.BulkLoadHF" +
+-      "ileResponse\022X\n\013ExecService\022#.hbase.pb.Co",
+-      "processorServiceRequest\032$.hbase.pb.Copro" +
+-      "cessorServiceResponse\022d\n\027ExecRegionServe" +
+-      "rService\022#.hbase.pb.CoprocessorServiceRe" +
+-      "quest\032$.hbase.pb.CoprocessorServiceRespo" +
+-      "nse\0228\n\005Multi\022\026.hbase.pb.MultiRequest\032\027.h" +
+-      "base.pb.MultiResponseBB\n*org.apache.hado" +
+-      "op.hbase.protobuf.generatedB\014ClientProto" +
+-      "sH\001\210\001\001\240\001\001"
++      "actionPressure\030\003 \001(\005:\0010\022\026\n\007enabled\030\004 \001(\010" +
++      ":\005false\"j\n\024MultiRegionLoadStats\022)\n\006regio" +
++      "n\030\001 \003(\0132\031.hbase.pb.RegionSpecifier\022\'\n\004st",
++      "at\030\002 \003(\0132\031.hbase.pb.RegionLoadStats\"\332\001\n\021" +
++      "ResultOrException\022\r\n\005index\030\001 \001(\r\022 \n\006resu" +
++      "lt\030\002 \001(\0132\020.hbase.pb.Result\022*\n\texception\030" +
++      "\003 \001(\0132\027.hbase.pb.NameBytesPair\022:\n\016servic" +
++      "e_result\030\004 \001(\0132\".hbase.pb.CoprocessorSer" +
++      "viceResult\022,\n\tloadStats\030\005 \001(\0132\031.hbase.pb" +
++      ".RegionLoadStats\"x\n\022RegionActionResult\0226" +
++      "\n\021resultOrException\030\001 \003(\0132\033.hbase.pb.Res" +
++      "ultOrException\022*\n\texception\030\002 \001(\0132\027.hbas" +
++      "e.pb.NameBytesPair\"x\n\014MultiRequest\022,\n\014re",
++      "gionAction\030\001 \003(\0132\026.hbase.pb.RegionAction" +
++      "\022\022\n\nnonceGroup\030\002 \001(\004\022&\n\tcondition\030\003 \001(\0132" +
++      "\023.hbase.pb.Condition\"\226\001\n\rMultiResponse\0228" +
++      "\n\022regionActionResult\030\001 \003(\0132\034.hbase.pb.Re" +
++      "gionActionResult\022\021\n\tprocessed\030\002 \001(\010\0228\n\020r" +
++      "egionStatistics\030\003 \001(\0132\036.hbase.pb.MultiRe" +
++      "gionLoadStats*\'\n\013Consistency\022\n\n\006STRONG\020\000" +
++      "\022\014\n\010TIMELINE\020\0012\203\004\n\rClientService\0222\n\003Get\022" +
++      "\024.hbase.pb.GetRequest\032\025.hbase.pb.GetResp" +
++      "onse\022;\n\006Mutate\022\027.hbase.pb.MutateRequest\032",
++      "\030.hbase.pb.MutateResponse\0225\n\004Scan\022\025.hbas" +
++      "e.pb.ScanRequest\032\026.hbase.pb.ScanResponse" +
++      "\022P\n\rBulkLoadHFile\022\036.hbase.pb.BulkLoadHFi" +
++      "leRequest\032\037.hbase.pb.BulkLoadHFileRespon" +
++      "se\022X\n\013ExecService\022#.hbase.pb.Coprocessor" +
++      "ServiceRequest\032$.hbase.pb.CoprocessorSer" +
++      "viceResponse\022d\n\027ExecRegionServerService\022" +
++      "#.hbase.pb.CoprocessorServiceRequest\032$.h" +
++      "base.pb.CoprocessorServiceResponse\0228\n\005Mu" +
++      "lti\022\026.hbase.pb.MultiRequest\032\027.hbase.pb.M",
++      "ultiResponseBB\n*org.apache.hadoop.hbase." +
++      "protobuf.generatedB\014ClientProtosH\001\210\001\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+@@ -34387,31 +35852,37 @@ public final class ClientProtos {
+           internal_static_hbase_pb_RegionLoadStats_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_RegionLoadStats_descriptor,
+-              new java.lang.String[] { "MemstoreLoad", "HeapOccupancy", "CompactionPressure", });
+-          internal_static_hbase_pb_ResultOrException_descriptor =
++              new java.lang.String[] { "MemstoreLoad", "HeapOccupancy", "CompactionPressure", "Enabled", });
++          internal_static_hbase_pb_MultiRegionLoadStats_descriptor =
+             getDescriptor().getMessageTypes().get(23);
++          internal_static_hbase_pb_MultiRegionLoadStats_fieldAccessorTable = new
++            com.google.protobuf.GeneratedMessage.FieldAccessorTable(
++              internal_static_hbase_pb_MultiRegionLoadStats_descriptor,
++              new java.lang.String[] { "Region", "Stat", });
++          internal_static_hbase_pb_ResultOrException_descriptor =
++            getDescriptor().getMessageTypes().get(24);
+           internal_static_hbase_pb_ResultOrException_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_ResultOrException_descriptor,
+               new java.lang.String[] { "Index", "Result", "Exception", "ServiceResult", "LoadStats", });
+           internal_static_hbase_pb_RegionActionResult_descriptor =
+-            getDescriptor().getMessageTypes().get(24);
++            getDescriptor().getMessageTypes().get(25);
+           internal_static_hbase_pb_RegionActionResult_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_RegionActionResult_descriptor,
+               new java.lang.String[] { "ResultOrException", "Exception", });
+           internal_static_hbase_pb_MultiRequest_descriptor =
+-            getDescriptor().getMessageTypes().get(25);
++            getDescriptor().getMessageTypes().get(26);
+           internal_static_hbase_pb_MultiRequest_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_MultiRequest_descriptor,
+               new java.lang.String[] { "RegionAction", "NonceGroup", "Condition", });
+           internal_static_hbase_pb_MultiResponse_descriptor =
+-            getDescriptor().getMessageTypes().get(26);
++            getDescriptor().getMessageTypes().get(27);
+           internal_static_hbase_pb_MultiResponse_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_MultiResponse_descriptor,
+-              new java.lang.String[] { "RegionActionResult", "Processed", });
++              new java.lang.String[] { "RegionActionResult", "Processed", "RegionStatistics", });
+           return null;
+         }
+       };
+diff --git a/hbase-protocol/src/main/protobuf/Client.proto b/hbase-protocol/src/main/protobuf/Client.proto
+index a3a969f..a8331c3 100644
+--- a/hbase-protocol/src/main/protobuf/Client.proto
++++ b/hbase-protocol/src/main/protobuf/Client.proto
+@@ -399,6 +399,17 @@ message RegionLoadStats {
+   optional int32 heapOccupancy = 2 [default = 0];
+   // Compaction pressure. Guaranteed to be positive, between 0 and 100.
+   optional int32 compactionPressure = 3 [default = 0];
++  // if the stats are enabled. By the default above being 0, even if a statistic is sent back,
++  // there is no change to the local behavior because there is no load. Futher, even if the
++  // server sends back statistics, its up to the client to have the tracker enabled via a
++  // configuration flag, so they don't have to use it, even if its sent. This flag is only useful
++  // for understanding the
++  optional bool enabled = 4 [default = false];
++}
++
++message MultiRegionLoadStats{
++  repeated RegionSpecifier region = 1;
++  repeated RegionLoadStats stat = 2;
+ }
+ 
+ /**
+@@ -444,6 +455,7 @@ message MultiResponse {
+   repeated RegionActionResult regionActionResult = 1;
+   // used for mutate to indicate processed only
+   optional bool processed = 2;
++  optional MultiRegionLoadStats regionStatistics = 3;
+ }
+ 
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 994270b..f5f394a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -6709,9 +6709,9 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   }
+ 
+   /**
+-   * @return the current load statistics for the the region
++   * @return statistics about the current load of the region
+    */
+-  public ClientProtos.RegionLoadStats getRegionStats() {
++  public ClientProtos.RegionLoadStats getLoadStatistics() {
+     if (!regionStatsEnabled) {
+       return null;
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index e3df85b..b5150ca 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -134,6 +134,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServic
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetResponse;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRegionLoadStats;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateRequest;
+@@ -379,9 +380,8 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+     }
+   }
+ 
+-  private static ResultOrException getResultOrException(
+-      final ClientProtos.Result r, final int index, final ClientProtos.RegionLoadStats stats) {
+-    return getResultOrException(ResponseConverter.buildActionResult(r, stats), index);
++  private static ResultOrException getResultOrException(final ClientProtos.Result r, final int index){
++    return getResultOrException(ResponseConverter.buildActionResult(r), index);
+   }
+ 
+   private static ResultOrException getResultOrException(final Exception e, final int index) {
+@@ -483,7 +483,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+    * @param cellScanner if non-null, the mutation data -- the Cell content.
+    * @throws IOException
+    */
+-  private ClientProtos.RegionLoadStats mutateRows(final Region region,
++  private void mutateRows(final Region region,
+       final List<ClientProtos.Action> actions,
+       final CellScanner cellScanner) throws IOException {
+     if (!region.getRegionInfo().isMetaTable()) {
+@@ -511,7 +511,6 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       }
+     }
+     region.mutateRow(rm);
+-    return ((HRegion)region).getRegionStats();
+   }
+ 
+   /**
+@@ -801,8 +800,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+ 
+           case SUCCESS:
+             builder.addResultOrException(getResultOrException(
+-              ClientProtos.Result.getDefaultInstance(), index,
+-                ((HRegion)region).getRegionStats()));
++              ClientProtos.Result.getDefaultInstance(), index));
+             break;
+         }
+       }
+@@ -2113,13 +2111,16 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+     Boolean processed = null;
+     RegionScannersCloseCallBack closeCallBack = null;
+     RpcCallContext context = RpcServer.getCurrentCall();
++    Map<RegionSpecifier, ClientProtos.RegionLoadStats> regionStats = new HashMap<>(request
++      .getRegionActionCount());
+     for (RegionAction regionAction : request.getRegionActionList()) {
+       this.requestCount.add(regionAction.getActionCount());
+       OperationQuota quota;
+       Region region;
+       regionActionResultBuilder.clear();
++      RegionSpecifier regionSpecifier = regionAction.getRegion();
+       try {
+-        region = getRegion(regionAction.getRegion());
++        region = getRegion(regionSpecifier);
+         quota = getQuotaManager().checkQuota(region, regionAction.getActionList());
+       } catch (IOException e) {
+         rpcServer.getMetrics().exception(e);
+@@ -2143,13 +2144,8 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+             processed = checkAndRowMutate(region, regionAction.getActionList(),
+                   cellScanner, row, family, qualifier, compareOp, comparator);
+           } else {
+-            ClientProtos.RegionLoadStats stats = mutateRows(region, regionAction.getActionList(),
+-                cellScanner);
+-            // add the stats to the request
+-            if(stats != null) {
+-              regionActionResultBuilder
+-                  .addResultOrException(ResultOrException.newBuilder().setLoadStats(stats));
+-            }
++            mutateRows(region, regionAction.getActionList(), cellScanner);
++            regionActionResultBuilder.addResultOrException(ResultOrException.getDefaultInstance());
+             processed = Boolean.TRUE;
+           }
+         } catch (IOException e) {
+@@ -2171,12 +2167,23 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       }
+       responseBuilder.addRegionActionResult(regionActionResultBuilder.build());
+       quota.close();
++      ClientProtos.RegionLoadStats regionLoadStats = ((HRegion)region).getLoadStatistics();
++      if(regionLoadStats != null) {
++        regionStats.put(regionSpecifier, regionLoadStats);
++      }
+     }
+     // Load the controller with the Cells to return.
+     if (cellsToReturn != null && !cellsToReturn.isEmpty() && controller != null) {
+       controller.setCellScanner(CellUtil.createCellScanner(cellsToReturn));
+     }
+     if (processed != null) responseBuilder.setProcessed(processed);
++
++    MultiRegionLoadStats.Builder builder = MultiRegionLoadStats.newBuilder();
++    for(Entry<RegionSpecifier, ClientProtos.RegionLoadStats> stat: regionStats.entrySet()){
++      builder.addRegion(stat.getKey());
++      builder.addStat(stat.getValue());
++    }
++    responseBuilder.setRegionStatistics(builder);
+     return responseBuilder.build();
+   }
+ 
