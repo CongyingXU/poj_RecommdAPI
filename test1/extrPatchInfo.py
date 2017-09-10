@@ -315,6 +315,8 @@ def write(Used_API):
            
             for ele in UsedAPI:
                 """
+                #其中：把API  与带参数API分开存储，因为API  用于API推荐；与带参数API  用于参数推荐
+                
                 #有参数版，问题：其中有的 API重复了
                 para_str=''
                 if len(ele[2])==0:
@@ -322,18 +324,18 @@ def write(Used_API):
                 else:
                     for para in ele[2]:
                         para_str = para_str + '+'
-                string0 = string0 + ele[0] + '|'+ ele[1] +'|'+para_str.strip('+')  +';'
+                string0 = string0 + ele[0] + '.'+ ele[1] +'|'+para_str.strip('+')  +';'
                 """
                 
                 #避免重复
-                str0 = ele[0] + '|'+ ele[1]
+                str0 = ele[0] + '.'+ ele[1]
                 if string0.find(str0) >-1:
                     continue
                 else:
                     string0 = string0 + str0  +';'  
                     
         sheet1.write(i,0,issueKey)
-        sheet1.write(i,1,string0.strip(';'))#格式：  类名|方法名|参数1，参数2:
+        sheet1.write(i,1,string0.strip(';'))#格式：  类名.方法名|参数1，参数2:
         i = i+1
     f.save('Input/issuekeys_UsedAPI.xls')#保存文件 
 
