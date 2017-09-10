@@ -1,10 +1,11 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
-Created on Sun Sep 10 14:45:33 2017
+Created on Sat Aug 12 14:33:35 2017
 
 @author: Congying.Xu
 """
+
 import computeSimilarity
 import os
 import xlrd
@@ -155,12 +156,11 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     newRportSD= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary,newReportDescription] )
     scores = Half_computeSimilarity(newRportSD,all_APIdescription)
     
-    print scores
-    print All_3partAPIinfo_list
     print time(),44
     Scores={}
     for i  in range(len(All_3partAPIinfo_list)):
-        Scores[ All_3partAPIinfo_list[i] ] = scores[i]
+        API = All_3partAPIinfo_list[i][0]+ '.' + All_3partAPIinfo_list[i][1]
+        Scores[ API ] = scores[i]
     
     return Scores
 
