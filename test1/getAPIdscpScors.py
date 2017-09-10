@@ -124,6 +124,7 @@ def getAPI_Info():
     return All_3partAPIinfo_list
 
 def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前只对description进行预处理）
+                                #二次升级  对class_name、method———name、para——name  也进行预处理，放到最后把
     dir = 'Input/APIdoc'
     All_3partAPIinfo_list=[]#格式：  【  （ class_name，method_name，para_info，method_description，modifier_type  ） ，  】
     for dirpath,dirname,filename in os.walk(dir):
@@ -134,14 +135,21 @@ def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前�
                     workbook = xlrd.open_workbook(tmp_path,'r')
                     sheet = workbook.sheet_by_name('sheet1')
                     for i in range(1,sheet.nrows):
+                        class_name =  sheet.cell(i,0).value
+                        class_name_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([class_name])
+                        methond_name =  sheet.cell(i,1).value
+                        methond_name_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([methond_name])
+                        para_name =  sheet.cell(i,2).value
+                        para_name_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([para_name])
                         description =  sheet.cell(i,3).value
                         description_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([description])
                         
-                        API=(sheet.cell(i,0).value,
-                             sheet.cell(i,1).value,
-                             sheet.cell(i,2).value,
-                             description_after_txtprces,
-                             sheet.cell(i,4).value)
+                        API=(sheet.cell(i,0).value,#原
+                             sheet.cell(i,1).value,#原
+                             class_name_after_txtprces,
+                             methond_name_after_txtprces,
+                             para_name_after_txtprces,
+                             description_after_txtprces)
                         All_3partAPIinfo_list.append(API)
                        
     #print  All_3partAPI_set.__len__()
@@ -151,7 +159,7 @@ def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前�
 def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPIinfo_list):      #,Src_info_file_dir):
     all_APIdescription = []
     for ele in All_3partAPIinfo_list:
-        all_APIdescription.append(ele[3])
+        all_APIdescription.append(ele[5])
     #版本二，数据已经经过文本处理，节省时间
     newRportSD= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary,newReportDescription] )
     scores = Half_computeSimilarity(newRportSD,all_APIdescription)
