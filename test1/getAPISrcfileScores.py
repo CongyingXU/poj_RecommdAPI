@@ -5,6 +5,7 @@ Created on Mon Sep 11 14:15:43 2017
 
 @author: Congying.Xu
 """
+
 """
 将特征定位到的  .java源文件中的信息抽取出来
 与API的一些信息  类名、方法名、参数名 APIdescription 进行 相似度计算
@@ -20,19 +21,35 @@ import getStrucCmptScors
 #text1:[“。。。”]  basic_texts:【 [“  ” , "  " , "  " ] , 
 #                                 ......
 #                                [ "  ","  ","  " ] 】
-dir0 = 'Output/FeaturnLocation_result.xls' 
-workbook0 = xlrd.open_workbook(dir0,'r')
-sheet0 = workbook0.sheet_by_name('sheet1')
+def Info_IO():
+    dir0 = 'Output/FeaturnLocation_result.xls' 
+    workbook0 = xlrd.open_workbook(dir0,'r')
+    sheet0 = workbook0.sheet_by_name('sheet1')
 
-Srcfileinfo_dir = 'Output/repo_SrcfileInfo.xls'
-workbook1 = xlrd.open_workbook(Srcfileinfo_dir,'r')
-sheet1 = workbook1.sheet_by_name('sheet1')
+    Srcfileinfo_dir = 'Output/repo_SrcfileInfo.xls'
+    workbook1 = xlrd.open_workbook(Srcfileinfo_dir,'r')
+    sheet1 = workbook1.sheet_by_name('sheet1')
+    
+    return sheet0,sheet1
 
-def getRelatedSrcfileinfo(issuekey ,sheet0):
+def getRelatedSrcfile(issuekey ,sheet0):
     #从feation location中，得到结果
+    RelatedSrcfile_list= []
     for i in range(1,sheet0.nrows):
         if sheet0.cell(i,0).value == issuekey:
-    return RelatedSrcfileinfo_list
+            j=1
+            while 1:
+                try:
+                    RelatedSrcfile_list.append( sheet0.cell(i,j).value )
+                    j = j+1
+                    ############################
+                    ############################
+                    if j>11:#目前提取10个相关的源文件
+                        break
+                except IOError:
+                    break
+            break
+    return RelatedSrcfile_list
     #[ 源文件名, , , ]
 
 
@@ -89,8 +106,14 @@ def computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights ):
     SimilarScores = sorted(SimilarScores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
     return SimilarScores#列表类型，【 （key，value） 】
         
-        
+def main(issuekey , weights):
+    sheet0,sheet1 = Info_IO()
+    RelatedSrcfile_list = getRelatedSrcfile(issuekey ,sheet0)
+    RelatedSrcfileinfo_dict = getRelatedSrcfile_info(RelatedSrcfile_list ,sheet1 )
+    allAPI_info_list = get_allAPI_info()
+    SimilarScores = computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights )
+    
+    return SimilarScores
 
-
-
-
+if __name__=='__main__':
+    print main(issuekey , weights)
