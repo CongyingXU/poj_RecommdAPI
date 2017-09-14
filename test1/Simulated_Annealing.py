@@ -17,7 +17,7 @@ import getSimilarityScores2Reports
 def initpara():
     alpha = 0.99
     t = (1,100)
-    markovlen = 10   #每次迭代的次数
+    markovlen = 1   #每次迭代的次数
 
     return alpha,t,markovlen
 
@@ -59,7 +59,7 @@ All_result,issuekey_file_num,issuekey_file_list = getSimilarityScores2Reports.ge
 
 All_result0=getStrucCmptScors.getall_result()
 
-solutionnew =weights = [0.4765080059930489, 0.08921775453867853, 0.38, 0.29, 0.36, 0.2, 0.23, 0.6, 0.7383606484712233, 0.5881762643232233, 0.4735409434116893, 0.10212499280443976, 0.4363396810754724, 0.5774016678038669, 0.4166697755914751, 0.18319637300523295, 0.14007257039425824]
+solutionnew =weights = [0.7217656912869671,  0.39589087254670696, 0.38, 0.29, 0.36, 0.2, 0.23, 0.6, 0.7383606484712233, 0.5881762643232233, 0.4735409434116893, 0.10212499280443976, 0.4363396810754724, 0.5774016678038669, 0.4166697755914751, 0.18319637300523295, 0.14007257039425824]
 valuenew = getevaluate(solutionnew)#目标函数解
 print valuenew
 

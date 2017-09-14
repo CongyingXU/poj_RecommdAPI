@@ -12,16 +12,13 @@ from time import time
 import getFeatureLocation_result
 
 
-kong_num =0
+#kong_num =0
 
 #aimList：表示已知的答案列表
 #resultLIst：表示工具计算的结果列表
 def getMAPandMRR(aimList,resultList):
     if len(aimList) == 0:
-        #global kong_num
-        #print kong_num
-        kong_num = kong_num +1
-        return(0 ,0)
+        return(0,0)
     
     result_list = []
     
@@ -90,22 +87,29 @@ def main(Aimresult,Result_dict):
     MAP=0.0
     MRR=0.0
     Result=[]
-    
+    kong_num = 0
     for key in Result_dict:
         #kong_num =0
         t=getMAPandMRR(Aimresult[key],Result_dict[key])
         Result.append( t )
         MAP = MAP + t[0]
         MRR = MRR + t[1]
+        if t[0] ==  0 :
+            kong_num = kong_num + 1
     #global kong_num
-    MAP =  MAP/(len( Result)-kong_num )
+    #print len( Result)
+    #print kong_num
+    #print MAP
+    MAP =  MAP/(len( Result)- kong_num )
     #print MAP
     return MAP
-    
+
+"""    
 if __name__ == '__main__':   
     Result_dict = getFeatureLocation_result.main()
-    print main(getAimList(), Result_dict)
-
+    #print main(getAimList(), Result_dict)
+    main(getAimList(), Result_dict)
+"""
 """
 def getresult(data , weights):
     #转为实验设计
