@@ -1,0 +1,455 @@
+Index: modules/kernel/src/org/apache/axis2/deployment/POJODeployer.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/deployment/POJODeployer.java	(revision 726973)
++++ modules/kernel/src/org/apache/axis2/deployment/POJODeployer.java	(working copy)
+@@ -72,7 +72,7 @@
+                 Thread.currentThread().setContextClassLoader(classLoader);
+                 String className = file.getName();
+                 className = className.replaceAll(".class", "");
+-                Class clazz = Loader.loadClass(className);
++                Class clazz = Class.forName(className,true,classLoader);
+                 log.info(Messages.getMessage(DeploymentErrorMsgs.DEPLOYING_POJO,
+                         className,
+                         deploymentFileData.getFile().getAbsolutePath()));
+Index: modules/kernel/src/org/apache/axis2/deployment/util/Utils.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/deployment/util/Utils.java	(revision 726973)
++++ modules/kernel/src/org/apache/axis2/deployment/util/Utils.java	(working copy)
+@@ -27,6 +27,7 @@
+ import org.apache.axis2.AxisFault;
+ import org.apache.axis2.classloader.JarFileClassLoader;
+ import org.apache.axis2.Constants;
++import org.apache.axis2.JAXRS.JAXRSModel;
+ import org.apache.axis2.context.ConfigurationContext;
+ import org.apache.axis2.deployment.DeploymentClassLoader;
+ import org.apache.axis2.deployment.DeploymentConstants;
+@@ -1404,6 +1405,13 @@
+             axisBinding.setType(WSDL2Constants.URI_WSDL2_HTTP);
+             axisBinding.setProperty(WSDL2Constants.ATTR_WHTTP_METHOD, "POST");
+ 
++            boolean addHTTPLocationTable = false;
++            Map httpLocationMap = new TreeMap<String, AxisOperation>(new Comparator() {
++                public int compare(Object o1, Object o2) {
++                    return (-1 * ((Comparable) o1).compareTo(o2));
++                }
++            });
++
+             for (Iterator iterator = axisService.getChildren(); iterator
+                     .hasNext();) {
+                 AxisOperation operation = (AxisOperation)iterator.next();
+@@ -1413,13 +1421,61 @@
+                 axisBindingOperation.setName(operationQName);
+                 axisBindingOperation.setAxisOperation(operation);
+                 String httpLocation = operationQName.getLocalPart();
+-                axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_LOCATION, httpLocation);
++
++
++                Parameter parameter = operation.getParameter("JAXRSAnnotaion");
++                if (parameter != null) {
++                    JAXRSModel methodModel = (JAXRSModel) parameter.getValue();
++                    if (methodModel != null) {
++                        if (methodModel.getProduces() != null) {
++                            axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_OUTPUT_SERIALIZATION, methodModel.getProduces());
++                        }
++                        if (methodModel.getConsumes() != null) {
++                            axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_INPUT_SERIALIZATION, methodModel.getConsumes());
++                        }
++
++                        if (methodModel.getHTTPMethod() != null) {
++                               if(methodModel.getHTTPMethod().equals("HEAD")){
++                                   log.warn("[JAXRS] http method HEAD is not supported by AXIS2 @ "+ operation.getName());
++                               }else{
++                                   axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_METHOD, methodModel.getHTTPMethod());
++                               }
++                        }
++
++                    }
++
++                    String whttpLocation = methodModel.getPath();
++                    String httPMethod=methodModel.getHTTPMethod();
++                    if(httPMethod==null||httPMethod.equals("HEAD")){
++                        httPMethod="POST";  //setting the default http method if annotation is not present or HEAD
++                    }
++
++                    if (whttpLocation != null) {
++
++                        axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_LOCATION, whttpLocation);
++                        httpLocationMap.put(WSDLUtil.getConstantFromHTTPLocation(whttpLocation, httPMethod), operation);
++                        addHTTPLocationTable=true;
++                    } else {
++                        axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_LOCATION, httpLocation);
++                        httpLocationMap.put(WSDLUtil.getConstantFromHTTPLocation(httpLocation, httPMethod), operation);
++                        addHTTPLocationTable=true;
++                    }
++                } else {
++                    axisBindingOperation.setProperty(WSDL2Constants.ATTR_WHTTP_LOCATION, httpLocation);
++                }
++
++
+                 axisBinding.addChild(axisBindingOperation.getName(),
+                                      axisBindingOperation);
+ 
+                 populateBindingOperation(axisBinding,
+                                          axisBindingOperation);
+             }
++
++            if(addHTTPLocationTable){
++            axisBinding.setProperty(WSDL2Constants.HTTP_LOCATION_TABLE,httpLocationMap);
++            }
++
+             if (bindingCache != null) {
+                 bindingCache.put(name, axisBinding);
+             }
+Index: modules/kernel/src/org/apache/axis2/description/java2wsdl/DefaultSchemaGenerator.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/description/java2wsdl/DefaultSchemaGenerator.java	(revision 726973)
++++ modules/kernel/src/org/apache/axis2/description/java2wsdl/DefaultSchemaGenerator.java	(working copy)
+@@ -20,6 +20,8 @@
+ package org.apache.axis2.description.java2wsdl;
+ 
+ import org.apache.axis2.AxisFault;
++import org.apache.axis2.JAXRS.JAXRSUtils;
++import org.apache.axis2.JAXRS.JAXRSModel;
+ import org.apache.axis2.util.JavaUtils;
+ import org.apache.axis2.deployment.util.BeanExcludeInfo;
+ import org.apache.axis2.deployment.util.Utils;
+@@ -57,6 +59,8 @@
+ 
+     private static int prefixCount = 1;
+ 
++    private JAXRSModel classModel;
++
+     protected Map targetNamespacePrefixMap = new Hashtable();
+ 
+     protected Map schemaMap = new Hashtable();
+@@ -249,6 +253,7 @@
+             }
+             service.setName(Utils.getAnnotatedServiceName(serviceClass, webervice));
+         }
++        classModel= JAXRSUtils.getClassModel(serviceClass);
+         methods = processMethods(serviceClass.getDeclaredMethods());
+         return schemaMap.values();
+     }
+@@ -292,6 +297,7 @@
+             AxisOperation axisOperation = service.getOperation(new QName(methodName));
+             if (axisOperation == null) {
+                 axisOperation = Utils.getAxisOperationForJmethod(jMethod);
++                axisOperation.addParameter("JAXRSAnnotaion", JAXRSUtils.getMethodModel(this.classModel,jMethod));
+ //                if (WSDL2Constants.MEP_URI_ROBUST_IN_ONLY.equals(
+ //                        axisOperation.getMessageExchangePattern())) {
+ //                    AxisMessage outMessage = axisOperation.getMessage(
+@@ -1233,7 +1239,7 @@
+         String parameterName = null;
+         if (parameterAnnotation.length > 0) {
+             Annotation[] tempAnnon = parameterAnnotation[j];
+-            if (tempAnnon.length > 0) {
++            if ((tempAnnon.length > 0) && (tempAnnon[0] instanceof WebParam)) {
+                 WebParam para = (WebParam) tempAnnon[0];
+                 if (para != null) {
+                     parameterName = para.name();
+Index: modules/kernel/src/org/apache/axis2/JAXRS/JAXRSModel.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/JAXRS/JAXRSModel.java	(revision 0)
++++ modules/kernel/src/org/apache/axis2/JAXRS/JAXRSModel.java	(revision 0)
+@@ -0,0 +1,58 @@
++package org.apache.axis2.JAXRS;
++
++/**
++ * Created by IntelliJ IDEA.
++ * User: pradeep
++ * Date: Dec 5, 2008
++ * Time: 11:55:18 AM
++ * To change this template use File | Settings | File Templates.
++ */
++public class JAXRSModel {
++
++    private String Path;
++
++    private String Produces;
++
++    private String Consumes;
++
++    private String HttpMethod; 
++
++
++    /*
++     *
++     * Setter methods
++     */
++    public void setPath(String path){
++       this.Path = path;
++    }
++    public void setConsumes(String consumes){
++       this.Consumes=consumes;
++    }
++    public void setProduces(String produces){
++        this.Produces=produces;
++    }
++    public void setHTTPMethod(String httpmethod){
++        this.HttpMethod=httpmethod;
++
++    }
++
++    /**
++     * getter methods
++     */
++    public String getPath(){
++       
++             return ((this.Path!=null) && (!this.Path.equals(""))) ? this.Path : null;
++    }
++
++     public String getConsumes(){
++              return ((this.Consumes!=null) && (!this.Consumes.equals(""))) ? this.Consumes : null;
++    }
++
++     public String getProduces(){
++               return ((this.Produces!=null) && (!this.Produces.equals(""))) ? this.Produces : null;
++    }
++
++     public String getHTTPMethod(){
++               return ((this.HttpMethod!=null) && (!this.HttpMethod.equals(""))) ? this.HttpMethod : null;
++    }
++}
+Index: modules/kernel/src/org/apache/axis2/JAXRS/JAXRSUtils.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/JAXRS/JAXRSUtils.java	(revision 0)
++++ modules/kernel/src/org/apache/axis2/JAXRS/JAXRSUtils.java	(revision 0)
+@@ -0,0 +1,205 @@
++package org.apache.axis2.JAXRS;
++
++import javax.ws.rs.Consumes;
++import javax.ws.rs.DELETE;
++import javax.ws.rs.GET;
++import javax.ws.rs.HEAD;
++import javax.ws.rs.POST;
++import javax.ws.rs.PUT;
++import javax.ws.rs.Path;
++import javax.ws.rs.Produces;
++import java.lang.reflect.Method;
++import java.lang.annotation.Annotation;
++
++/**
++ * Created by IntelliJ IDEA.
++ * User: pradeep
++ * Date: Dec 5, 2008
++ * Time: 4:16:26 PM
++ * To change this template use File | Settings | File Templates.
++ */
++public class JAXRSUtils {
++
++
++    public static JAXRSModel getClassModel(Class serviceClass) {
++        JAXRSModel model = new JAXRSModel();
++        Annotation[] annotation = serviceClass.getAnnotations();
++        for (Annotation a : annotation) {
++            if (a != null) {
++                if (a instanceof Produces) {
++                    addProducesToClassModel((Produces) a, model);
++                } else if (a instanceof Consumes) {
++                    addConsumesToClassModel((Consumes) a, model);
++                } else if (a instanceof Path) {
++                    addPathToClassModel((Path) a, model);
++                } else {
++                    System.out.println("Could not identify the Annotation....");
++                }
++
++            }
++
++        }
++
++        return model;
++    }
++
++    public static JAXRSModel getMethodModel(JAXRSModel classModel, Method serviceMethod) {
++        JAXRSModel model=new JAXRSModel();
++        addProducesToMethodModel(classModel,model);
++        addConsumesToMethodModel(classModel,model);
++        addPathToMethodModel(classModel,model);
++        Annotation[] annotation=serviceMethod.getAnnotations();
++        for(Annotation a:annotation){
++           if(a!=null){
++               if(a instanceof Produces){
++                    addProducesToMethodModel((Produces)a,model);
++               }else if(a instanceof Consumes){
++                  addConsumesToMethodModel((Consumes)a,model);
++               }else if(a instanceof Path){
++                  addPathToMethodModel((Path)a,model);
++               } else{
++                  addHTTPMethodToMethodModel(a,model);
++               }
++
++           }
++        }
++        return model;
++    }
++
++    private static void addProducesToClassModel(Produces produces, JAXRSModel classModel) {
++
++
++        String[] array = null;
++        String value = null;
++        array = produces.value();
++        for (String s : array) {
++            if (value == null) {
++                value = s;
++            } else {
++                value = value + "," + s;
++            }
++        }
++
++        classModel.setProduces(value);
++
++    }
++
++    private static void addConsumesToClassModel(Consumes consumes, JAXRSModel classModel) {
++
++
++        String[] array = null;
++        String value = null;
++        array = consumes.value();
++        for (String s : array) {
++            if (value == null) {
++                value = s;
++            } else {
++                value = value + "," + s;
++            }
++        }
++        classModel.setConsumes(value);
++
++    }
++
++
++    private static void addPathToClassModel(Path path, JAXRSModel classModel) {
++
++
++        String value = null;
++        value = path.value();
++        if(value!=null){
++            if(value.startsWith("/")){
++                value=value.substring(1);
++            }
++            if(value.endsWith("/")){
++               value= value.substring(0,(value.length()-1));
++            }
++        }
++
++        classModel.setPath(value);
++
++    }
++   private static void addProducesToMethodModel(Produces produces,JAXRSModel methodModel){
++
++       String value = null;
++       for (String s : produces.value()) {
++           if (value != null) {
++               value = value + s;
++           } else {
++               value = s;
++           }
++           methodModel.setProduces(value);
++       }
++
++   }
++
++   private static void addProducesToMethodModel(JAXRSModel classModel,JAXRSModel methodModel){
++           String value=classModel.getProduces();
++       if(value!=null){
++           methodModel.setProduces(value);
++       }
++   }
++    private static void addConsumesToMethodModel(Consumes consumes,JAXRSModel methodModel){
++        String value = null;
++        for (String s : consumes.value()) {
++            if (value != null) {
++                value = value + s;
++            } else {
++                value = s;
++            }
++            methodModel.setProduces(value);
++        }
++
++    }
++
++   private static void addConsumesToMethodModel(JAXRSModel classModel,JAXRSModel methodModel){
++         String value=classModel.getConsumes();
++       if(value!=null){
++           methodModel.setConsumes(value);
++       }
++   }
++
++    private static void addHTTPMethodToMethodModel(Annotation annotation,JAXRSModel methodModel){
++
++
++            if (annotation instanceof POST) {
++                methodModel.setHTTPMethod("POST");
++            } else if (annotation instanceof GET) {
++                methodModel.setHTTPMethod("GET");
++            } else if (annotation instanceof PUT) {
++               methodModel.setHTTPMethod("PUT");
++            } else if (annotation instanceof HEAD) {
++                 methodModel.setHTTPMethod("HEAD");
++            } else if (annotation instanceof DELETE) {
++                methodModel.setHTTPMethod("DELETE");
++            }
++
++    }
++
++  private static void addPathToMethodModel(Path path,JAXRSModel methodModel){
++          String value = path.value();
++            if(value!=null){
++            if(value.startsWith("/")){
++                value=value.substring(1);
++            }
++            if(value.endsWith("/")){
++               value= value.substring(0,(value.length()-1));
++            }
++        }
++            if (methodModel.getPath()!=null ) {
++
++                     methodModel.setPath(methodModel.getPath() +"/"+ value);
++            } else{
++
++                methodModel.setPath(value);
++            }
++  }
++
++  private static  void addPathToMethodModel(JAXRSModel classModel,JAXRSModel methodModel){
++       String value=classModel.getPath();
++      if(value!=null){
++          methodModel.setPath(value);
++      }
++  }
++
++}
+Index: modules/parent/pom.xml
+===================================================================
+--- modules/parent/pom.xml	(revision 726973)
++++ modules/parent/pom.xml	(working copy)
+@@ -988,11 +988,15 @@
+                 <version>${geronimo-spec.jta.version}</version>
+             </dependency>
+ 
+-
+         </dependencies>
+     </dependencyManagement>
+     <!-- Top level dependencies that will be needed in all sub mvn modules -->
+     <dependencies>
++           <dependency>
++            <groupId>javax.ws.rs</groupId>
++            <artifactId>jsr311-api</artifactId>
++            <version>1.0</version>
++        </dependency>
+         <dependency>
+             <groupId>org.apache.ws.commons.axiom</groupId>
+             <artifactId>axiom-api</artifactId>
+Index: modules/osgi/pom.xml
+===================================================================
+--- modules/osgi/pom.xml	(revision 726973)
++++ modules/osgi/pom.xml	(working copy)
+@@ -64,6 +64,7 @@
+                         <Import-Package>
+                             !javax.xml.namespace,
+                             !org.apache.axis2.*,
++                            javax.ws.rs; version=1.0,
+                             javax.xml.namespace; version=0.0.0,
+                             javax.servlet; version=2.4.0,
+                             javax.servlet.http; version=2.4.0,

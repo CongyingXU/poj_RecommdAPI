@@ -1,0 +1,289 @@
+Index: modules/kernel/src/org/apache/axis2/transport/jms/JMSConnectionFactory.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/jms/JMSConnectionFactory.java	(revision 734866)
++++ modules/kernel/src/org/apache/axis2/transport/jms/JMSConnectionFactory.java	(working copy)
+@@ -436,7 +436,6 @@
+             log.warn("Cannot find destination : " + destinationJndi +
+                     " Creating a Queue with this name");
+             destination = session.createQueue(destinationJndi);
+-
+         } catch (NamingException e) {
+             log.warn("Error looking up destination : " + destinationJndi, e);
+             // mark service as faulty
+@@ -447,6 +446,7 @@
+         }
+ 
+         MessageConsumer consumer = session.createConsumer(destination);
++        this.msgRcvr.setSession(session);
+         consumer.setMessageListener(this.msgRcvr);
+         jmsSessions.put(destinationJndi, session);
+     }
+@@ -462,6 +462,16 @@
+     }
+ 
+     /**
++     * Return the session using this destination 
++     *
++     * @param destinationJndi the JNDI name of the JMS destination
++     * @throws JMSException on exception
++     */
++    public Session getSessionForDestination(String destinationJndi) {
++        return ((Session) jmsSessions.get(destinationJndi));
++    }
++    
++    /**
+      * Return the service name using this destination
+      *
+      * @param destination the destination name
+Index: modules/kernel/src/org/apache/axis2/transport/jms/JMSConstants.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/jms/JMSConstants.java	(revision 734866)
++++ modules/kernel/src/org/apache/axis2/transport/jms/JMSConstants.java	(working copy)
+@@ -126,6 +126,10 @@
+      */
+     public static final String JMS_WAIT_REPLY = "JMS_WAIT_REPLY";
+     /**
++     * A MessageContext property or client Option stating the name of the dead letter queue 
++     */
++    public static final String JMS_DEAD_LETTER_QUEUE = "JMS_DEAD_LETTER_QUEUE";
++    /**
+      * The JMS message property specifying the SOAP Action
+      */
+     public static final String SOAPACTION = "SOAPAction";
+@@ -137,7 +141,14 @@
+      * The default JMS time out waiting for a reply
+      */
+     public static final long DEFAULT_JMS_TIMEOUT = Options.DEFAULT_TIMEOUT_MILLISECONDS;
++    /**
++     * The default JMS dead letter queue name
++     */
++    public static final String DEFAULT_DEAD_LETTER_QUEUE = "DeadLetterQueue";
++    
++    public static final String PROPERTY_DEAD_LETTER_CAUSE = "Cause Of Death";
+ 
+     public static final String ACTIVEMQ_DYNAMIC_QUEUE = "dynamicQueues/";
+     public static final String ACTIVEMQ_DYNAMIC_TOPIC = "dynamicTopics/";
++    
+ }
+Index: modules/kernel/src/org/apache/axis2/transport/jms/JMSMessageReceiver.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/jms/JMSMessageReceiver.java	(revision 734866)
++++ modules/kernel/src/org/apache/axis2/transport/jms/JMSMessageReceiver.java	(working copy)
+@@ -36,6 +36,7 @@
+ import javax.jms.Message;
+ import javax.jms.MessageListener;
+ import javax.jms.Queue;
++import javax.jms.Session;
+ import javax.jms.Topic;
+ import javax.naming.Context;
+ import javax.xml.stream.XMLStreamException;
+@@ -63,6 +64,10 @@
+      * A reference to the JMS Connection Factory
+      */
+     private JMSConnectionFactory jmsConFac = null;
++    /**
++     * A reference to the JMS Session object
++     */
++    private Session session = null;
+ 
+     /**
+      * Create a new JMSMessage receiver
+@@ -95,6 +100,16 @@
+     public void setWorkerPool(Executor workerPool) {
+         this.workerPool = workerPool;
+     }
++    
++    /**
++     * Set the JMS session
++     *
++     * @param session the session object
++     */
++    public void setSession(Session session) {
++        this.session = session;
++    }
++    
+ 
+     /**
+      * The entry point on the recepit of each JMS message
+@@ -252,6 +267,7 @@
+                     engine.receive(msgCtx);
+                 } catch (AxisFault e) {
+                     log.debug("Exception occured when receiving the SOAP message", e);
++                    JMSUtils.handleDeadLetter(msgCtx, message, session, jmsConFac.getProperties(), e);
+                     if (msgCtx.isServerSide()) {
+                         MessageContext faultContext = MessageContextBuilder.createFaultMessageContext(msgCtx, e);
+                         engine.sendFault(faultContext);
+Index: modules/kernel/src/org/apache/axis2/transport/jms/JMSSender.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/jms/JMSSender.java	(revision 734866)
++++ modules/kernel/src/org/apache/axis2/transport/jms/JMSSender.java	(working copy)
+@@ -133,32 +133,33 @@
+                 WSDL2Constants.MEP_URI_OUT_IN.equals(
+                     msgContext.getOperationContext().getAxisOperation().getMessageExchangePattern());
+ 
+-            if (waitForResponse) {
+-                String replyToJNDIName = (String) msgContext.getProperty(JMSConstants.REPLY_PARAM);
+-                if (replyToJNDIName != null && replyToJNDIName.length() > 0) {
+-                    Context context = null;
+-                    Hashtable props = JMSUtils.getProperties(targetAddress);
+-                    try {
+-                        context = new InitialContext(props);
+-                    } catch (NamingException e) {
+-                        handleException("Could not get the initial context", e);
+-                    }
++            String replyToJNDIName = (String) msgContext.getProperty(JMSConstants.REPLY_PARAM);
++            Hashtable props = null;
++            if (replyToJNDIName != null && replyToJNDIName.length() > 0) {
++                Context context = null;
++                props = JMSUtils.getProperties(targetAddress);
++                try {
++                    context = new InitialContext(props);
++                } catch (NamingException e) {
++                    handleException("Could not get the initial context", e);
++                }
+ 
+-                    try {
+-                        replyDest = (Destination) context.lookup(replyToJNDIName);
++                try {
++                    replyDest = (Destination) context.lookup(replyToJNDIName);
+ 
+-                    } catch (NameNotFoundException e) {
+-                        log.warn("Cannot get or lookup JMS response destination : " +
+-                            replyToJNDIName + " : " + e.getMessage() +
+-                            ". Attempting to create a Queue named : " + replyToJNDIName);
+-                        replyDest = session.createQueue(replyToJNDIName);
++                } catch (NameNotFoundException e) {
++                    log.warn("Cannot get or lookup JMS response destination : " +
++                        replyToJNDIName + " : " + e.getMessage() +
++                        ". Attempting to create a Queue named : " + replyToJNDIName);
++                    replyDest = session.createQueue(replyToJNDIName);
+ 
+-                    } catch (NamingException e) {
+-                        handleException("Cannot get JMS response destination : " +
+-                            replyToJNDIName + " : ", e);
+-                    }
++                } catch (NamingException e) {
++                    handleException("Cannot get JMS response destination : " +
++                        replyToJNDIName + " : ", e);
++                }
+ 
+-                } else {
++            } else {
++                if (waitForResponse) {
+                     try {
+                         // create temporary queue to receive reply
+                         replyDest = session.createTemporaryQueue();
+@@ -166,6 +167,8 @@
+                         handleException("Error creating temporary queue for response");
+                     }
+                 }
++            }
++            if (replyDest != null) {
+                 message.setJMSReplyTo(replyDest);
+                 if (log.isDebugEnabled()) {
+                     log.debug("Expecting a response to JMS Destination : " +
+@@ -181,6 +184,7 @@
+                 producer.close();
+ 
+             } catch (JMSException e) {
++            	JMSUtils.handleDeadLetter(msgContext, message, session, props, e);
+                 handleException("Error sending JMS message to destination : " +
+                         dest.toString(), e);
+             }
+Index: modules/kernel/src/org/apache/axis2/transport/jms/JMSUtils.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/jms/JMSUtils.java	(revision 734866)
++++ modules/kernel/src/org/apache/axis2/transport/jms/JMSUtils.java	(working copy)
+@@ -47,16 +47,30 @@
+ import org.apache.commons.logging.LogFactory;
+ 
+ import javax.jms.BytesMessage;
++import javax.jms.Connection;
++import javax.jms.Destination;
+ import javax.jms.JMSException;
+ import javax.jms.Message;
++import javax.jms.MessageProducer;
++import javax.jms.Queue;
++import javax.jms.Session;
+ import javax.jms.TextMessage;
++import javax.naming.Context;
++import javax.naming.InitialContext;
++import javax.naming.NameNotFoundException;
++import javax.naming.NamingException;
+ import javax.xml.stream.XMLStreamException;
+ import javax.xml.stream.XMLStreamReader;
+ import javax.xml.namespace.QName;
+ import javax.activation.DataHandler;
+ import java.io.*;
++import java.util.Enumeration;
++import java.util.HashMap;
+ import java.util.Hashtable;
++import java.util.Iterator;
+ import java.util.List;
++import java.util.Properties;
++import java.util.Set;
+ import java.util.StringTokenizer;
+ 
+ public class JMSUtils {
+@@ -425,6 +439,61 @@
+         return envelope;
+     }
+ 
++    public static void handleDeadLetter(
++            MessageContext msgContext, Message message, Session session, Hashtable jndiProperties, Throwable cause) {
++    	Context context = null;
++        try {
++            context = new InitialContext(jndiProperties);
++        } catch (NamingException e) {
++            handleException("Could not get the initial context", e);
++        }
++    	
++    	String deadLetterQueueName = (String) msgContext.getProperty(JMSConstants.JMS_DEAD_LETTER_QUEUE);
++    	if (deadLetterQueueName == null || deadLetterQueueName.length() == 0) {
++    		deadLetterQueueName = JMSConstants.DEFAULT_DEAD_LETTER_QUEUE;    		
++    	}
++
++    	try {
++	    	Destination deadLetterQueue = null;
++	    	try {
++	            deadLetterQueue = (Destination) context.lookup(deadLetterQueueName);
++	        } catch (NameNotFoundException e) {
++	            log.warn("Cannot get or lookup JMS response destination : " +
++	                deadLetterQueueName + " : " + e.getMessage() +
++	                ". Attempting to create a Queue named : " + deadLetterQueueName);
++	            deadLetterQueue = session.createQueue(deadLetterQueueName);
++	        } catch (NamingException e) {
++	            handleException("Cannot get JMS response destination : " +
++	                deadLetterQueueName + " : ", e);
++	        }
++	        
++	        // make a copy of the message properties
++	        HashMap msgProperties = new HashMap();  
++	        for (Enumeration propertyNames = message.getPropertyNames(); 
++	        		propertyNames.hasMoreElements(); ) {	        	
++	        	String propertyName = (String) propertyNames.nextElement();
++	        	msgProperties.put(propertyName, message.getObjectProperty(propertyName));	        	
++	        }
++	        // clear the message properties in order to make them writable
++	        message.clearProperties();
++	        // re-insert the original set of message properties
++	        for (Iterator propertyNames = msgProperties.keySet().iterator(); propertyNames.hasNext(); ) {
++	        	String propertyName = (String) propertyNames.next();
++	        	message.setObjectProperty(propertyName, msgProperties.get(propertyName));
++	        }
++	        // add a message properties that identifies the root cause of the problem
++	        message.setStringProperty(JMSConstants.PROPERTY_DEAD_LETTER_CAUSE, 
++	        		cause.getLocalizedMessage());
++	        
++	        if (deadLetterQueue != null) {
++	        	MessageProducer producer = session.createProducer(deadLetterQueue);
++	        	producer.send(message);
++	        }
++    	} catch (JMSException e) {
++    		log.error("Could not queue dead letter" + message, e);
++    	}
++    }
++    
+     private static SOAPEnvelope getEnvelope(InputStream in, String namespace) throws XMLStreamException {
+ 
+         try {

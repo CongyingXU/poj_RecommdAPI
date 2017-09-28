@@ -104,6 +104,117 @@ def main(Aimresult,Result_dict):
     #print MAP
     return MAP
 
+
+
+def get_all_evalution(aimList,resultList):#MAP  MPP @1   @5  @10 
+    if len(aimList) == 0:
+        return(0,0,0,0,0)
+    
+    result_list = []
+    k1  = 0
+    k5 = 0
+    k10 = 0
+    
+    for file0 in aimList:
+        if not file0 in resultList:
+            result_list.append(0)
+        else:
+            result_list.append(resultList.index(file0)+1)
+            
+    result_list0 = numpy.sort(numpy.array(result_list)) #内容便为 已排好序的结果
+    
+    index_k = 0
+    for i in range(len(result_list0)):
+        if result_list0[i] == 0 :
+             pass
+             #MAP_result =  MAP_result + 0
+        else:
+            index_k = result_list0[i]
+            break
+    if index_k == 0 or index_k >10:
+        k1 = 0
+        k5 = 0
+        k10 = 0    
+    elif index_k == 1:
+        k1 = 1
+        k5 = 1
+        k10 = 1
+    elif index_k <=5 and index_k >1 :
+        k1 = 0
+        k5 = 1
+        k10 = 1
+    elif index_k <=10 and index_k >5:
+        k1 = 0
+        k5 = 0
+        k10 = 1
+        
+        
+    MAP_result = 0.0
+    MRR_result = 0.0
+    per_num = 1 #用于表示前面已有的
+    flag = 0
+    for i in range(len(result_list0)):
+        if result_list0[i] == 0 :
+             pass
+             #MAP_result =  MAP_result + 0
+        else:
+             MAP_result =  MAP_result + per_num / float(result_list0[i])
+             if flag == 0:
+                 MRR_result = 1 / float(result_list0[i])
+                 flag=1
+             per_num = per_num + 1
+    MAP_result =  MAP_result / len(aimList) 
+     
+    return (MAP_result ,MRR_result,k1,k5,k10)
+
+#用于测试集   多个评估标准的结果
+def main_All(Aimresult,Result_dict):    
+    MAP=0.0
+    MRR=0.0
+    k1=0.0
+    k5=0.0
+    k10=0.0
+    Result=[]
+    kong_num = 0
+    for key in Result_dict:
+        #kong_num =0
+        t=get_all_evalution(Aimresult[key],Result_dict[key])
+        Result.append( t )
+        MAP = MAP + t[0]
+        MRR = MRR + t[1]
+        k1 = k1 + t[2]
+        k5 = k5 + t[3]
+        k10 = k10 + t[4]
+        if t[0] ==  0 :
+            kong_num = kong_num + 1
+    try:
+        MAP =  MAP/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        MAP = 0
+    try:
+        MRR =  MRR/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        MRR = 0
+    try:
+        k1 =  k1/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        k1 = 0
+    try:
+        k5 =  k5/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        k5 = 0
+    try:
+        k10 =  k10/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        k10 = 0
+        
+    print MAP
+    print MRR
+    print k1
+    print k5
+    print k10
+    return MAP,MRR,k1,k5,k10
+    
 """    
 if __name__ == '__main__':   
     Result_dict = getFeatureLocation_result.main()

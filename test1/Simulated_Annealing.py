@@ -12,7 +12,10 @@ import csv
 import evaluate 
 import getFeatureLocation_result
 import getSimilarityScores2Reports
+from time import time
 
+begin = time()
+print begin
 #相关参数初始化
 def initpara():
     alpha = 0.99
@@ -27,17 +30,14 @@ def initpara():
 def getevaluate(weights):
 
     Similarreports_result = getSimilarityScores2Reports.getFinalResultsbyWeights(All_result,weights[2:9],issuekey_file_num,issuekey_file_list)
-
-
     Structure_result = getStrucCmptScors.getFinal_result(All_result0 , weights[9:])
-
-    Result_dict = getFeatureLocation_result.getFinal_Result(Similarreports_result , Structure_result , weights[:2])
+    Result_dict = getFeatureLocation_result.getFinal_Result(Similarreports_result , Structure_result , weights[:2])    
     
-    Aimresult=getAimList()
-    MAP = evaluate.main(Aimresult,Result_dict)
-    return MAP
-
-
+    #MAP = evaluate.main(Aimresult,Result_dict)用于训练
+    #return MAP
+    evaluate_result  = evaluate.main_All(Aimresult,Result_dict)#用于测试集
+    getFeatureLocation_result.write(Result_dict,evaluate_result)
+    return evaluate_result
 
 #为了减少I/O，定向制作
       
@@ -55,14 +55,18 @@ def getAimList():
              #   break
     return Aimresult
 
-All_result,issuekey_file_num,issuekey_file_list = getSimilarityScores2Reports.getAll_Info()
+weights = [1, 0.7000000000000001, 1.0, 0.10000000000000014, 0.40000000000000013, 1.3877787807814457e-16, 0.10000000000000014, 1.3877787807814457e-16, 1, 1, 0.40000000000000013, 0.10000000000000014, 0.20000000000000015, 1, 1, 1, 1]
 
+#weights = [1, 0.7000000000000001, 0.8, 1.3877787807814457e-16, 1.0, 0.40000000000000013, 1, 0.8, 1, 1, 0.6000000000000001, 0.10000000000000014, 0.5000000000000001, 1, 1, 1, 1]
+Aimresult=getAimList()
+All_result,issuekey_file_num,issuekey_file_list = getSimilarityScores2Reports.getAll_Info()
 All_result0=getStrucCmptScors.getall_result()
 
-solutionnew =weights = [0.7217656912869671,  0.39589087254670696, 0.38, 0.29, 0.36, 0.2, 0.23, 0.6, 0.7383606484712233, 0.5881762643232233, 0.4735409434116893, 0.10212499280443976, 0.4363396810754724, 0.5774016678038669, 0.4166697755914751, 0.18319637300523295, 0.14007257039425824]
+print time()
+solutionnew =weights 
 valuenew = getevaluate(solutionnew)#目标函数解
 print valuenew
-
+"""
 solutioncurrent = solutionnew
 valuecurrent = valuenew
 
@@ -85,7 +89,7 @@ while t > t2[0]:
         #solutionnew[5] = np.random.rand()
         #solutionnew[6] = np.random.rand()
         #solutionnew[7] = np.random.rand()
-        solutionnew[8] = np.random.rand()
+        #solutionnew[8] = np.random.rand()
         #solutionnew[9] = np.random.rand()
         #solutionnew[10] = np.random.rand()
         #solutionnew[11] = np.random.rand()
@@ -118,11 +122,14 @@ while t > t2[0]:
     valuebest_result.append(valuebest)
     solutionbest_result.append(solutionbest)
     print t #程序运行时间较长，打印t来监视程序进展速度
+    print time()
 
 #print valuebest_result
 #print solutionbest_result
 
 print valuebest
 print solutionbest
-
+end = time()
+print begin -end
+"""
 

@@ -125,6 +125,7 @@ def getAPI_Info():
 
 def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前只对description进行预处理）
                                 #二次升级  对class_name、method———name、para——name  也进行预处理，放到最后把
+    """
     dir = 'Input/APIdoc'
     All_3partAPIinfo_list=[]#格式：  【  （ class_name，method_name，para_info，method_description，modifier_type  ） ，  】
     for dirpath,dirname,filename in os.walk(dir):
@@ -149,11 +150,73 @@ def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前�
                              class_name_after_txtprces,
                              methond_name_after_txtprces,
                              para_name_after_txtprces,
-                             description_after_txtprces)
+                             description_after_txtprces,
+                             sheet.cell(i,2).value,#原
+                             sheet.cell(i,4).value)#原)
                         All_3partAPIinfo_list.append(API)
                        
     #print  All_3partAPI_set.__len__()
-    #print  All_3partAPI_set.union()                
+    #print  All_3partAPI_set.union()
+    f = xlwt.Workbook() #创建工作簿
+    sheet1 = f.add_sheet(u'sheet1',cell_overwrite_ok=True) #创建sheet
+    #sheet2 = f.add_sheet(u'comments',cell_overwrite_ok=True) #创建sheet
+    sheet1.write(0,0,"class_name_origin".decode('utf-8'))
+    sheet1.write(0,1,"methond_name_origin".decode('utf-8'))
+    sheet1.write(0,2,"class_name".decode('utf-8'))
+    sheet1.write(0,3,"methond_name".decode('utf-8'))
+    sheet1.write(0,4,"para_name".decode('utf-8'))
+    sheet1.write(0,5,"description".decode('utf-8'))
+    
+    sheet1.write(0,6,"para_info_origin".decode('utf-8'))
+    sheet1.write(0,7,"modifier_type_origin".decode('utf-8'))
+         
+    for i in range(len(All_3partAPIinfo_list)):
+            sheet1.write(i+1,0,All_3partAPIinfo_list[i][0])
+            sheet1.write(i+1,1,All_3partAPIinfo_list[i][1])
+            
+            class_name = ' '
+            if len(All_3partAPIinfo_list[i][2]) >0:
+                for word in All_3partAPIinfo_list[i][2]:
+                    class_name = class_name + ' ' + word
+            sheet1.write(i+1,2,class_name.strip(' '))
+            
+            methond_name = ' '
+            if len(All_3partAPIinfo_list[i][3]) >0:
+                for word in All_3partAPIinfo_list[i][3]:
+                    methond_name = methond_name + ' ' + word
+            sheet1.write(i+1,3,methond_name.strip(' '))
+            
+            para_name = ' '
+            if len(All_3partAPIinfo_list[i][4]) >0:
+                for word in All_3partAPIinfo_list[i][4]:
+                    para_name = para_name + ' ' + word
+            sheet1.write(i+1,4,para_name.strip(' '))
+
+            description = ' '
+            if len(All_3partAPIinfo_list[i][5]) >0:
+                for word in All_3partAPIinfo_list[i][5]:
+                    description = description + ' ' + word
+            sheet1.write(i+1,5,description.strip(' '))
+            
+            sheet1.write(i+1,0,All_3partAPIinfo_list[i][6])
+            sheet1.write(i+1,1,All_3partAPIinfo_list[i][7])
+     
+    f.save('Input/allAPI_info')
+    """
+    allAPI_info_dir = 'Input/allAPI_info.xls'
+    workbook = xlrd.open_workbook(allAPI_info_dir,'r')
+    sheet2 = workbook.sheet_by_name('sheet1')
+    
+    allAPI_info_list=[]
+    for i in range(len(sheet2.nrows)):
+        API=(sheet2.cell(i,0).value,#原
+             sheet2.cell(i,1).value,#原
+             sheet2.cell(i,2).value.split(' '),#进过文本预处理的地方，将单词分开
+             sheet2.cell(i,3).value.split(' '),
+             sheet2.cell(i,4).value.split(' '),
+             sheet2.cell(i,5).value.split(' '))
+    allAPI_info_list.append(API)
+    All_3partAPIinfo_list = allAPI_info_list
     return All_3partAPIinfo_list
 
 def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPIinfo_list):      #,Src_info_file_dir):
@@ -169,136 +232,31 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     for i  in range(len(All_3partAPIinfo_list)):
         API = All_3partAPIinfo_list[i][0]+ '.' + All_3partAPIinfo_list[i][1]
         Scores[ API ] = scores[i]
-    
-    return Scores
-
-def writeResult(result,result_file_dir,weights):
-    all_result={}
-    f = xlwt.Workbook() #创建工作簿
-    sheet1 = f.add_sheet(u'sheet1',cell_overwrite_ok=True) #创建sheet
-    
-    sheet1.write(0,0,'classdir'.encode('utf-8'))
-    sheet1.write(0,1,'classNameS_result'.encode('utf-8'))
-    sheet1.write(0,2,'classNameD_result'.encode('utf-8'))
-    sheet1.write(0,3,'methodNameS_result'.encode('utf-8'))
-    sheet1.write(0,4,'methodNameD_result'.encode('utf-8'))
-    sheet1.write(0,5,'variableNameS_result'.encode('utf-8'))
-    sheet1.write(0,6,'variableNameD_result'.encode('utf-8'))
-    sheet1.write(0,7,'commentsS_result'.encode('utf-8'))
-    sheet1.write(0,8,'commentsD_result'.encode('utf-8'))
-    sheet1.write(0,9,'all_result'.encode('utf-8'))
-    
-    for i in range(len(result[0])):
         
-        all_result0= weights[0]*result[1][i] +weights[1]*result[2][i] +weights[2]*result[3][i] +weights[3]*result[4][i]
-        + weights[4]*result[5][i] +weights[5]*result[6][i] +weights[6]*result[7][i] +weights[7]*result[8][i] 
-        all_result[result[0][i]] = all_result0
-        sheet1.write(i+1,0,result[0][i])#字符串   #表格的第一行开始写。第一列，第二列。。。。
-        sheet1.write(i+1,1,result[1][i])
-        sheet1.write(i+1,2,result[2][i])
-        sheet1.write(i+1,3,result[3][i])
-        sheet1.write(i+1,4,result[4][i])
-        sheet1.write(i+1,5,result[5][i])
-        sheet1.write(i+1,6,result[6][i])
-        sheet1.write(i+1,7,result[7][i])
-        sheet1.write(i+1,8,result[8][i])
-        sheet1.write(i+1,9,all_result0)
-        
-    f.save(result_file_dir)#保存文件
-    #问题！！！不能追加，会把原来的文件覆盖掉！！
-    all_result = sorted(all_result.iteritems(), key = lambda asd:asd[1], reverse = True)
-    return all_result#列表类型，【 （key，value） 】
-      
-def getAimList():
-    #准备设计成 字典，以issuekey 作为键   ，  其aimresulr  为值
-    Aimresult={}
-    import csv
-    with open("Input/Attachments_PatchInfo.csv","r") as csvfile:
-        reader = csv.reader(csvfile)
-        #这里不需要readlines
-        for i,rows in enumerate(reader):
-            #if i <20 :
-                aimresult = rows[1:]
-                Aimresult[rows[0]] = aimresult
-            #else:
-             #   break
-    return Aimresult
+    """
+    Scores = sorted(Scores.iteritems(), key = lambda asd:asd[1], reverse = True)
+    return Scores # [(key,value)]
+    """
+    return Scores   #直接用字典，这样便于后续的关键字查找
 
+num_list = range(4,1004)
+def main():#即issuekey的行号【4:1004】 是全部
 
-    #做整体计算
-def getall_result():
-    #begin = time()
-    
     workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     #print sheet1.cell(6,28).value.encode('utf-8')
-    
-    
-    #定向制作
-    Src_info_file_dir='Output/repo_SrcfileInfo.xls'
-    workbook = xlrd.open_workbook(Src_info_file_dir,'r')
-    sheet1 = workbook.sheet_by_name('sheet1')
-    #因为数据量小，所以代码没有优化，
-    #正式使用前，一定会要  优化！！！！
-    All_result={}
-    for i in range(4,1004):
-        newReportissueKey=sheet.cell(i,1).value.encode('utf-8')
+    Scores_dict={}
+    All_3partAPIinfo_list = getAPI_Info_Txtprocessing()
+    ###########################################################
+    #调节范围
+    for i in num_list:
+        issuekey = sheet.cell(i,1).value.encode('utf-8')
         newReportSummary=sheet.cell(i,2).value.encode('utf-8')
         newReportDescription=sheet.cell(i,28).value.encode('utf-8')
-        
-        #Src_info_file_dir='Output/repo_SrcfileInfo.xls'
-        result= computeSimilarityScors(newReportSummary,newReportDescription,    sheet1)     #Src_info_file_dir)
-        #result_file_dir='Output/StructComponentScrs.xls'
-        #weights=[1.0 ,1.0 ,1.0 ,1.0 ,1.0 ,1.0 ,1.0 ,1.0 ]
-        #all_result = writeResult(result,result_file_dir,weights)#排好序
-        All_result[newReportissueKey] = result
-    
-    #end = time()
-    #print "Total procesing time: %d seconds" % (end - begin)
-    return All_result
-
-def getFinal_result(All_result , weights):
-    #转为实验设计
-    Final_result = {}
-    for key in All_result:
-        result = All_result[key]
-        all_result={}
-        for i in range(len(result[0])):
-            all_result0= weights[0]*result[1][i] +weights[1]*result[2][i] +weights[2]*result[3][i] +weights[3]*result[4][i]
-            + weights[4]*result[5][i] +weights[5]*result[6][i] +weights[6]*result[7][i] +weights[7]*result[8][i] 
-            all_result[result[0][i]] = all_result0
-        all_result = sorted(all_result.iteritems(), key = lambda asd:asd[1], reverse = True)
-        Final_result[key]= all_result
-    return Final_result #{ issuekey:[(.java , 分数) 。。。。。  ] }
-
-
-"""
-def main( weights):
-    All_result=getall_result()
-    #weights = [0.5881762643232233, 0.4735409434116893, 0.10212499280443976, 0.4363396810754724, 0.5774016678038669, 0.4166697755914751, 0.18319637300523295, 0.14007257039425824]
-    Final_result = getFinal_result(All_result , weights)
-    return Final_result
-"""
-#单个计算时
-def main():
-    begin = time()
-    print time(),11
-    
-    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
-    sheet = workbook.sheet_by_name('general_report')
-    #print sheet1.cell(6,28).value.encode('utf-8')
-    newReportSummary=sheet.cell(844,2).value.encode('utf-8')
-    newReportDescription=sheet.cell(844,28).value.encode('utf-8')
-    
-    print time(),22
-    All_3partAPIinfo_list = getAPI_Info_Txtprocessing()
-    print time(),33
-    Scores = computeSimilarityScors(newReportSummary, newReportDescription, All_3partAPIinfo_list)
-    print time()
-    end = time()
-    print "Total procesing time: %d seconds" % (end - begin)
+        Scores = computeSimilarityScors(newReportSummary, newReportDescription, All_3partAPIinfo_list)
+        Scores_dict[issuekey] = Scores
     return Scores
 
 
-if __name__=='__main__':
-    print main()
+#if __name__=='__main__':
+#    print main()

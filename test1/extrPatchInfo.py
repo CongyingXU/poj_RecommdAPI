@@ -25,14 +25,35 @@ from pygit import PyGit
 # https://github.com/mijdavis2/pygit
 # pip install git+git://github.com/mijdavis2/pygit.git
 
-repo_path = "/Users/apple/Git/hbase-1"
+class switch(object):
+    def __init__(self, value):
+        self.value = value
+        self.fall = False
+ 
+    def __iter__(self):
+        """Return the match method once, then stop"""
+        yield self.match
+        raise StopIteration
+ 
+    def match(self, *args):
+        """Indicate whether or not to enter a case suite"""
+        if self.fall or not args:
+            return True
+        elif self.value in args: # changed for v1.5, see below
+            self.fall = True
+            return True
+        else:
+            return False
+
+
+repo_path = "/Users/apple/Git/hadoop"
 
 def getCommitHash():
     CommitHash_dict = {}
     with open(repo_path+'/log.log','r') as f:
         content = f.read()
         list0 = content.split('\n')
-        p1='HBASE-[0-9]+'
+        p1='HADOOP-[0-9]+'
         pa1=re.compile(p1)
         for each in list0:
             index = each.find(',')
@@ -77,7 +98,7 @@ def getSrcInfo():
 
 #汇总出所有的第三方API
 def getAll_3partAPI():
-    dir = '/Users/apple/Documents/API推荐项目/APIdoc'
+    dir = 'Input/APIdoc'
     All_3partAPI_set=set()
     for dirpath,dirname,filename in os.walk(dir):
         for each_file in filename:
@@ -97,9 +118,19 @@ def getAll_3partAPI():
 
 All_3partAPI_set = getAll_3partAPI()
 
+
+
 #提取出每个issuekey所修改的.java文件
 def getfixedfile():
-    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+    #读取出目前已有的路径
+    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/repo_SrcfileInfo.xls')
+    sheet0 = workbook0.sheet_by_name('sheet1')
+    file_list = []
+    for i in range(1,sheet0.nrows):
+        name = sheet0.cell(i,0).value.encode('utf-8')
+        file_list.append(name)
+    #print    file_list
+    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/HadoopCommon.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     
     Result=collections.OrderedDict()
@@ -111,7 +142,7 @@ def getfixedfile():
         class_result=[]
         x=0
         while 1:
-            filename='Input/hbase-attachments/'+issuekey+'_'+str(x)+'.patch'
+            filename='/Users/apple/Documents/API/Hadoop/HadoopCommon-attachments/'+issuekey+'_'+str(x)+'.patch'
             x = x + 1
             try:
                 #获取patch中设计的源代码文件
@@ -121,19 +152,29 @@ def getfixedfile():
                     for line in list_of_all_the_lines:#文本文件时
                         if line[:3]=='+++':#提取所有修改的类
                             class_name = line.split(' ')[1].strip('\n').strip('b/') 
-                            class_name = 'hbase-1/'+class_name
-                            if not class_name in class_result and class_name.endswith(".java"): 
+                            #class_name =class_name[ class_name.find('hadoop-common/'):]
+                            #class_name = 'cxf/'+class_name
+                            class_name = class_name.split('\t')[0]
+                            if not class_name in class_result and class_name.endswith(".java") and class_name in file_list: 
                                 class_result.append(class_name)
                                 
             except IOError:
+                print issuekey
                 break
         
         #print j
         #Result.update[issuekey] = [class_result,API_result]
         Result[issuekey] = [class_result]    #格式：key:[[ .java, , ,]  ]
-        
     return Result
 
+"""
+    with open("/Users/apple/Documents/API/Hadoop/Attachments_PatchInfo.csv","w") as csvfile:
+        writer = csv.writer(csvfile)
+        for k,v in Result.items():
+            writer.writerow([k]+v[0])
+    #return Result
+#getfixedfile()
+"""
 #将项目退回到某一版本，并进行解析信息
 def getSrcvariable_Info_git(issuekey,file_name):
     git_repo = PyGit(repo_path)
@@ -147,7 +188,8 @@ def getSrcvariable_Info_git(issuekey,file_name):
         return {'':''}
     git_repo('reset --hard '+commit_hash)
     
-    file_name = repo_path + file_name [file_name.find('/'):]#因为有些是  hbase-1-master开头的
+    #file_name = repo_path + file_name [file_name.find('/'):]#因为有些是  hbase-1-master开头的
+    file_name = repo_path + '/'+ file_name#   Hadoop 特殊处理，不然统一用上面的 [file_name.find('/'):]#因为有些是  hbase-1-master开头的
     #String_dir = file_name.split('Input/')##因为路径名不统一而采取的 手段，很烦，删
     try:
         class_info_list = extrSrcFileInfo.get_class(file_name)[ file_name ]
@@ -170,6 +212,10 @@ def getAPIFromSrcfile(pre_result_dict,variable_Info_dict):
                 Result_list.append(( variable_Info_dict[pre_result_dict[key][0]] , 
                                     pre_result_dict[key][1] , 
                                     pre_result_dict[key][2]))
+            else:
+                Result_list.append((pre_result_dict[key][0] , 
+                                    pre_result_dict[key][1] , 
+                                    pre_result_dict[key][2]))
         except KeyError: 
             #print file_name,'KeyError'
             pass
@@ -178,11 +224,18 @@ def getAPIFromSrcfile(pre_result_dict,variable_Info_dict):
 
 #提取出每个issuekey所使用的API
 def getUsedAPI(fixedfile_result):
-    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/repo_SrcfileInfo.xls')
+    sheet0 = workbook0.sheet_by_name('sheet1')
+    file_list = []
+    for i in range(1,sheet0.nrows):
+        name = sheet0.cell(i,0).value.encode('utf-8')
+        file_list.append(name)
+        
+    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/HadoopCommon.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     
     Result=collections.OrderedDict()
-    for j in range(4,54):
+    for j in range(4,1004):
         issuekey=sheet.cell(j,1).value.encode('utf-8')       
         class_result=[]
         API_result=[ ]
@@ -190,10 +243,13 @@ def getUsedAPI(fixedfile_result):
         Add_line={}
         x=0
         while 1:
-            filename='Input/hbase-attachments/'+issuekey+'_'+str(x)+'.patch'
+            filename='/Users/apple/Documents/API/Hadoop/HadoopCommon-attachments/'+issuekey+'_'+str(x)+'.patch'
             x = x + 1
-            if len(fixedfile_result[issuekey][0])==0:#无fixed file时
-                #print issuekey,'None .java'
+            try:
+                if len(fixedfile_result[issuekey][0])==0:#无fixed file时
+                    #print issuekey,'None .java'
+                    break
+            except KeyError:   #???
                 break
             try:
                 #获取patch中设计的源代码文件
@@ -202,8 +258,9 @@ def getUsedAPI(fixedfile_result):
                     for line in list_of_all_the_lines:#文本文件时
                         if line[:3]=='+++':#提取所有修改的类
                             class_name = line.split(' ')[1].strip('\n').strip('b/') 
-                            class_name = 'hbase-1/'+class_name
-                            if not class_name in class_result and class_name.endswith(".java"): 
+                            #class_name = 'axis2-java/'+class_name
+                            class_name = class_name.split('\t')[0]
+                            if not class_name in class_result and class_name.endswith(".java") :#and class_name in file_list: 
                                 class_result.append(class_name)
                                 Add_line[class_name]=''
                                 
@@ -258,6 +315,55 @@ def getAPI(add_line,file_name,issuekey):
                 para = []
                 index0 = API_line.find('.')
                 index1 = API_line.find('(')
+                
+                index_0 = line.find(API_line)#API起始地址
+                index_1 = index_0 + len(API_line)#参数起始地址
+                
+                index_p = index_1
+                
+                notend = 1 #flag 
+                while notend:
+                    if index_p<len(line):
+                        char = line[index_p]
+                        kuohao_num = 0 #利用堆栈原理
+                        yinhao_num = 0 #利用堆栈原理
+                        for case in switch(char):
+                            if case(','):
+                                if kuohao_num == 0:
+                                    para0 = line[index_1:index_p].strip(' ')
+                                    if para0.find('\'')>-1 or para0.find('\"')>-1 or para0.find('(')>-1: 
+                                        break
+                                    else:
+                                        para.append( para0 )
+                                        index_1 = index_p + 1
+                                break
+                            if case('('):
+                                kuohao_num = kuohao_num +1
+                                break
+                            if case('\''):
+                                if yinhao_num%2==0:
+                                    yinhao_num = yinhao_num +1
+                                else:
+                                    yinhao_num = yinhao_num -1
+                                break
+                            if case('\"'):
+                                if yinhao_num%2==0:
+                                    yinhao_num = yinhao_num +1
+                                else:
+                                    yinhao_num = yinhao_num -1
+                                break
+                            if case(')'):
+                                if kuohao_num == 0:
+                                   para.append( line[index_1:index_p] )
+                                   index_1 = index_p + 1
+                                   notend = 0
+                                else:
+                                   kuohao_num = kuohao_num - 1
+                                break
+                        index_p = index_p + 1
+                    else:
+                        break
+                
                 """
                 暂时只考虑API，不考虑参数的提取
                 #index2 = API_line.find(')')
@@ -309,6 +415,7 @@ def write(Used_API):
         UsedAPI = Used_API[key][0]
         #for ele in UsedAPI:
         string0 = ''
+        para0 = ''
         if len(UsedAPI)==0:
             UsedAPI=''
         else:
@@ -333,11 +440,16 @@ def write(Used_API):
                     continue
                 else:
                     string0 = string0 + str0  +';'  
+                
+                para0 = '' 
+                for string1 in ele[2]:
+                    para0 = para0 + string1 + ','
                     
         sheet1.write(i,0,issueKey)
         sheet1.write(i,1,string0.strip(';'))#格式：  类名.方法名|参数1，参数2:
+        sheet1.write(i,2,para0.strip(','))#格式：  类名.方法名|参数1，参数2
         i = i+1
-    f.save('Input/issuekeys_UsedAPI.xls')#保存文件 
+    f.save('/Users/apple/Documents/API/Hadoop/issuekeys_UsedAPI.xls')#保存文件 
 
 def main():
     fixedfile_result = getfixedfile()

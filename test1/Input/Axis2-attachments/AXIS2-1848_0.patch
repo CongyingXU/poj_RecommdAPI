@@ -1,0 +1,1021 @@
+Index: modules/kernel/src/org/apache/axis2/transport/http/HTTPWorker.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/HTTPWorker.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/HTTPWorker.java	(working copy)
+@@ -35,6 +35,8 @@
+ import org.apache.http.entity.ContentProducer;
+ import org.apache.http.entity.EntityTemplate;
+ import org.apache.http.entity.StringEntity;
++import org.apache.http.message.BasicHeader;
++import org.apache.http.message.BasicStatusLine;
+ import org.apache.ws.commons.schema.XmlSchema;
+ 
+ import java.io.IOException;
+@@ -83,13 +85,13 @@
+ 
+         if (method.equals(HTTPConstants.HEADER_GET)) {
+             if (uri.equals("/favicon.ico")) {
+-                response.setStatusLine(new StatusLine(ver, 301, "Redirect"));
+-                response.addHeader(new Header("Location", "http://ws.apache.org/favicon.ico"));
++                response.setStatusLine(new BasicStatusLine(ver, 301, "Redirect"));
++                response.addHeader(new BasicHeader("Location", "http://ws.apache.org/favicon.ico"));
+                 return;
+             }
+             if (!uri.startsWith(contextPath)) {
+-                response.setStatusLine(new StatusLine(ver, 301, "Redirect"));
+-                response.addHeader(new Header("Location", contextPath));
++                response.setStatusLine(new BasicStatusLine(ver, 301, "Redirect"));
++                response.addHeader(new BasicHeader("Location", contextPath));
+                 return;
+             }
+             if (uri.indexOf("?") < 0) {
+@@ -189,7 +191,7 @@
+                         return;
+                     } else {
+                         // no schema available by that name  - send 404
+-                        response.setStatusLine(new StatusLine(ver, 404, "Schema Not Found!"));
++                        response.setStatusLine(new BasicStatusLine(ver, 404, "Schema Not Found!"));
+                         return;
+                     }
+                 }
+@@ -212,7 +214,7 @@
+                 outbuffer.setChunked(chunked);
+                 response.setEntity(outbuffer);
+             } else {
+-                response.setStatusLine(new StatusLine(ver, 200, "OK"));
++                response.setStatusLine(new BasicStatusLine(ver, 200, "OK"));
+                 String s = HTTPTransportReceiver.getServicesHTML(configurationContext);
+                 StringEntity entity = new StringEntity(s);
+                 entity.setContentType("text/html");
+@@ -273,12 +275,12 @@
+ 
+         if ((contextWritten != null) && Constants.VALUE_TRUE.equals(contextWritten)) {
+             if ((isTwoChannel != null) && Constants.VALUE_TRUE.equals(isTwoChannel)) {
+-                response.setStatusLine(new StatusLine(ver, 202, "OK"));
++                response.setStatusLine(new BasicStatusLine(ver, 202, "OK"));
+                 return;
+             }
+-            response.setStatusLine(new StatusLine(ver, 200, "OK"));
++            response.setStatusLine(new BasicStatusLine(ver, 200, "OK"));
+         } else {
+-            response.setStatusLine(new StatusLine(ver, 202, "OK"));
++            response.setStatusLine(new BasicStatusLine(ver, 202, "OK"));
+         }
+     }
+ 
+@@ -303,4 +305,5 @@
+         responseReadySignal.countDown();
+       }
+     }
++    
+ }
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpConnectionManager.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpConnectionManager.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpConnectionManager.java	(working copy)
+@@ -36,8 +36,18 @@
+ import org.apache.axis2.context.ConfigurationContext;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.http.ConnectionReuseStrategy;
++import org.apache.http.HttpResponseFactory;
+ import org.apache.http.HttpServerConnection;
++import org.apache.http.impl.DefaultConnectionReuseStrategy;
++import org.apache.http.impl.DefaultHttpResponseFactory;
+ import org.apache.http.params.HttpParams;
++import org.apache.http.protocol.BasicHttpProcessor;
++import org.apache.http.protocol.HttpProcessor;
++import org.apache.http.protocol.ResponseConnControl;
++import org.apache.http.protocol.ResponseContent;
++import org.apache.http.protocol.ResponseDate;
++import org.apache.http.protocol.ResponseServer;
+ 
+ import edu.emory.mathcs.backport.java.util.concurrent.Executor;
+ 
+@@ -120,7 +130,39 @@
+         }
+         // Evict destroyed processors
+         cleanup();
++
++        // Assemble new Axis HTTP service
++        HttpProcessor httpProcessor;
++        ConnectionReuseStrategy connStrategy;
++        HttpResponseFactory responseFactory;
+         
++        if (httpFactory != null) {
++            httpProcessor = httpFactory.newHttpProcessor(); 
++            connStrategy = httpFactory.newConnStrategy();
++            responseFactory = httpFactory.newResponseFactory();
++        } else {
++            BasicHttpProcessor p = new BasicHttpProcessor();
++            p.addInterceptor(new RequestSessionCookie());
++            p.addInterceptor(new ResponseDate());
++            p.addInterceptor(new ResponseServer());
++            p.addInterceptor(new ResponseContent());
++            p.addInterceptor(new ResponseConnControl());
++            p.addInterceptor(new ResponseSessionCookie());
++            httpProcessor =  new LoggingProcessorDecorator(p);
++            connStrategy = new DefaultConnectionReuseStrategy();
++            responseFactory = new DefaultHttpResponseFactory();
++        }
++
++        AxisHttpService httpService = new AxisHttpService(
++                httpProcessor,
++                connStrategy,
++                responseFactory,
++                this.configurationContext,
++                this.sessionManager,
++                this.workerfactory.newWorker());
++        httpService.setParams(this.params);
++        
++        // Create I/O processor to execute HTTP service
+         IOProcessorCallback callback = new IOProcessorCallback() {
+           
+             public void completed(final IOProcessor processor) {
+@@ -131,16 +173,11 @@
+             }
+             
+         };
+-        HttpServiceProcessor processor;
+-        if (httpFactory != null) {
+-            processor = httpFactory.newRequestServiceProcessor(
+-                    conn, sessionManager, workerfactory.newWorker(), callback);
+-        } else {
+-            processor = new DefaultHttpServiceProcessor(
+-                    conn, configurationContext, sessionManager, workerfactory.newWorker(), callback);
+-        }
+-
+-        processor.setParams(this.params);
++        IOProcessor processor = new HttpServiceProcessor(
++                httpService,
++                conn,
++                callback);
++        
+         addProcessor(processor);
+         this.executor.execute(processor);
+     }
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/HttpServiceProcessor.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/HttpServiceProcessor.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/HttpServiceProcessor.java	(working copy)
+@@ -29,21 +29,92 @@
+ 
+ package org.apache.axis2.transport.http.server;
+ 
++import java.io.IOException;
++import java.net.SocketException;
++import java.net.SocketTimeoutException;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.http.ConnectionClosedException;
++import org.apache.http.HttpException;
+ import org.apache.http.HttpServerConnection;
++import org.apache.http.protocol.HttpContext;
++import org.apache.http.protocol.HttpExecutionContext;
+ import org.apache.http.protocol.HttpService;
+ 
+ /**
+- * Abstract base class to process requests and fill in respnses.
++ * I/O processor intended to process requests and fill in responses.
++ * 
+  * @author Chuck Williams
+  */
++public class HttpServiceProcessor implements IOProcessor {
+ 
+-public abstract class HttpServiceProcessor extends HttpService implements IOProcessor {
++    private static final Log LOG = LogFactory.getLog(HttpServiceProcessor.class);
+     
+-    /** Create an HttpServiceProcessor
+-     * @param conn the connection we are receiving the request on
+-     */
+-    public HttpServiceProcessor(HttpServerConnection conn) {
+-        super(conn);
++    private volatile boolean terminated;
++    
++    private final HttpService httpservice;
++    private final HttpServerConnection conn;
++    private final IOProcessorCallback callback;
++    
++    public HttpServiceProcessor(
++            final HttpService httpservice, 
++            final HttpServerConnection conn,
++            final IOProcessorCallback callback) {
++        super();
++        this.httpservice = httpservice;
++        this.conn = conn;
++        this.callback = callback;
++        this.terminated = false;
+     }
++    
++    public void run() {
++        LOG.debug("New connection thread");
++        HttpContext context = new HttpExecutionContext(null);
++        try {
++            while (!Thread.interrupted() && !isDestroyed() && this.conn.isOpen()) {
++                this.httpservice.handleRequest(this.conn, context);
++            }
++        } catch (ConnectionClosedException ex) {
++            LOG.debug("Client closed connection");
++        } catch (IOException ex) {
++            if (ex instanceof SocketTimeoutException) {
++                LOG.debug(ex.getMessage());
++            } else if (ex instanceof SocketException) {
++                LOG.debug(ex.getMessage());
++            } else {
++                LOG.warn(ex.getMessage(), ex);
++            }
++        } catch (HttpException ex) {
++            if (LOG.isWarnEnabled()) {
++                LOG.warn("HTTP protocol error: " + ex.getMessage());
++            }
++        } finally {
++            destroy();
++            if (this.callback != null) {
++                this.callback.completed(this);
++            }
++        }
++    }
+ 
++    public void close() throws IOException {
++        this.conn.close();
++    }
++
++    public void destroy() {
++        if (this.terminated) {
++            return;
++        }
++        this.terminated = true;
++        try {
++            this.conn.shutdown();
++        } catch (IOException ex) {
++            LOG.debug("I/O error shutting down connection");
++        }
++    }
++
++    public boolean isDestroyed() {
++        return this.terminated;
++    }
++    
+ }
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpServiceProcessor.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpServiceProcessor.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/DefaultHttpServiceProcessor.java	(working copy)
+@@ -1,273 +0,0 @@
+-/*
+-* $HeadURL$
+-* $Revision$
+-* $Date$
+-*
+-* ====================================================================
+-*
+-*  Copyright 1999-2004 The Apache Software Foundation
+-*
+-*  Licensed under the Apache License, Version 2.0 (the "License");
+-*  you may not use this file except in compliance with the License.
+-*  You may obtain a copy of the License at
+-*
+-*      http://www.apache.org/licenses/LICENSE-2.0
+-*
+-*  Unless required by applicable law or agreed to in writing, software
+-*  distributed under the License is distributed on an "AS IS" BASIS,
+-*  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-*  See the License for the specific language governing permissions and
+-*  limitations under the License.
+-* ====================================================================
+-*
+-* This software consists of voluntary contributions made by many
+-* individuals on behalf of the Apache Software Foundation.  For more
+-* information on the Apache Software Foundation, please see
+-* <http://www.apache.org/>.
+-*/
+-package org.apache.axis2.transport.http.server;
+-
+-import java.io.IOException;
+-import java.net.SocketException;
+-import java.net.SocketTimeoutException;
+-import java.util.HashMap;
+-import java.util.Iterator;
+-
+-import javax.xml.namespace.QName;
+-
+-import org.apache.axis2.Constants;
+-import org.apache.axis2.transport.http.HTTPConstants;
+-import org.apache.axis2.addressing.AddressingHelper;
+-import org.apache.axis2.context.ConfigurationContext;
+-import org.apache.axis2.context.MessageContext;
+-import org.apache.axis2.context.SessionContext;
+-import org.apache.axis2.description.TransportInDescription;
+-import org.apache.axis2.description.TransportOutDescription;
+-import org.apache.axis2.engine.AxisEngine;
+-import org.apache.axis2.util.MessageContextBuilder;
+-import org.apache.axis2.util.UUIDGenerator;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.http.Header;
+-import org.apache.http.HttpException;
+-import org.apache.http.HttpRequest;
+-import org.apache.http.HttpResponse;
+-import org.apache.http.HttpServerConnection;
+-import org.apache.http.HttpVersion;
+-import org.apache.http.RequestLine;
+-import org.apache.http.StatusLine;
+-import org.apache.http.UnsupportedHttpVersionException;
+-import org.apache.http.impl.DefaultHttpServerConnection;
+-import org.apache.http.entity.StringEntity;
+-import org.apache.http.protocol.HttpContext;
+-import org.apache.http.protocol.ResponseConnControl;
+-import org.apache.http.protocol.ResponseContent;
+-import org.apache.http.protocol.ResponseDate;
+-import org.apache.http.protocol.ResponseServer;
+-
+-public class DefaultHttpServiceProcessor extends HttpServiceProcessor {
+-
+-    private static final Log LOG = LogFactory.getLog(DefaultHttpServiceProcessor.class);
+-    private static final Log HEADERLOG = LogFactory.getLog("org.apache.axis2.transport.http.server.wire");
+-
+-    private final ConfigurationContext configurationContext;
+-    private final SessionManager sessionManager;
+-    private final Worker worker;
+-    private final IOProcessorCallback callback;
+-    private HttpServerConnection conn;
+-
+-    private HttpContext httpcontext = null;
+-
+-    public DefaultHttpServiceProcessor(
+-            final HttpServerConnection conn,
+-            final ConfigurationContext configurationContext,
+-            final SessionManager sessionManager,
+-            final Worker worker,
+-            final IOProcessorCallback callback) {
+-        super(conn);
+-        this.conn = conn;
+-        if (worker == null) {
+-            throw new IllegalArgumentException("Worker may not be null");
+-        }
+-        if (configurationContext == null) {
+-            throw new IllegalArgumentException("Configuration context may not be null");
+-        }
+-        if (sessionManager == null) {
+-            throw new IllegalArgumentException("Session manager may not be null");
+-        }
+-        this.configurationContext = configurationContext;
+-        this.sessionManager = sessionManager;
+-        this.worker = worker;
+-        this.callback = callback;
+-
+-        // Add required protocol interceptors
+-        addInterceptor(new RequestSessionCookie());
+-        addInterceptor(new ResponseDate());
+-        addInterceptor(new ResponseServer());
+-        addInterceptor(new ResponseContent());
+-        addInterceptor(new ResponseConnControl());
+-        addInterceptor(new ResponseSessionCookie());
+-    }
+-
+-    protected void postprocessResponse(final HttpResponse response, final HttpContext context)
+-            throws IOException, HttpException {
+-        super.postprocessResponse(response, context);
+-        if (HEADERLOG.isDebugEnabled()) {
+-            HEADERLOG.debug("<< " + response.getStatusLine().toString());
+-            Header[] headers = response.getAllHeaders();
+-            for (int i = 0; i < headers.length; i++) {
+-                HEADERLOG.debug("<< " + headers[i].toString());
+-            }
+-        }
+-    }
+-
+-    protected void preprocessRequest(final HttpRequest request, final HttpContext context)
+-            throws IOException, HttpException {
+-        // As of next version of HttpCore the HTTP execution context can be retrieved 
+-        // by calling #getContext()
+-        this.httpcontext = context;
+-        super.preprocessRequest(request, context);
+-        if (HEADERLOG.isDebugEnabled()) {
+-            HEADERLOG.debug(">> " + request.getRequestLine().toString());
+-            Header[] headers = request.getAllHeaders();
+-            for (int i = 0; i < headers.length; i++) {
+-                HEADERLOG.debug(">> " + headers[i].toString());
+-            }
+-        }
+-    }
+-
+-    protected void doService(final HttpRequest request, final HttpResponse response)
+-            throws HttpException, IOException {
+-        RequestLine reqline = request.getRequestLine();
+-        if (LOG.isDebugEnabled()) {
+-            LOG.debug("Request method: " + reqline.getMethod());
+-            LOG.debug("Target URI: " + reqline.getUri());
+-        }
+-
+-        HttpVersion ver = reqline.getHttpVersion();
+-        if (!ver.lessEquals(HttpVersion.HTTP_1_1)) {
+-            throw new UnsupportedHttpVersionException("Unsupported HTTP version: " + ver);
+-        }
+-
+-        MessageContext msgContext = new MessageContext();
+-        msgContext.setIncomingTransportName(Constants.TRANSPORT_HTTP);
+-
+-        if (conn instanceof DefaultHttpConnectionFactory.Axis2HttpServerConnection) {
+-            DefaultHttpConnectionFactory.Axis2HttpServerConnection axis2Con =
+-                (DefaultHttpConnectionFactory.Axis2HttpServerConnection) conn;
+-            msgContext.setProperty(MessageContext.REMOTE_ADDR, axis2Con.getRemoteIPAddress());
+-            LOG.debug("Remote address of the connection : " + axis2Con.getRemoteIPAddress());
+-        }
+-
+-        try {
+-            TransportOutDescription transportOut = this.configurationContext.getAxisConfiguration()
+-                    .getTransportOut(new QName(Constants.TRANSPORT_HTTP));
+-            TransportInDescription transportIn = this.configurationContext.getAxisConfiguration()
+-                    .getTransportIn(new QName(Constants.TRANSPORT_HTTP));
+-
+-            msgContext.setConfigurationContext(this.configurationContext);
+-
+-            String sessionKey = (String) this.httpcontext.getAttribute(HTTPConstants.COOKIE_STRING);
+-            if (this.configurationContext.getAxisConfiguration().isManageTransportSession()) {
+-                SessionContext sessionContext = this.sessionManager.getSessionContext(sessionKey);
+-                msgContext.setSessionContext(sessionContext);
+-            }
+-            msgContext.setTransportIn(transportIn);
+-            msgContext.setTransportOut(transportOut);
+-            msgContext.setServiceGroupContextId(UUIDGenerator.getUUID());
+-            msgContext.setServerSide(true);
+-            msgContext.setProperty(Constants.Configuration.TRANSPORT_IN_URL, reqline.getUri());
+-
+-            // set the transport Headers
+-            HashMap headerMap = new HashMap();
+-            for (Iterator it = request.headerIterator(); it.hasNext();) {
+-                Header header = (Header) it.next();
+-                headerMap.put(header.getName(), header.getValue());
+-            }
+-            msgContext.setProperty(MessageContext.TRANSPORT_HEADERS, headerMap);
+-
+-            this.httpcontext.setAttribute(AxisParams.MESSAGE_CONTEXT, msgContext);
+-
+-            this.worker.service(request, response, msgContext);
+-        } catch (SocketException ex) {
+-            // Socket is unreliable. 
+-            throw ex;
+-        } catch (HttpException ex) {
+-            // HTTP protocol violation. Transport is unrelaible
+-            throw ex;
+-        } catch (Throwable e) {
+-            try {
+-                AxisEngine engine = new AxisEngine(this.configurationContext);
+-
+-                OutputBuffer outbuffer = new OutputBuffer();
+-                msgContext.setProperty(MessageContext.TRANSPORT_OUT, outbuffer.getOutputStream());
+-                msgContext.setProperty(Constants.OUT_TRANSPORT_INFO, outbuffer);
+-
+-                MessageContext faultContext = MessageContextBuilder.createFaultMessageContext(msgContext, e);
+-                // If the fault is not going along the back channel we should be 202ing
+-                if (AddressingHelper.isFaultRedirected(msgContext)) {
+-                    response.setStatusLine(new StatusLine(ver, 202, "Accepted"));
+-                } else {
+-                    response.setStatusLine(new StatusLine(ver, 500, "Internal server error"));
+-                }
+-                engine.sendFault(faultContext);
+-                response.setEntity(outbuffer);
+-            } catch (Exception ex) {
+-                if (AddressingHelper.isFaultRedirected(msgContext)) {
+-                    response.setStatusLine(new StatusLine(ver, 202, "Accepted"));
+-                } else {
+-                    response.setStatusLine(new StatusLine(ver, 500, "Internal server error"));
+-                    String msg = ex.getMessage();
+-                    StringEntity entity;
+-                    if (msg != null && msg.trim().length() != 0) {
+-                        entity = new StringEntity(msg);
+-                    } else {
+-                        entity = new StringEntity("Exception message unknown");
+-                    }
+-                    entity.setContentType("text/plain");
+-                    response.setEntity(entity);
+-                }
+-            }
+-        }
+-
+-    }
+-
+-    protected void logIOException(final IOException ex) {
+-        if (ex instanceof SocketTimeoutException) {
+-            LOG.debug(ex.getMessage());
+-        } else if (ex instanceof SocketException) {
+-            LOG.debug(ex.getMessage());
+-        } else {
+-            LOG.warn(ex.getMessage(), ex);
+-        }
+-    }
+-
+-    protected void logMessage(final String s) {
+-        LOG.debug(s);
+-    }
+-
+-    protected void logProtocolException(final HttpException ex) {
+-        if (LOG.isWarnEnabled()) {
+-            LOG.warn("HTTP protocol error: " + ex.getMessage());
+-        }
+-    }
+-
+-    public void close() throws IOException {
+-        closeConnection();
+-    }
+-
+-    public void run() {
+-        LOG.debug("New connection thread");
+-        try {
+-            while (!Thread.interrupted() && !isDestroyed() && isActive()) {
+-                handleRequest();
+-            }
+-        } finally {
+-            destroy();
+-            if (this.callback != null) {
+-                this.callback.completed(this);
+-            }
+-        }
+-    }
+-
+-}
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/HttpFactory.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/HttpFactory.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/HttpFactory.java	(working copy)
+@@ -43,11 +43,20 @@
+ import org.apache.axis2.description.TransportInDescription;
+ import org.apache.axis2.engine.ListenerManager;
+ import org.apache.axis2.transport.http.HTTPWorkerFactory;
+-import org.apache.http.HttpServerConnection;
++import org.apache.http.ConnectionReuseStrategy;
++import org.apache.http.HttpResponseFactory;
++import org.apache.http.impl.DefaultConnectionReuseStrategy;
+ import org.apache.http.impl.DefaultHttpParams;
++import org.apache.http.impl.DefaultHttpResponseFactory;
+ import org.apache.http.params.HttpConnectionParams;
+ import org.apache.http.params.HttpParams;
+ import org.apache.http.params.HttpProtocolParams;
++import org.apache.http.protocol.BasicHttpProcessor;
++import org.apache.http.protocol.HttpProcessor;
++import org.apache.http.protocol.ResponseConnControl;
++import org.apache.http.protocol.ResponseContent;
++import org.apache.http.protocol.ResponseDate;
++import org.apache.http.protocol.ResponseServer;
+ 
+ /**
+  * Factory used to configure and create the various instances required in http transports.
+@@ -243,15 +252,25 @@
+             return new HTTPWorkerFactory();
+     }
+ 
+-    /** Create a request service processor to populate the response */
+-    public HttpServiceProcessor newRequestServiceProcessor(
+-            final HttpServerConnection connection, 
+-            final SessionManager sessionManager, 
+-            final Worker worker, 
+-            final IOProcessorCallback callback) {
+-        return new DefaultHttpServiceProcessor(connection, configurationContext, sessionManager, worker, callback);
++    public HttpProcessor newHttpProcessor() {
++        BasicHttpProcessor httpProcessor = new BasicHttpProcessor();
++        httpProcessor.addInterceptor(new RequestSessionCookie());
++        httpProcessor.addInterceptor(new ResponseDate());
++        httpProcessor.addInterceptor(new ResponseServer());
++        httpProcessor.addInterceptor(new ResponseContent());
++        httpProcessor.addInterceptor(new ResponseConnControl());
++        httpProcessor.addInterceptor(new ResponseSessionCookie());
++        return new LoggingProcessorDecorator(httpProcessor);
+     }
++
++    public ConnectionReuseStrategy newConnStrategy() {
++        return new DefaultConnectionReuseStrategy();
++    }
+     
++    public HttpResponseFactory newResponseFactory() {
++        return new DefaultHttpResponseFactory();
++    }
++    
+     // *****
+     // Getters and Setters
+     // *****
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/DefaultConnectionListener.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/DefaultConnectionListener.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/DefaultConnectionListener.java	(working copy)
+@@ -32,7 +32,6 @@
+ import java.io.IOException;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+-import java.net.SocketException;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/AxisHttpService.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/AxisHttpService.java	(revision 0)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/AxisHttpService.java	(revision 0)
+@@ -0,0 +1,204 @@
++/*
++* $HeadURL$
++* $Revision$
++* $Date$
++*
++* ====================================================================
++*
++*  Copyright 1999-2004 The Apache Software Foundation
++*
++*  Licensed under the Apache License, Version 2.0 (the "License");
++*  you may not use this file except in compliance with the License.
++*  You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++*  Unless required by applicable law or agreed to in writing, software
++*  distributed under the License is distributed on an "AS IS" BASIS,
++*  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++*  See the License for the specific language governing permissions and
++*  limitations under the License.
++* ====================================================================
++*
++* This software consists of voluntary contributions made by many
++* individuals on behalf of the Apache Software Foundation.  For more
++* information on the Apache Software Foundation, please see
++* <http://www.apache.org/>.
++*/
++package org.apache.axis2.transport.http.server;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.net.SocketException;
++import java.util.HashMap;
++import java.util.Iterator;
++
++import javax.xml.namespace.QName;
++
++import org.apache.axis2.Constants;
++import org.apache.axis2.addressing.AddressingHelper;
++import org.apache.axis2.context.ConfigurationContext;
++import org.apache.axis2.context.MessageContext;
++import org.apache.axis2.context.SessionContext;
++import org.apache.axis2.description.TransportInDescription;
++import org.apache.axis2.description.TransportOutDescription;
++import org.apache.axis2.engine.AxisEngine;
++import org.apache.axis2.transport.http.HTTPConstants;
++import org.apache.axis2.util.MessageContextBuilder;
++import org.apache.axis2.util.UUIDGenerator;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.http.ConnectionReuseStrategy;
++import org.apache.http.Header;
++import org.apache.http.HttpException;
++import org.apache.http.HttpInetConnection;
++import org.apache.http.HttpRequest;
++import org.apache.http.HttpResponse;
++import org.apache.http.HttpResponseFactory;
++import org.apache.http.HttpServerConnection;
++import org.apache.http.HttpVersion;
++import org.apache.http.RequestLine;
++import org.apache.http.UnsupportedHttpVersionException;
++import org.apache.http.entity.StringEntity;
++import org.apache.http.message.BasicStatusLine;
++import org.apache.http.protocol.HttpContext;
++import org.apache.http.protocol.HttpProcessor;
++import org.apache.http.protocol.HttpService;
++
++/**
++ * This class is an extension of the defaulf HTTP service responsible for 
++ * maintaining and polulating the {@link MessageContext} for incoming Axis 
++ * requests.
++ */
++public class AxisHttpService extends HttpService {
++
++    private static final Log LOG = LogFactory.getLog(AxisHttpService.class);
++
++    private final MessageContext msgContext;
++    private final ConfigurationContext configurationContext;
++    private final SessionManager sessionManager;
++    private final Worker worker;
++  
++    public AxisHttpService(
++            final HttpProcessor httpProcessor,
++            final ConnectionReuseStrategy connStrategy,
++            final HttpResponseFactory responseFactory,
++            final ConfigurationContext configurationContext,
++            final SessionManager sessionManager,
++            final Worker worker) {
++        super(httpProcessor, connStrategy, responseFactory);
++        if (worker == null) {
++            throw new IllegalArgumentException("Worker may not be null");
++        }
++        if (configurationContext == null) {
++            throw new IllegalArgumentException("Configuration context may not be null");
++        }
++        if (sessionManager == null) {
++            throw new IllegalArgumentException("Session manager may not be null");
++        }
++        this.configurationContext = configurationContext;
++        this.sessionManager = sessionManager;
++        this.worker = worker;
++
++        this.msgContext = new MessageContext();
++        this.msgContext.setIncomingTransportName(Constants.TRANSPORT_HTTP);
++        this.msgContext.setConfigurationContext(configurationContext);
++    }
++
++    protected void doService(
++            final HttpRequest request, 
++            final HttpResponse response,
++            final HttpContext context) throws HttpException, IOException {
++        RequestLine reqline = request.getRequestLine();
++        if (LOG.isDebugEnabled()) {
++            LOG.debug("Request method: " + reqline.getMethod());
++            LOG.debug("Target URI: " + reqline.getUri());
++        }
++
++        HttpVersion ver = reqline.getHttpVersion();
++        if (!ver.lessEquals(HttpVersion.HTTP_1_1)) {
++            throw new UnsupportedHttpVersionException("Unsupported HTTP version: " + ver);
++        }
++
++        try {
++            TransportOutDescription transportOut = this.configurationContext.getAxisConfiguration()
++                    .getTransportOut(new QName(Constants.TRANSPORT_HTTP));
++            TransportInDescription transportIn = this.configurationContext.getAxisConfiguration()
++                    .getTransportIn(new QName(Constants.TRANSPORT_HTTP));
++
++            String sessionKey = (String) context.getAttribute(HTTPConstants.COOKIE_STRING);
++            if (this.configurationContext.getAxisConfiguration().isManageTransportSession()) {
++                SessionContext sessionContext = this.sessionManager.getSessionContext(sessionKey);
++                this.msgContext.setSessionContext(sessionContext);
++            }
++            this.msgContext.setTransportIn(transportIn);
++            this.msgContext.setTransportOut(transportOut);
++            this.msgContext.setServiceGroupContextId(UUIDGenerator.getUUID());
++            this.msgContext.setServerSide(true);
++            this.msgContext.setProperty(Constants.Configuration.TRANSPORT_IN_URL, reqline.getUri());
++
++            // set the transport Headers
++            HashMap headerMap = new HashMap();
++            for (Iterator it = request.headerIterator(); it.hasNext();) {
++                Header header = (Header) it.next();
++                headerMap.put(header.getName(), header.getValue());
++            }
++            this.msgContext.setProperty(MessageContext.TRANSPORT_HEADERS, headerMap);
++            this.worker.service(request, response, this.msgContext);
++        } catch (SocketException ex) {
++            // Socket is unreliable. 
++            throw ex;
++        } catch (HttpException ex) {
++            // HTTP protocol violation. Transport is unrelaible
++            throw ex;
++        } catch (Throwable e) {
++            try {
++                AxisEngine engine = new AxisEngine(this.configurationContext);
++
++                OutputBuffer outbuffer = new OutputBuffer();
++                this.msgContext.setProperty(MessageContext.TRANSPORT_OUT, outbuffer.getOutputStream());
++                this.msgContext.setProperty(Constants.OUT_TRANSPORT_INFO, outbuffer);
++
++                MessageContext faultContext = MessageContextBuilder.createFaultMessageContext(msgContext, e);
++                // If the fault is not going along the back channel we should be 202ing
++                if (AddressingHelper.isFaultRedirected(this.msgContext)) {
++                    response.setStatusLine(new BasicStatusLine(ver, 202, "Accepted"));
++                } else {
++                    response.setStatusLine(new BasicStatusLine(ver, 500, "Internal server error"));
++                }
++                engine.sendFault(faultContext);
++                response.setEntity(outbuffer);
++            } catch (Exception ex) {
++                if (AddressingHelper.isFaultRedirected(this.msgContext)) {
++                    response.setStatusLine(new BasicStatusLine(ver, 202, "Accepted"));
++                } else {
++                    response.setStatusLine(new BasicStatusLine(ver, 500, "Internal server error"));
++                    String msg = ex.getMessage();
++                    StringEntity entity;
++                    if (msg != null && msg.trim().length() != 0) {
++                        entity = new StringEntity(msg);
++                    } else {
++                        entity = new StringEntity("Exception message unknown");
++                    }
++                    entity.setContentType("text/plain");
++                    response.setEntity(entity);
++                }
++            }
++        }
++
++    }
++
++    public void handleRequest(final HttpServerConnection conn, final HttpContext context) 
++            throws IOException, HttpException {
++        if (conn instanceof HttpInetConnection) {
++            HttpInetConnection inetconn = (HttpInetConnection) conn;
++            InetAddress address = inetconn.getRemoteAddress();
++            this.msgContext.setProperty(MessageContext.REMOTE_ADDR, address.getHostAddress());
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Remote address of the connection : " + address);
++            }
++        }
++        super.handleRequest(conn, context);
++    }
++
++}
+
+Property changes on: modules/kernel/src/org/apache/axis2/transport/http/server/AxisHttpService.java
+___________________________________________________________________
+Name: svn:mime-type
+   + text/plain
+Name: svn:keywords
+   + Date Author Id Revision HeadURL
+
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/LoggingProcessorDecorator.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/LoggingProcessorDecorator.java	(revision 0)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/LoggingProcessorDecorator.java	(revision 0)
+@@ -0,0 +1,83 @@
++/*
++* $HeadURL$
++* $Revision$
++* $Date$
++*
++* ====================================================================
++*
++*  Copyright 1999-2004 The Apache Software Foundation
++*
++*  Licensed under the Apache License, Version 2.0 (the "License");
++*  you may not use this file except in compliance with the License.
++*  You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++*  Unless required by applicable law or agreed to in writing, software
++*  distributed under the License is distributed on an "AS IS" BASIS,
++*  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++*  See the License for the specific language governing permissions and
++*  limitations under the License.
++* ====================================================================
++*
++* This software consists of voluntary contributions made by many
++* individuals on behalf of the Apache Software Foundation.  For more
++* information on the Apache Software Foundation, please see
++* <http://www.apache.org/>.
++*/
++package org.apache.axis2.transport.http.server;
++
++import java.io.IOException;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.http.Header;
++import org.apache.http.HttpException;
++import org.apache.http.HttpRequest;
++import org.apache.http.HttpResponse;
++import org.apache.http.protocol.HttpContext;
++import org.apache.http.protocol.HttpProcessor;
++
++/**
++ * This class wraps an arbitrary {@link HttpProcessor} and extends it with 
++ * an additional request / response debugging service
++ */
++public class LoggingProcessorDecorator implements HttpProcessor {
++    
++    private static final Log HEADERLOG = LogFactory.getLog("org.apache.axis2.transport.http.server.wire");
++    
++    final private HttpProcessor httpProcessor;
++    
++    public LoggingProcessorDecorator(final HttpProcessor httpProcessor) {
++        super();
++        if (httpProcessor == null) {
++            throw new IllegalArgumentException("HTTP processor may not be null");
++        }
++        this.httpProcessor = httpProcessor;
++    }
++
++    public void process(final HttpRequest request, final HttpContext context) 
++            throws HttpException, IOException {
++        this.httpProcessor.process(request, context);
++        if (HEADERLOG.isDebugEnabled()) {
++            HEADERLOG.debug(">> " + request.getRequestLine().toString());
++            Header[] headers = request.getAllHeaders();
++            for (int i = 0; i < headers.length; i++) {
++                HEADERLOG.debug(">> " + headers[i].toString());
++            }
++        }
++    }
++
++    public void process(final HttpResponse response, final HttpContext context) 
++            throws HttpException, IOException {
++        this.httpProcessor.process(response, context);
++        if (HEADERLOG.isDebugEnabled()) {
++            HEADERLOG.debug("<< " + response.getStatusLine().toString());
++            Header[] headers = response.getAllHeaders();
++            for (int i = 0; i < headers.length; i++) {
++                HEADERLOG.debug("<< " + headers[i].toString());
++            }
++        }
++    }
++
++}
+
+Property changes on: modules/kernel/src/org/apache/axis2/transport/http/server/LoggingProcessorDecorator.java
+___________________________________________________________________
+Name: svn:mime-type
+   + text/plain
+Name: svn:keywords
+   + Date Author Id Revision HeadURL
+
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/OutputBuffer.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/OutputBuffer.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/OutputBuffer.java	(working copy)
+@@ -35,8 +35,9 @@
+ import org.apache.axis2.transport.OutTransportInfo;
+ import org.apache.http.Header;
+ import org.apache.http.HttpEntity;
+-import org.apache.http.io.ByteArrayBuffer;
++import org.apache.http.message.BasicHeader;
+ import org.apache.http.protocol.HTTP;
++import org.apache.http.util.ByteArrayBuffer;
+ 
+ public class OutputBuffer implements OutTransportInfo, HttpEntity {
+ 
+@@ -67,7 +68,7 @@
+     }
+ 
+     public Header getContentType() {
+-        return new Header(HTTP.CONTENT_TYPE, this.contentType);
++        return new BasicHeader(HTTP.CONTENT_TYPE, this.contentType);
+     }
+ 
+     public void consumeContent() throws IOException {
+Index: modules/kernel/src/org/apache/axis2/transport/http/server/ResponseSessionCookie.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/transport/http/server/ResponseSessionCookie.java	(revision 483446)
++++ modules/kernel/src/org/apache/axis2/transport/http/server/ResponseSessionCookie.java	(working copy)
+@@ -34,12 +34,12 @@
+ import org.apache.axis2.Constants;
+ import org.apache.axis2.context.MessageContext;
+ import org.apache.axis2.transport.http.HTTPConstants;
+-import org.apache.http.Header;
+ import org.apache.http.HttpException;
+ import org.apache.http.HttpResponse;
+ import org.apache.http.HttpResponseInterceptor;
+-import org.apache.http.io.CharArrayBuffer;
++import org.apache.http.message.BufferedHeader;
+ import org.apache.http.protocol.HttpContext;
++import org.apache.http.util.CharArrayBuffer;
+ 
+ public class ResponseSessionCookie implements HttpResponseInterceptor {
+ 
+@@ -61,20 +61,31 @@
+           sessionCookie = (String) context.getAttribute(HTTPConstants.COOKIE_STRING);
+         }
+         if (sessionCookie != null) {
+-            CharArrayBuffer buffer = new CharArrayBuffer(sessionCookie.length() + 40);
+-            buffer.append(Constants.SESSION_COOKIE);
+-            buffer.append("=");
+-            buffer.append(sessionCookie);
+-            response.addHeader(new Header(HTTPConstants.HEADER_SET_COOKIE, buffer.toString()));
+-            buffer.append("; ");
++            // Generate Netscape style cookie header
++            CharArrayBuffer buffer1 = new CharArrayBuffer(sessionCookie.length() + 40);
++            buffer1.append(HTTPConstants.HEADER_SET_COOKIE);
++            buffer1.append(": ");
++            buffer1.append(Constants.SESSION_COOKIE);
++            buffer1.append("=");
++            buffer1.append(sessionCookie);
++            response.addHeader(new BufferedHeader(buffer1));
++            
++            // Generate RFC2965 cookie2 header
++            CharArrayBuffer buffer2 = new CharArrayBuffer(sessionCookie.length() + 50);
++            buffer2.append(HTTPConstants.HEADER_SET_COOKIE2);
++            buffer2.append(": ");
++            buffer2.append(Constants.SESSION_COOKIE);
++            buffer2.append("=");
++            buffer2.append(sessionCookie);
++            buffer2.append("; ");
+             int port = response.getParams().getIntParameter(AxisParams.LISTENER_PORT, 0);
+             if (port > 0) {
+-                buffer.append("Port=\"");
+-                buffer.append(Integer.toString(port));
+-                buffer.append("\"; ");
++                buffer2.append("Port=\"");
++                buffer2.append(Integer.toString(port));
++                buffer2.append("\"; ");
+             }
+-            buffer.append("Version=1");
+-            response.addHeader(new Header(HTTPConstants.HEADER_SET_COOKIE2, buffer.toString()));
++            buffer2.append("Version=1");
++            response.addHeader(new BufferedHeader(buffer2));
+         }
+     }
+     
+Index: etc/project.properties
+===================================================================
+--- etc/project.properties	(revision 483446)
++++ etc/project.properties	(working copy)
+@@ -103,7 +103,7 @@
+ commons.logging.version=1.1
+ geronimo.spec.jms.version=1.1-rc4
+ groovy.all.version=1.0-jsr-06
+-jakarta.httpcore.version=4.0-alpha2
++jakarta.httpcore.version=4.0-alpha3
+ javamail.version=1.4
+ jaxbri.version=2.0.2
+ jaxen.version=1.1-beta-10

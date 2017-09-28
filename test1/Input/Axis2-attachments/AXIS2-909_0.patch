@@ -1,0 +1,1056 @@
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContextImpl.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContextImpl.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContextImpl.java	(working copy)
+@@ -17,10 +17,12 @@
+ package org.apache.axis2.jaxws.core;
+ 
+ import java.util.List;
++import java.util.concurrent.Executor;
+ 
+ import javax.xml.ws.handler.Handler;
+ 
+ import org.apache.axis2.client.ServiceClient;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ 
+ /**
+  * An implementation of the InvocationContext interface.
+@@ -32,6 +34,8 @@
+     private List<Handler> handlers;
+     private MessageContext requestMsgCtx;
+     private MessageContext responseMsgCtx;
++    private Executor executor;
++    private AsyncListener asyncListener;
+     
+     private ServiceClient serviceClient; //FIXME: This is temporary
+     
+@@ -83,6 +87,22 @@
+         return requestMsgCtx;
+     }
+     
++    public Executor getExecutor() {
++        return executor;
++    }
++    
++    public void setExecutor(Executor e) {
++        executor = e;
++    }
++    
++    public AsyncListener getAsyncListener() {
++        return asyncListener;
++    }
++    
++    public void setAsyncListener(AsyncListener al) {
++        asyncListener = al;
++    }
++    
+     // FIXME: This is temporary
+     public ServiceClient getServiceClient() {
+         return serviceClient;
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java	(working copy)
+@@ -16,19 +16,27 @@
+  */
+ package org.apache.axis2.jaxws.core.controller;
+ 
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+ 
+ import javax.xml.ws.AsyncHandler;
+ import javax.xml.ws.Response;
+ import javax.xml.ws.WebServiceException;
++import javax.xml.ws.Service.Mode;
+ 
+ import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.AxisFault;
+ import org.apache.axis2.addressing.EndpointReference;
+ import org.apache.axis2.client.ServiceClient;
++import org.apache.axis2.jaxws.AxisCallback;
+ import org.apache.axis2.jaxws.BindingProvider;
+ import org.apache.axis2.jaxws.core.InvocationContext;
+ import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.impl.AsyncListenerWrapper;
++import org.apache.axis2.jaxws.impl.AsyncListener;
++import org.apache.axis2.jaxws.util.Constants;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
+@@ -110,6 +118,7 @@
+                 throw new WebServiceException(e);
+             }
+             
++            // Set the response message on the response MessageContext
+             responseMsgCtx.setMessageAsOM(rspEnvelope);
+         }
+ 
+@@ -128,6 +137,46 @@
+         if (log.isDebugEnabled()) {
+             log.debug("Invocation pattern: one-way");
+         }
++        
++        // Check to make sure we at least have a valid InvocationContext
++        // and request MessageContext
++        if (ic == null) {
++            throw new WebServiceException("Cannot invoke; InvocationContext was null");
++        }
++        if (ic.getRequestMessageContext() == null) {
++            throw new WebServiceException("Cannot invoke; request MessageContext was null");
++        }
++        
++        // Setup the MessageContext for the response
++        MessageContext requestMsgCtx = ic.getRequestMessageContext();
++        
++        //TODO: Need to figure out whether or not we need to create the response
++        //MessageContext here and whether or not handlers need to be run for 
++        //one-way invocations.
++        MessageContext responseMsgCtx = new MessageContext();
++        ic.setResponseMessageContext(responseMsgCtx);
++        
++        ServiceClient client = ic.getServiceClient();        
++        if (client != null) {
++            // Get the target endpoint address and setup the TO endpoint 
++            // reference.  This tells us where the request is going.
++            String targetUrl = (String) requestMsgCtx.getProperties().get(BindingProvider.ENDPOINT_ADDRESS_PROPERTY);
++            EndpointReference toEPR = new EndpointReference(targetUrl);
++            client.getOptions().setTo(toEPR);
++            
++            // Get the SOAP Action (if needed)
++            String soapAction = getSOAPAction(requestMsgCtx);
++            client.getOptions().setAction(soapAction);
++            
++            // Use the ServiceClient to send the request.
++            try {
++                OMElement reqEnvelope = requestMsgCtx.getMessageAsOM();
++                client.fireAndForget(ServiceClient.ANON_OUT_ONLY_OP, reqEnvelope);
++            } catch (AxisFault e) {
++                throw new WebServiceException(e);
++            }
++        }
++        
+         return;
+     }
+     
+@@ -145,6 +194,102 @@
+         if (log.isDebugEnabled()) {
+             log.debug("Invocation pattern: async (callback)");
+         }
++
++        // Check to make sure we at least have a valid InvocationContext
++        // and request MessageContext
++        if (ic == null) {
++            throw new WebServiceException("Cannot invoke; InvocationContext was null");
++        }
++        if (ic.getRequestMessageContext() == null) {
++            throw new WebServiceException("Cannot invoke; request MessageContext was null");
++        }
++        
++        // Setup the MessageContext for the response
++        MessageContext requestMsgCtx = ic.getRequestMessageContext();
++        MessageContext responseMsgCtx = new MessageContext();
++        ic.setResponseMessageContext(responseMsgCtx);
++        
++        ServiceClient client = ic.getServiceClient();        
++        if (client != null) {
++            // Get the target endpoint address and setup the TO endpoint 
++            // reference.  This tells us where the request is going.
++            String targetUrl = (String) requestMsgCtx.getProperties().get(BindingProvider.ENDPOINT_ADDRESS_PROPERTY);
++            EndpointReference toEPR = new EndpointReference(targetUrl);
++            client.getOptions().setTo(toEPR);
++            
++            // Get the SOAP Action (if needed)
++            String soapAction = getSOAPAction(requestMsgCtx);
++            client.getOptions().setAction(soapAction);
++            
++            // Setup the client so that it knows whether the underlying call to
++            // Axis2 knows whether or not to start a listening port for an
++            // asynchronous response.
++            Boolean useAsyncMep = (Boolean) requestMsgCtx.getProperties().get(Constants.USE_ASYNC_MEP);
++            if((useAsyncMep != null && useAsyncMep.booleanValue()) 
++                    || client.getOptions().isUseSeparateListener()) {
++                client.getOptions().setUseSeparateListener(true);
++                client.getOptions().setTransportInProtocol("http");
++            }
++            
++            // There should be an AsyncListener that is configured and set on the
++            // InvocationContext.  We must get this and use it to wait for the 
++            // async response to come back.  The AxisCallback that is set on the 
++            // AsyncListener is the callback that Axis2 will call when the response
++            // has arrived.
++            AsyncListener listener = ic.getAsyncListener();
++            AxisCallback axisCallback = new AxisCallback();
++            listener.setAxisCallback(axisCallback);
++            
++            // Once the AsyncListener is configured, we must include that in an 
++            // AsyncListenerWrapper.  The wrapper is what will handle the lifecycle 
++            // of the listener and determine when it's started and stopped.
++            AsyncListenerWrapper<?> wrapper = new AsyncListenerWrapper<Object>(listener);
++
++            // Inside of the wrapper we must set the callback that the JAX-WS
++            // client programmer provided.  This is the user object that we 
++            // must call back on once we've done everything we need to do at
++            // the JAX-WS layer.
++            if(callback != null){
++                wrapper.setAsyncHandler(callback);
++            }
++            else {
++                throw new WebServiceException("Cannot call asynchronous invoke with null callback");
++            }
++            
++            // Get the request message from the MessageContext and send it
++            // using the ServiceClient API.
++            OMElement reqEnvelope = requestMsgCtx.getMessageAsOM();
++            try {
++                client.sendReceiveNonBlocking(ServiceClient.ANON_OUT_IN_OP, reqEnvelope, axisCallback);
++            } catch (AxisFault e) {
++                e.printStackTrace();
++                throw new WebServiceException(e);
++            }
++            
++            // Now that the request has been sent, start the listener thread so that it can
++            // catch the async response.
++            // TODO: Need to determine whether this should be done BEFORE or AFTER
++            // we send the request.  My guess is before though.
++            try {
++                // TODO:Need to figure out where we get the Executor from
++                // Can't be from the MessageContext, but should maybe be 
++                // set somewhere accessible.
++                // FIXME: This should NOT be an ExecutorService, but should just
++                // be a plain old Executor.
++                ExecutorService exec = (ExecutorService) ic.getExecutor();
++                Future<?> future = exec.submit(wrapper);
++                future.get();
++            } catch (InterruptedException e) {
++                e.printStackTrace();
++                throw new WebServiceException(e.getMessage());
++            } catch (ExecutionException e) {
++                e.printStackTrace();
++                throw new WebServiceException(e.getMessage());
++            }
++            
++            return wrapper;
++        }
++
+         return null;
+     }
+     
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java	(working copy)
+@@ -50,6 +50,11 @@
+         properties = new HashMap<String, Object>();
+     }
+     
++    public MessageContext(org.apache.axis2.context.MessageContext mc) {
++        axisMsgCtx = mc;
++        properties = new HashMap<String, Object>();
++    }
++    
+     public Map<String, Object> getProperties() {   
+         return properties;
+     }
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContext.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContext.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/core/InvocationContext.java	(working copy)
+@@ -17,10 +17,12 @@
+ package org.apache.axis2.jaxws.core;
+ 
+ import java.util.List;
++import java.util.concurrent.Executor;
+ 
+ import javax.xml.ws.handler.Handler;
+ 
+ import org.apache.axis2.client.ServiceClient;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ 
+ /**
+  * The <code>InvocationContext</code> encapsulates all of the information 
+@@ -31,16 +33,24 @@
+  */
+ public interface InvocationContext {
+ 
++    public List<Handler> getHandlers();
++    
+     public MessageContext getRequestMessageContext();
+-   
+-    public MessageContext getResponseMessageContext();
+     
+-    public List<Handler> getHandlers();
+-    
+     public void setRequestMessageContext(MessageContext ctx);
+     
++    public MessageContext getResponseMessageContext();
++    
+     public void setResponseMessageContext(MessageContext ctx);
+     
++    public Executor getExecutor();
++    
++    public void setExecutor(Executor e);
++    
++    public AsyncListener getAsyncListener();
++    
++    public void setAsyncListener(AsyncListener al);
++    
+     //FIXME: This is temporary.
+     public void setServiceClient(ServiceClient client);
+     
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisController.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisController.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisController.java	(working copy)
+@@ -43,8 +43,8 @@
+ import org.apache.axis2.context.ServiceGroupContext;
+ import org.apache.axis2.description.AxisService;
+ import org.apache.axis2.jaxws.handler.PortData;
+-import org.apache.axis2.jaxws.impl.AsyncResponse;
+-import org.apache.axis2.jaxws.impl.AsyncResponseProcessor;
++import org.apache.axis2.jaxws.impl.AsyncListenerWrapper;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.param.JAXBParameter;
+ import org.apache.axis2.jaxws.param.Parameter;
+ import org.apache.axis2.jaxws.param.ParameterFactory;
+@@ -245,11 +245,11 @@
+                 p.setJAXBContext(clientContext.getJAXBContext());
+             }
+             
+-            AsyncResponseProcessor asyncProcessor = new AsyncResponseProcessor(callback);
++            AsyncListener asyncProcessor = new AsyncListener(callback);
+             asyncProcessor.setMode((Mode) clientContext.getServiceMode());
+-            asyncProcessor.setParameter(responseParam);
++            //asyncProcessor.setParameter(responseParam);
+             
+-            AsyncResponse<?> response = new AsyncResponse<Object>(asyncProcessor);
++            AsyncListenerWrapper<?> response = new AsyncListenerWrapper<Object>(asyncProcessor);
+             if(asynchandler !=null){
+                 response.setAsyncHandler(asynchandler);
+             }
+@@ -276,7 +276,7 @@
+     }
+     
+     public Response invokeAsync(Parameter param, Map requestContext)throws WebServiceException{
+-    	AsyncResponse<Object>  response= (AsyncResponse<Object>)invokeAsync(param, null, requestContext);
++    	AsyncListenerWrapper<Object>  response= (AsyncListenerWrapper<Object>)invokeAsync(param, null, requestContext);
+         return response;
+     }
+     
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListener.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListener.java	(revision 0)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListener.java	(revision 0)
+@@ -0,0 +1,91 @@
++/*
++ * Copyright 2004,2005 The Apache Software Foundation.
++ * Copyright 2006 International Business Machines Corp.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.axis2.jaxws.impl;
++
++import java.util.concurrent.Callable;
++
++import javax.xml.ws.Service.Mode;
++
++import org.apache.axiom.om.OMElement;
++import org.apache.axis2.jaxws.AxisCallback;
++import org.apache.axis2.jaxws.core.MessageContext;
++
++
++/**
++ * The AsyncListener is responsible for holding the callback that was passed
++ * to the Axis2 client and waiting for that async response to come back.  Once 
++ * the response comes back, the AsyncListener will perform whatever function is
++ * needed by the JAX-WS layer before returning.
++ * 
++ * This class implements the Callable interface and is what will be called by
++ * the execute() method of the client's Executor.
++ */
++public class AsyncListener implements Callable {
++
++    protected AxisCallback axisCallback;
++    protected Mode mode;
++    
++    public AsyncListener() {
++        //do nothing
++    }
++    
++    public AsyncListener(AxisCallback cb) {
++        axisCallback = cb;
++    }
++    
++    public void setAxisCallback(AxisCallback cb) {
++        axisCallback = cb;
++    }
++    
++    //TODO: This will probably be removed or at least made a little more 
++    //clear since it's only the Dispatch that's concerned with the mode.
++    public void setMode(Mode m) {
++        mode = m;
++    }
++    
++    /**
++     * This method will be called to collect the async response from Axis2.  
++     */
++    public Object call() throws Exception {
++        if (axisCallback != null) {
++            while (!axisCallback.isComplete()) {
++                //TODO: The wait period should probably be configurable
++                Thread.sleep(1000);
++            }
++            
++            MessageContext responseMsgCtx = axisCallback.getResponseMessageContext();
++            Object responseObj = getResponseValueObject(responseMsgCtx);
++            return responseObj;            
++        }
++        else {
++            //throw an Exception
++        }
++        
++        return null;
++    }
++    
++    /**
++     * A default implementation of this method that returns the contents
++     * of the message in the form of an XML String.  Subclasses should override
++     * this to convert the response message into whatever format they require.
++     * @param msg
++     */
++    protected Object getResponseValueObject(MessageContext mc) {
++        OMElement msg = mc.getMessageAsOM();
++        return msg.toString();
++    }
++}
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListenerWrapper.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListenerWrapper.java	(revision 421341)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncListenerWrapper.java	(working copy)
+@@ -24,17 +24,19 @@
+ import javax.xml.ws.Response;
+ 
+ /**
+- * The AsyncResponse class is the object that a JAX-WS callback, implemented
+- * using the AsyncHandler API, will recieve.  The AsyncResponse encapsulates the 
+- * context of the response so that the user's handler can read any available
+- * contextual data.
++ * The AsyncListenerWrapper is what wraps the AsyncListener that waits for
++ * the response.  The AsyncListenerWrapper controls the lifecycle of the 
++ * listener, determining when it is started and stopped.
++ * 
++ * The wrapper is also the item that will call the users AsyncHandler that
++ * they provided when they made the asynchronous call.
+  */
+-public class AsyncResponse<T> extends FutureTask<T> implements Response<T> {
++public class AsyncListenerWrapper<T> extends FutureTask<T> implements Response<T> {
+ 
+     private Map<String, Object> responseCtx;
+     private AsyncHandler asyncHandler;
+     
+-    public AsyncResponse(Callable<T> processor) {
++    public AsyncListenerWrapper(Callable<T> processor) {
+         super(processor);
+     }
+     
+@@ -55,5 +57,4 @@
+             }
+         }
+     }
+-
+ }
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponse.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponse.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponse.java	(working copy)
+@@ -1,59 +0,0 @@
+-/*
+- * Copyright 2004,2005 The Apache Software Foundation.
+- * Copyright 2006 International Business Machines Corp.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.axis2.jaxws.impl;
+-
+-import java.util.Map;
+-import java.util.concurrent.Callable;
+-import java.util.concurrent.FutureTask;
+-
+-import javax.xml.ws.AsyncHandler;
+-import javax.xml.ws.Response;
+-
+-/**
+- * The AsyncResponse class is the object that a JAX-WS callback, implemented
+- * using the AsyncHandler API, will recieve.  The AsyncResponse encapsulates the 
+- * context of the response so that the user's handler can read any available
+- * contextual data.
+- */
+-public class AsyncResponse<T> extends FutureTask<T> implements Response<T> {
+-
+-    private Map<String, Object> responseCtx;
+-    private AsyncHandler asyncHandler;
+-    
+-    public AsyncResponse(Callable<T> processor) {
+-        super(processor);
+-    }
+-    
+-    public void setAsyncHandler(AsyncHandler ah) {
+-        asyncHandler = ah;
+-    }
+-    
+-    public Map<String, Object> getContext() {
+-        return responseCtx;
+-    }
+-    
+-    protected void done() {
+-        super.done();
+-        
+-        if(!isCancelled()){
+-            if(asyncHandler != null){
+-                asyncHandler.handleResponse(this);
+-            }
+-        }
+-    }
+-
+-}
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponseProcessor.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponseProcessor.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/impl/AsyncResponseProcessor.java	(working copy)
+@@ -1,71 +0,0 @@
+-/*
+- * Copyright 2004,2005 The Apache Software Foundation.
+- * Copyright 2006 International Business Machines Corp.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.axis2.jaxws.impl;
+-
+-import java.util.concurrent.Callable;
+-
+-import javax.xml.ws.Service.Mode;
+-
+-import org.apache.axis2.jaxws.AxisCallback;
+-import org.apache.axis2.jaxws.param.Parameter;
+-
+-
+-/**
+- * The AsyncResponseProcessor is responsible for collecting the async response
+- * from Axis2 and saving the value of the response.  This is should be called
+- * from within the Executor configured by the JAX-WS Service (or ServiceDelegate).
+- */
+-public class AsyncResponseProcessor implements Callable {
+-
+-    private AxisCallback axisCallback;
+-    private Mode mode;
+-    private Parameter param;
+-    
+-    public AsyncResponseProcessor(AxisCallback cb) {
+-        axisCallback = cb;
+-    }
+-    
+-    public void setMode(Mode m) {
+-        mode = m;
+-    }
+-    
+-    //TODO: Need to re-work Parameter usage so that we're not using the same instance.
+-    //Should be based off of parameter types so that we're not possibly contaminating a 
+-    //previous object.
+-    public void setParameter(Parameter p) {
+-        param = p;
+-    }
+-    
+-    /**
+-     * This method will be called to collect the async response from Axis2.  
+-     */
+-    public Object call() throws Exception {
+-        if (axisCallback != null) {
+-            while (!axisCallback.isComplete()) {
+-                //System.out.println(">> AsyncResponseProcessor - waiting for response");
+-                //TODO: The wait period should probably be configurable
+-                Thread.sleep(1000);
+-            }
+-            
+-            //System.out.println(">> AsyncResponseProcessor - response received, processing");
+-            param.fromEnvelope(mode, axisCallback.getSOAPEnvelope());
+-            return param.getValue();            
+-        }
+-        
+-        return null;
+-    }
+-}
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java	(working copy)
+@@ -17,29 +17,53 @@
+ 
+ package org.apache.axis2.jaxws;
+ 
+-import org.apache.axiom.soap.SOAPEnvelope;
++import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.client.async.AsyncResult;
+ import org.apache.axis2.client.async.Callback;
+-import org.apache.axis2.context.MessageContext;
++import org.apache.axis2.jaxws.core.MessageContext;
+ 
++/**
++ * The AxisCallback is the touch point for asynchronous invocations 
++ * between the Axis2 runtime and the JAX-WS implementation.  This
++ * object will be handed to the ServiceClient/OperationClient APIs
++ * to use in processing the async response.
++ * 
++ * The AxisCallback is responsible for taking the incoming message and
++ * MessageContext from Axis2 and turning that into a MessageContext
++ * that can be used by the JAX-WS implementation.
++ */
+ public class AxisCallback extends Callback {
+ 
+-    private SOAPEnvelope responseEnv;
+     private MessageContext responseMsgCtx;
+     
++    /**
++     * This method will be called when the Axis2 implementation is
++     * ready to send the async response back to the client.
++     */
+     public void onComplete(AsyncResult result) {
+-        responseEnv = result.getResponseEnvelope();
+-        responseMsgCtx = result.getResponseMessageContext();
++        org.apache.axis2.context.MessageContext axisMsgCtx = 
++            result.getResponseMessageContext();
++        responseMsgCtx = new MessageContext(axisMsgCtx);
++        
++        try {
++            OMElement responseEnv = result.getResponseEnvelope();
++            responseMsgCtx.setMessageAsOM(responseEnv);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
+     }
+ 
++    // FIXME: Figure out what needs to be done when this method is called
++    // and we've received an error from Axis2.
+     public void onError(Exception e) {
+         e.printStackTrace();
+     }
+     
+-    public SOAPEnvelope getSOAPEnvelope() {
+-        return responseEnv;
+-    }
+-    
++    /**
++     * Returns the <@link org.apache.axis2.jaxws.core.MessageContext> that was
++     * created for the response message.
++     * @return - a MessageContext with the response contents
++     */
+     public MessageContext getResponseMessageContext() {
+         return responseMsgCtx;
+     }
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatch.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatch.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatch.java	(working copy)
+@@ -18,6 +18,7 @@
+ 
+ import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.jaxws.AxisController;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.param.Parameter;
+ import org.apache.axis2.jaxws.param.ParameterFactory;
+ 
+@@ -33,6 +34,13 @@
+         super(ac);
+     }
+     
++    public AsyncListener createAsyncListener() {
++        XMLDispatchAsyncListener al = new XMLDispatchAsyncListener();
++        al.setMode(mode);
++        al.setType(type);
++        return al;
++    }
++    
+     public OMElement createMessageFromValue(Object value) {
+         type = value.getClass();
+         
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatch.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatch.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatch.java	(working copy)
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.jaxws.AxisController;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.param.JAXBParameter;
+ import org.apache.axis2.jaxws.param.Parameter;
+ 
+@@ -35,6 +36,21 @@
+         super(ac);
+     }
+     
++    public JAXBContext getJAXBContext() {
++        return jaxbContext;
++    }
++    
++    public void setJAXBContext(JAXBContext jbc) {
++        jaxbContext = jbc;
++    }
++    
++    public AsyncListener createAsyncListener() {
++        JAXBDispatchAsyncListener listener = new JAXBDispatchAsyncListener();
++        listener.setJAXBContext(jaxbContext);
++        listener.setMode(mode);
++        return listener;
++    }
++    
+     public OMElement createMessageFromValue(Object value) {
+         // FIXME: This is where the Message Model will be integrated instead of 
+         // the ParameterFactory/Parameter APIs.
+@@ -56,12 +72,4 @@
+                 axisController.getServiceClient().getOptions().getSoapVersionURI());
+         return p.getValue();
+     }
+-
+-    public JAXBContext getJAXBContext() {
+-        return jaxbContext;
+-    }
+-    
+-    public void setJAXBContext(JAXBContext jbc) {
+-        jaxbContext = jbc;
+-    }
+ }
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java	(revision 0)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java	(revision 0)
+@@ -0,0 +1,43 @@
++package org.apache.axis2.jaxws.client;
++
++import javax.xml.ws.Service.Mode;
++
++import org.apache.axiom.soap.SOAPEnvelope;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.impl.AsyncListener;
++import org.apache.axis2.jaxws.param.Parameter;
++import org.apache.axis2.jaxws.param.ParameterFactory;
++import org.apache.axis2.jaxws.param.ParameterUtils;
++
++/**
++ * The XMLDispatchAsyncListener is an extension of the  
++ * {@link org.apache.axis2.jaxws.impl.AsyncListener} class to provide 
++ * proper deserialization into the target format (XML String or Source).
++ */
++public class XMLDispatchAsyncListener extends AsyncListener {
++
++    private Mode mode;
++    private Class type;
++    
++    public XMLDispatchAsyncListener() {
++        super();
++    }
++    
++    public void setMode(Mode m) {
++        mode = m;
++    }
++    
++    public void setType(Class t) {
++        type = t;
++    }
++    
++    protected Object getResponseValueObject(MessageContext mc) {
++        // FIXME: This is where the Message Model will be integrated instead of 
++        // the ParameterFactory/Parameter APIs.
++        SOAPEnvelope msg = (SOAPEnvelope) mc.getMessageAsOM();
++        
++        Parameter param = ParameterFactory.createParameter(type);
++        ParameterUtils.fromEnvelope(mode, msg, param);
++        return param.getValue();
++    }
++}
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java	(revision 0)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java	(revision 0)
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2006 The Apache Software Foundation.
++ * Copyright 2006 International Business Machines Corp.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.axis2.jaxws.client;
++
++import javax.xml.bind.JAXBContext;
++import javax.xml.ws.Service.Mode;
++
++import org.apache.axiom.soap.SOAPEnvelope;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.impl.AsyncListener;
++import org.apache.axis2.jaxws.param.JAXBParameter;
++import org.apache.axis2.jaxws.param.ParameterUtils;
++
++/**
++ * The JAXBDispatchAsyncListener is an extension of the  
++ * {@link org.apache.axis2.jaxws.impl.AsyncListener} class to provide JAX-B
++ * specific function when processing an async response.
++ */
++public class JAXBDispatchAsyncListener extends AsyncListener {
++    
++    private Mode mode;
++    private JAXBContext jaxbContext;
++    
++    public JAXBDispatchAsyncListener() {
++        super();
++    }
++    
++    public void setMode(Mode m) {
++        mode = m;
++    }
++    
++    public void setJAXBContext(JAXBContext jbc) {
++        jaxbContext = jbc;
++    }
++    
++    public Object getResponseValueObject(MessageContext mc) {
++        // FIXME: This is where the Message Model will be integrated instead of 
++        // the ParameterFactory/Parameter APIs.
++        SOAPEnvelope msg = (SOAPEnvelope) mc.getMessageAsOM();
++        
++        JAXBParameter param = new JAXBParameter();
++        param.setJAXBContext(jaxbContext);
++        ParameterUtils.fromEnvelope(mode, msg, param);
++        
++        return param.getValue();
++    }
++}
+Index: C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java	(revision 423506)
++++ C:/work/apps/eclipse/workspace/axis2-clean/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java	(working copy)
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.axis2.jaxws.client;
+ 
++import java.util.concurrent.Executor;
+ import java.util.concurrent.Future;
+ 
+ import javax.xml.namespace.QName;
+@@ -34,16 +35,21 @@
+ import org.apache.axis2.jaxws.core.MessageContext;
+ import org.apache.axis2.jaxws.core.controller.AxisInvocationController;
+ import org.apache.axis2.jaxws.core.controller.InvocationController;
++import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.param.Parameter;
+ import org.apache.axis2.jaxws.param.ParameterFactory;
+ import org.apache.axis2.jaxws.param.ParameterUtils;
+ import org.apache.axis2.jaxws.spi.ServiceDelegate;
+ import org.apache.axis2.jaxws.util.Constants;
+ import org.apache.axis2.jaxws.util.WSDLWrapper;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ 
+ public abstract class BaseDispatch<T> extends BindingProvider 
+     implements javax.xml.ws.Dispatch {
+ 
++    private Log log = LogFactory.getLog(BaseDispatch.class);
++    
+     //FIXME: Remove the AxisController completely and replace with InvocationController
+     protected AxisController axisController = null;
+     
+@@ -52,7 +58,7 @@
+     protected Mode mode;
+     
+     protected BaseDispatch() {
+-        //do nothing
++        super();
+     }
+     
+     protected BaseDispatch(AxisController ac) {
+@@ -65,11 +71,37 @@
+         setRequestContext();
+     }
+     
++    /**
++     * Take the input object and turn it into an OMElement so that it can
++     * be sent.
++     * 
++     * @param value
++     * @return
++     */
+     protected abstract OMElement createMessageFromValue(Object value);
+     
++    /**
++     * Given a message, return the business object based on the requestor's
++     * required format (PAYLOAD vs. MESSAGE) and datatype.
++     * 
++     * @param message
++     * @return
++     */
+     protected abstract Object getValueFromMessage(OMElement message);
+     
++    /**
++     * Creates an instance of the AsyncListener that is to be used for waiting
++     * for async responses.
++     * 
++     * @return a configured AsyncListener instance
++     */
++    protected abstract AsyncListener createAsyncListener();
++    
+     public Object invoke(Object obj) throws WebServiceException {
++        if (log.isDebugEnabled()) { 
++            log.debug("Entered synchronous invocation: BaseDispatch.invoke()");
++        }
++        
+         // Create the InvocationContext instance for this request/response flow.
+         InvocationContext invocationContext = InvocationContextFactory.createInvocationContext(null);
+         invocationContext.setServiceClient(axisController.getServiceClient());
+@@ -94,31 +126,82 @@
+         OMElement rspEnvelope = responseMsgCtx.getMessageAsOM();
+         Object returnObj = getValueFromMessage(rspEnvelope);
+         
++        if (log.isDebugEnabled()) {
++            log.debug("Synchronous invocation completed: BaseDispatch.invoke()");
++        }
++        
+         return returnObj;
+     }
+     
+-   public void invokeOneWay(Object obj) throws WebServiceException{
+-       if(obj == null){
+-            throw new WebServiceException("Dispatch Cannot Invoke SEI with null object");
++    public void invokeOneWay(Object obj) throws WebServiceException{
++        if (log.isDebugEnabled()) { 
++            log.debug("Entered one-way invocation: BaseDispatch.invokeOneWay()");
+         }
+-        try{
+-            Parameter param = ParameterFactory.createParameter(obj);
+-            axisController.invokeOneWay(param, requestContext);
+-        }catch(Exception e){
+-            throw new WebServiceException(e);
++       
++        // Create the InvocationContext instance for this request/response flow.
++        InvocationContext invocationContext = InvocationContextFactory.createInvocationContext(null);
++        invocationContext.setServiceClient(axisController.getServiceClient());
++       
++        // Create the MessageContext to hold the actual request message and its
++        // associated properties
++        MessageContext requestMsgCtx = new MessageContext();
++        invocationContext.setRequestMessageContext(requestMsgCtx);
++       
++        OMElement reqEnvelope = createMessageFromValue(obj);
++        requestMsgCtx.setMessageAsOM(reqEnvelope);
++       
++        // Copy the properties from the request context into the MessageContext
++        requestMsgCtx.getProperties().putAll(requestContext);
++       
++        // Send the request using the InvocationController
++        ic.invokeOneWay(invocationContext);
++       
++        if (log.isDebugEnabled()) {
++            log.debug("One-way invocation completed: BaseDispatch.invokeOneWay()");
+         }
++       
++        return;
+     }
+    
+     public Future<?> invokeAsync(Object obj, AsyncHandler asynchandler) throws WebServiceException {
+-       if(obj == null){
+-           throw new WebServiceException("Dispatch Cannot Invoke SEI with null object");
+-       }
+-       try{
+-           Parameter param = ParameterFactory.createParameter(obj);
+-           return axisController.invokeAsync(param, asynchandler, requestContext);
+-       } catch(Exception e) {
+-           throw new WebServiceException(e);
+-       }
++        if (log.isDebugEnabled()) { 
++            log.debug("Entered asynchronous (callback) invocation: BaseDispatch.invokeAsync()");
++        }
++        
++        // Create the InvocationContext instance for this request/response flow.
++        InvocationContext invocationContext = InvocationContextFactory.createInvocationContext(null);
++        invocationContext.setServiceClient(axisController.getServiceClient());
++        
++        // Create the MessageContext to hold the actual request message and its
++        // associated properties
++        MessageContext requestMsgCtx = new MessageContext();
++        invocationContext.setRequestMessageContext(requestMsgCtx);
++        
++        OMElement reqEnvelope = createMessageFromValue(obj);
++        requestMsgCtx.setMessageAsOM(reqEnvelope);
++        
++        // Copy the properties from the request context into the MessageContext
++        requestMsgCtx.getProperties().putAll(requestContext);
++
++        // Setup the Executor that will be used to drive async responses back to 
++        // the client.
++        // FIXME: We shouldn't be getting this from the ServiceDelegate, rather each 
++        // Dispatch object should have it's own.
++        Executor e = serviceDelegate.getExecutor();
++        invocationContext.setExecutor(e);
++        
++        // Create the AsyncListener that is to be used by the InvocationController.
++        AsyncListener listener = createAsyncListener();
++        invocationContext.setAsyncListener(listener);
++        
++        // Send the request using the InvocationController
++        Future<?> asyncResponse = ic.invokeAsync(invocationContext, asynchandler);
++        
++        if (log.isDebugEnabled()) {
++            log.debug("Asynchronous (callback) invocation sent: BaseDispatch.invokeOneWay()");
++        }
++        
++        return asyncResponse;
+     }
+   
+     public Response invokeAsync(Object obj)throws WebServiceException{
+@@ -133,6 +216,8 @@
+         }
+     }
+     
++    //FIXME: This needs to be moved up to the BindingProvider and should actually
++    //be called "initRequestContext()" or something like that.
+     protected void setRequestContext(){
+         String endPointAddress = axisController.getEndpointAddress();
+         WSDLWrapper wsdl =  axisController.getWSDLContext();

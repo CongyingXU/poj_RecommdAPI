@@ -301,8 +301,10 @@ def getall_result():
     sheet1 = workbook.sheet_by_name('sheet1')
     #因为数据量小，所以代码没有优化，
     #正式使用前，一定会要  优化！！！！
+    ######################################
     All_result={}
-    for i in range(4,1004):
+    data = range(904,1004)# + range(204,1004)
+    for i in data:
         newReportissueKey=sheet.cell(i,1).value.encode('utf-8')
         newReportSummary=sheet.cell(i,2).value.encode('utf-8')
         newReportDescription=sheet.cell(i,28).value.encode('utf-8')
@@ -328,7 +330,7 @@ def getFinal_result(All_result , weights):
             all_result0= weights[0]*result[1][i] +weights[1]*result[2][i] +weights[2]*result[3][i] +weights[3]*result[4][i]
             + weights[4]*result[5][i] +weights[5]*result[6][i] +weights[6]*result[7][i] +weights[7]*result[8][i] 
             all_result[result[0][i]] = all_result0
-        all_result = sorted(all_result.iteritems(), key = lambda asd:asd[1], reverse = True)
+        #all_result = sorted(all_result.iteritems(), key = lambda asd:asd[1], reverse = True)
         Final_result[key]= all_result
     return Final_result #{ issuekey:[(.java , 分数) 。。。。。  ] }
 

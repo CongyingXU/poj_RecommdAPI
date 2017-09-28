@@ -22,6 +22,8 @@ import getStrucCmptScors
 #                                 ......
 #                                [ "  ","  ","  " ] 】
 def Info_IO():
+    ##########################################
+    #注意文件名   序号的修改
     dir0 = 'Output/FeaturnLocation_result.xls' 
     workbook0 = xlrd.open_workbook(dir0,'r')
     sheet0 = workbook0.sheet_by_name('sheet1')
@@ -35,7 +37,7 @@ def Info_IO():
 def getRelatedSrcfile(issuekey ,sheet0):
     #从feation location中，得到结果
     RelatedSrcfile_list= []
-    for i in range(1,sheet0.nrows):
+    for i in range(2,sheet0.nrows):
         if sheet0.cell(i,0).value == issuekey:
             j=1
             while 1:
@@ -79,7 +81,7 @@ def get_allAPI_info():
     allAPI_info_list.append(API)
     return allAPI_info_list
 
-def computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights ):
+def computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ):
     #text0_list:类名 方法名 参数名    因为相似度计算是 列表存的words
     #text1_list:注释
     text0_list = []
@@ -94,6 +96,9 @@ def computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights ):
     text0_result = getStrucCmptScors.Half_computeSimilarity(text0_list,APIinfo_list)
     text1_result = getStrucCmptScors.Half_computeSimilarity(text1_list,APIinfo_list)
     
+    return APIinfo_list,text0_result,text1_result
+"""
+def computeFinal_SimilarScores(weights):
     SimilarScores_dict = {}
     for i in range(len(APIinfo_list)):
         API = APIinfo_list[i][0]  + '.' + APIinfo_list[i][1]
@@ -105,15 +110,63 @@ def computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights ):
           
     SimilarScores = sorted(SimilarScores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
     return SimilarScores#列表类型，【 （key，value） 】
-        
-def main(issuekey , weights):
-    sheet0,sheet1 = Info_IO()
+    #不使用列表的原因，后期直接根据  键找分数
+    
+"""
+def computeFinal_SimilarScores(weights):
+    SimilarScores_dict = {}
+    for i in range(len(APIinfo_list)):
+        API = APIinfo_list[i][0]  + '.' + APIinfo_list[i][1]
+        score = text0_result[i]*weights[0] + text1_result[i]*weights[1]
+        if SimilarScores_dict.has_key(API) and  SimilarScores_dict[API] >= score:
+           pass
+        else:
+           SimilarScores_dict[API] = score
+          
+    #SimilarScores = sorted(SimilarScores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
+    return SimilarScores_dict#列表类型，【 （key，value） 】
+
+
+#这样零散得放置便于调参数
+
+
+sheet0,sheet1 = Info_IO()
+allAPI_info_list = get_allAPI_info()
+workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+sheet = workbook.sheet_by_name('general_report')
+###########################################################
+#调节范围
+num_list = range(104,1004)
+
+for i in num_list:
+    issuekey = sheet.cell(i,1).value.encode('utf-8') 
     RelatedSrcfile_list = getRelatedSrcfile(issuekey ,sheet0)
     RelatedSrcfileinfo_dict = getRelatedSrcfile_info(RelatedSrcfile_list ,sheet1 )
-    allAPI_info_list = get_allAPI_info()
-    SimilarScores = computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights )
-    
-    return SimilarScores
 
-if __name__=='__main__':
-    print main(issuekey , weights)
+APIinfo_list,text0_result,text1_result = computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list )
+
+def main( weights):
+    ALL_SimilarScores_dict = {}
+    SimilarScores_dict = computeFinal_SimilarScores(weights)
+    ALL_SimilarScores_dict[issuekey] =  SimilarScores_dict
+    return ALL_SimilarScores_dict
+
+"""
+def main(num_list , weights):
+    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+    sheet = workbook.sheet_by_name('general_report')
+    ###########################################################
+    #调节范围
+    SimilarScores_dict={}
+    for i in num_list:
+        issuekey = sheet.cell(i,1).value.encode('utf-8')
+        RelatedSrcfile_list = getRelatedSrcfile(issuekey ,sheet0)
+        RelatedSrcfileinfo_dict = getRelatedSrcfile_info(RelatedSrcfile_list ,sheet1 )
+        SimilarScores = computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list ,weights )
+        SimilarScores_dict[issuekey] = SimilarScores
+    return SimilarScores_dict
+"""
+
+
+#if __name__=='__main__':
+#    print main(issuekey , weights)

@@ -192,12 +192,14 @@ def main():
     newReportLinkedissue=['']  #列表类型，表格中是以’，‘号分割的字符串;若没有，则为【‘’】
     """
 def getnewreportInfo():
-    oldReports_dir='/Users/apple/Documents/API推荐项目/hbase/Hbase.xlsx'
+    oldReports_dir='Input/Hbase.xlsx'
     workbook = xlrd.open_workbook(oldReports_dir,'r')
     sheet1 = workbook.sheet_by_name('general_report')
     #print sheet1.cell(6,28).value.encode('utf-8')
     All_newreportinfo=[]
-    for i in range(4,1004):
+    
+    data = range(904,1004)# + range(204,1004)
+    for i in data:
         print i
         newReportSummary=sheet1.cell(i,2).value.encode('utf-8')
         newReportDescription=sheet1.cell(i,28).value.encode('utf-8')
@@ -272,7 +274,7 @@ def getnewreportInfo():
     return  All_newreportinfo
        
 def getOldreportsInfo():
-    oldReports_dir='/Users/apple/Documents/API推荐项目/hbase/Hbase.xlsx'
+    oldReports_dir='Input/Hbase.xlsx'
     workbook = xlrd.open_workbook(oldReports_dir,'r')
     sheet1 = workbook.sheet_by_name('general_report')
     
@@ -560,9 +562,11 @@ def getFinalResultsbyWeights(All_result,weights,issuekey_file_num,issuekey_file_
         for key in file_num_dict:
             file_scores_dict[key] = file_num_dict[key]/float(k)
             
-        file_scores_list = sorted(file_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
+        #file_scores_list = sorted(file_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
         
-        Result_dict[newReportIssueKey] = file_scores_list
+        #Result_dict[newReportIssueKey] = file_scores_list
+        Result_dict[newReportIssueKey] = file_scores_dict
+        
     return Result_dict
     #print result_dict    
     #print time()
@@ -605,6 +609,87 @@ def getFinalResultsbyWeights(All_result,weights,issuekey_file_num,issuekey_file_
     #end = time()
     #print "Total procesing time: %d seconds" % (end - begin)
     
+
+#IssueKey 找到对应使用过的API
+def getIssueKey_UsedAPIinfo():
+    issuekey_UsedAPI_num = {}  #用于存放 issuekey及其对应 修复文件的个数
+    issuekey_UsedAPI_list = {} #存放  issuekey，及其对应 修复文件   0个时，不放入其中
+    
+    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xlsx')
+    sheet = workbook.sheet_by_name('sheet1')
+
+    for j in range(1,sheet.nrows):
+        issuekey=sheet.cell(j,0).value
+        if sheet.cell(j,1).value=='':
+            issuekey_UsedAPI_num[issuekey] = 0
+        else:
+            issuekey_UsedAPI_num[issuekey] = len( sheet.cell(j,1).value.split(';') )
+            issuekey_UsedAPI_list[issuekey] = sheet.cell(j,1).value.split(';')
+    return issuekey_UsedAPI_num,issuekey_UsedAPI_list
+    
+#得到最终  issuekey——API的分数
+def getFinalAPIResultsbyWeights(All_result,weights,issuekey_UsedAPI_num,issuekey_UsedAPI_list):#这里已经当作  多个计算处理了
+    Result_dict={}
+    #权重
+    a=weights
+    for all_result in All_result:
+        result_dict={}
+        D2D_result = all_result[0]
+        S2S_result = all_result[1]
+        SD2SD_result = all_result[2]
+        Comp_result = all_result[3]
+        Rpoter_result = all_result[4]
+        Prio_result = all_result[5]
+        OldIssueKey = all_result[6]
+        Llediss_result = all_result[7]
+        newReportIssueKey = all_result[8]
+        #a=[0.38 , 0.29 , 0.36 , 0.20 , 0.23 , 0.60 , 0.5]
+        Final_SimlarScors2Reports=[]
+        for i in range(len(Llediss_result)):
+            score = a[0]*S2S_result[i] + a[1]*D2D_result[i] + a[2]*SD2SD_result[i] + a[3]*Rpoter_result[i]+ a[4]*Comp_result[i]+ a[5]*Prio_result[i] + a[6]*Llediss_result[i]
+            Final_SimlarScors2Reports.append( score )
+            result_dict[ OldIssueKey[i] ]=score
+        result_list = sorted(result_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
+        #列表类型，【 （key，value） 】
+        
+        """
+        #根据排名靠前的report 找到使用的API
+        issuekey_UsedAPI_num = {}  #用于存放 issuekey及其对应 修复文件的个数
+        issuekey_UsedAPI_list = {} #存放  issuekey，及其对应 修复文件   0个时，不放入其中
+        """
+        k = 15
+        num = 0 
+        topk_result_report = []
+        for i in range(len(result_list)):
+            if num >= k:
+                break
+            elif issuekey_UsedAPI_num[result_list[i][0]] > 0:
+                if result_list[i][0] == newReportIssueKey:#去掉自己
+                    continue  
+                topk_result_report.append(result_list[i][0])
+                num = num + 1
+                
+        API_num_dict = {}
+        for key in issuekey_UsedAPI_list:
+            if key in topk_result_report:
+                for file0 in issuekey_UsedAPI_list[key]:
+                    if API_num_dict.has_key(file0):
+                        API_num_dict[file0] = API_num_dict[file0] +1
+                    else:
+                        API_num_dict[file0] = 1
+            
+        API_scores_dict ={}###为该词的结果
+        for key in API_num_dict:
+            API_scores_dict[key] = API_num_dict[key]/float(k)
+            
+        API_scores_list = sorted(API_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
+        
+        Result_dict[newReportIssueKey] = API_scores_list
+        
+    return Result_dict
+
+    
+    
 def getAll_Info():#用于调参数
     All_newreportinfo = getnewreportInfo()
     oldreportsInfo = getOldreportsInfo()
@@ -620,8 +705,7 @@ def getAll_Info():#用于调参数
 
 def main(weights):
     
-    begin = time()
-    
+    #begin = time()
     #weights = [0.38 , 0.29 , 0.36 , 0.20 , 0.23 , 0.60 , 0.5]
     All_newreportinfo = getnewreportInfo()
     oldreportsInfo = getOldreportsInfo()
@@ -636,6 +720,22 @@ def main(weights):
     
     #end = time()
     #print "Total procesing time: %d seconds" % (end - begin)
+ 
+def main_API(weights):
+    
+    #begin = time()
+    #weights = [0.38 , 0.29 , 0.36 , 0.20 , 0.23 , 0.60 , 0.5]
+    All_newreportinfo = getnewreportInfo()
+    oldreportsInfo = getOldreportsInfo()
+    All_result=[]
+    for newreportinfo in All_newreportinfo:
+        all_result = getOldreportsSimilarScores(newreportinfo,oldreportsInfo)
+        All_result.append(all_result)
+    issuekey_UsedAPI_num,issuekey_UsedAPI_list = getIssueKey_UsedAPIinfo()()
+    #All_result = [all_result] 
+    Result_dict = getFinalAPIResultsbyWeights(All_result,weights,issuekey_UsedAPI_num,issuekey_UsedAPI_list)#这里已经当作  多个计算处理了
+    return Result_dict
+    
 """  
 if __name__ == '__main__':   
     main()
