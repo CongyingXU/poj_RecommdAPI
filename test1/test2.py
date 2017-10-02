@@ -6,27 +6,18 @@ Created on Fri Sep 15 09:37:53 2017
 @author: Congying.Xu
 """
 
-import numpy as np
-import getStrucCmptScors
-import test0
-import csv
+print 'start'
 import evaluate 
-import getFeatureLocation_result
 import getSimilarityScores2Reports
-from time import time
-import getRecmdAPIresult
+import getRecmdAPI_result
 import getAPIdscpScors 
 import getAPISrcfileScores
 import xlrd
-
-begin = time()
-print begin
-
 #功能简化型调参数
 def getevaluate(weights):
 
     APISrcfileScores_dict = getAPISrcfileScores.main(weights[:2])#weights：自然语言  与程序语言之间的权重关系，决定相似度分数
-    Result_dict = getRecmdAPIresult.getFinal_Result(APIdscpScors_dict , APISimilarReportsScores_dict , APISrcfileScores_dict , weights[2:])
+    Result_dict = getRecmdAPI_result.getFinal_Result(APIdscpScors_dict , APISimilarReportsScores_dict , APISrcfileScores_dict , weights[2:])
 
     Aimresult=getAimList()
     MAP = evaluate.main(Aimresult,Result_dict)
@@ -58,13 +49,13 @@ Similarreports_result = getSimilarityScores2Reports.getFinalResultsbyWeights(All
 Structure_result = getStrucCmptScors.getFinal_result(All_result0 , weights[9:])
 """
 def getAimList():
-    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xlsx')
+    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xls')
     sheet = workbook.sheet_by_name('sheet1')
     Aimresult={}
     for j in range(1,sheet.nrows):
         issuekey=sheet.cell(j,0).value
         if sheet.cell(j,1).value=='':
-            Aimresult[issuekey] = 0
+            Aimresult[issuekey] = []
         else:
             Aimresult[issuekey] = sheet.cell(j,1).value.split(';')
     return Aimresult
@@ -73,27 +64,36 @@ weights = [1,1,  1,1,1]#前两个用于Src相似度计算时，后三个用于  
 APISimilarReportsScores_dict  = getSimilarityScores2Reports.main_API()
 APIdscpScors_dict = getAPIdscpScors.main()
 
-print time()
-solutionnew =weights 
-valuenow = getevaluate(solutionnew)#目标函数解
+solutionnow =weights 
+valuenow = getevaluate(solutionnow)#目标函数解
 print valuenow
 
 best = 0.0
-best_i = 0.0
-for index in [1] + range(3,9) + range(10,17):
-    i=0.1
-    while i<10: 
-        valuenew = getevaluate(solutionnew)#目标函数解
-        if valuenew> valuenow:
-            valuenow = valuenew
-            best = valuenew
-            best_i = i
-        i = i +0.1
-        solutionnew[index] = i
-    solutionnew[index]  = best_i
+for count in range(5):
+#for index in [1] + range(3,9) + range(10,17):
+    for index in range(len(solutionnow)):
+    #for index in [16,15,14,13,12,11,10,8,7,6,5,4,3,1]:
+        i=1.0
+        best_i = solutionnow[index]
+        while i>0.05: 
+            solutionnow[index] = i
+            valuenew = getevaluate(solutionnow)#目标函数解
+            if valuenew> valuenow:
+                valuenow = valuenew
+                best = valuenow
+                best_i = i
+            i = i - 0.1
+           
+        solutionnow[index]  = best_i
+        print index
+    
+    print count
+    print valuenow
+    print solutionnow
 
 print valuenow
-print solutionnew
+print solutionnow
+
 
 
 

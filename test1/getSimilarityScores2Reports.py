@@ -198,7 +198,7 @@ def getnewreportInfo():
     #print sheet1.cell(6,28).value.encode('utf-8')
     All_newreportinfo=[]
     
-    data = range(904,1004)# + range(204,1004)
+    data = range(104,1004)# + range(204,1004)
     for i in data:
         print i
         newReportSummary=sheet1.cell(i,2).value.encode('utf-8')
@@ -615,7 +615,7 @@ def getIssueKey_UsedAPIinfo():
     issuekey_UsedAPI_num = {}  #用于存放 issuekey及其对应 修复文件的个数
     issuekey_UsedAPI_list = {} #存放  issuekey，及其对应 修复文件   0个时，不放入其中
     
-    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xlsx')
+    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xls')
     sheet = workbook.sheet_by_name('sheet1')
 
     for j in range(1,sheet.nrows):
@@ -682,9 +682,10 @@ def getFinalAPIResultsbyWeights(All_result,weights,issuekey_UsedAPI_num,issuekey
         for key in API_num_dict:
             API_scores_dict[key] = API_num_dict[key]/float(k)
             
-        API_scores_list = sorted(API_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
+        #API_scores_list = sorted(API_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
         
-        Result_dict[newReportIssueKey] = API_scores_list
+        #Result_dict[newReportIssueKey] = API_scores_list
+        Result_dict[newReportIssueKey] = API_scores_dict
         
     return Result_dict
 
@@ -721,19 +722,20 @@ def main(weights):
     #end = time()
     #print "Total procesing time: %d seconds" % (end - begin)
  
-def main_API(weights):
+def main_API():
     
     #begin = time()
-    #weights = [0.38 , 0.29 , 0.36 , 0.20 , 0.23 , 0.60 , 0.5]
+    weights = [1, 0.5000000000000001, 1.0, 0.30000000000000016, 1, 1.3877787807814457e-16, 0.10000000000000014, 1.3877787807814457e-16, 1, 0.7000000000000001, 0.5000000000000001, 0.10000000000000014, 0.5000000000000001, 1, 1, 1, 1]
+    
     All_newreportinfo = getnewreportInfo()
     oldreportsInfo = getOldreportsInfo()
     All_result=[]
     for newreportinfo in All_newreportinfo:
         all_result = getOldreportsSimilarScores(newreportinfo,oldreportsInfo)
         All_result.append(all_result)
-    issuekey_UsedAPI_num,issuekey_UsedAPI_list = getIssueKey_UsedAPIinfo()()
+    issuekey_UsedAPI_num,issuekey_UsedAPI_list = getIssueKey_UsedAPIinfo()
     #All_result = [all_result] 
-    Result_dict = getFinalAPIResultsbyWeights(All_result,weights,issuekey_UsedAPI_num,issuekey_UsedAPI_list)#这里已经当作  多个计算处理了
+    Result_dict = getFinalAPIResultsbyWeights(All_result,weights[2:9],issuekey_UsedAPI_num,issuekey_UsedAPI_list)#这里已经当作  多个计算处理了
     return Result_dict
     
 """  

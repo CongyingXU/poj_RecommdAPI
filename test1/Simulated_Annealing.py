@@ -5,14 +5,14 @@ Created on Thu Aug 24 20:47:39 2017
 
 @author: Congying.Xu
 """
-import numpy as np
-import getStrucCmptScors
-import test0
-import csv
 import evaluate 
-import getFeatureLocation_result
+#import getFeatureLocation_result
 import getSimilarityScores2Reports
 from time import time
+import getRecmdAPI_result
+import getAPIdscpScors 
+import getAPISrcfileScores
+import xlrd
 
 begin = time()
 print begin
@@ -29,43 +29,37 @@ def initpara():
 
 def getevaluate(weights):
 
-    Similarreports_result = getSimilarityScores2Reports.getFinalResultsbyWeights(All_result,weights[2:9],issuekey_file_num,issuekey_file_list)
-    Structure_result = getStrucCmptScors.getFinal_result(All_result0 , weights[9:])
-    Result_dict = getFeatureLocation_result.getFinal_Result(Similarreports_result , Structure_result , weights[:2])    
-    
-    #MAP = evaluate.main(Aimresult,Result_dict)用于训练
-    #return MAP
-    evaluate_result  = evaluate.main_All(Aimresult,Result_dict)#用于测试集
-    getFeatureLocation_result.write(Result_dict,evaluate_result)
-    return evaluate_result
+    APISrcfileScores_dict = getAPISrcfileScores.main(weights[:2])#weights：自然语言  与程序语言之间的权重关系，决定相似度分数
+    Result_dict = getRecmdAPI_result.getFinal_Result(APIdscpScors_dict , APISimilarReportsScores_dict , APISrcfileScores_dict , weights[2:])
+
+    Aimresult=getAimList()
+    MAP = evaluate.main_All(Aimresult,Result_dict)
+    return MAP
 
 #为了减少I/O，定向制作
       
 def getAimList():
-    #准备设计成 字典，以issuekey 作为键   ，  其aimresulr  为值
+    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xls')
+    sheet = workbook.sheet_by_name('sheet1')
     Aimresult={}
-    with open("Input/Attachments_PatchInfo.csv","r") as csvfile:
-        reader = csv.reader(csvfile)
-        #这里不需要readlines
-        for i,rows in enumerate(reader):
-            #if i <20 :
-                aimresult = rows[1:]
-                Aimresult[rows[0]] = aimresult
-            #else:
-             #   break
+    for j in range(1,sheet.nrows):
+        issuekey=sheet.cell(j,0).value
+        if sheet.cell(j,1).value=='':
+            Aimresult[issuekey] = []
+        else:
+            Aimresult[issuekey] = sheet.cell(j,1).value.split(';')
     return Aimresult
-
-weights = [1, 0.7000000000000001, 1.0, 0.10000000000000014, 0.40000000000000013, 1.3877787807814457e-16, 0.10000000000000014, 1.3877787807814457e-16, 1, 1, 0.40000000000000013, 0.10000000000000014, 0.20000000000000015, 1, 1, 1, 1]
-
-#weights = [1, 0.7000000000000001, 0.8, 1.3877787807814457e-16, 1.0, 0.40000000000000013, 1, 0.8, 1, 1, 0.6000000000000001, 0.10000000000000014, 0.5000000000000001, 1, 1, 1, 1]
-Aimresult=getAimList()
-All_result,issuekey_file_num,issuekey_file_list = getSimilarityScores2Reports.getAll_Info()
-All_result0=getStrucCmptScors.getall_result()
-
 print time()
+weights = [0.0, 0.0, 0.2, 0.2, 0.2]#前两个用于Src相似度计算时，后三个用于  API 推荐结果的汇总
+APISimilarReportsScores_dict  = getSimilarityScores2Reports.main_API()
+APIdscpScors_dict = getAPIdscpScors.main()
+
+
 solutionnew =weights 
-valuenew = getevaluate(solutionnew)#目标函数解
-print valuenew
+valuenow = getevaluate(solutionnew)#目标函数解
+print valuenow
+
+
 """
 solutioncurrent = solutionnew
 valuecurrent = valuenew

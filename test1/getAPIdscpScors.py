@@ -144,7 +144,7 @@ def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前�
                         para_name_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([para_name])
                         description =  sheet.cell(i,3).value
                         description_after_txtprces = computeSimilarity.tokenize_stopwords_stemmer([description])
-                        
+            
                         API=(sheet.cell(i,0).value,#原
                              sheet.cell(i,1).value,#原
                              class_name_after_txtprces,
@@ -198,27 +198,27 @@ def getAPI_Info_Txtprocessing():#进过文本预处理的API信息，（目前�
                     description = description + ' ' + word
             sheet1.write(i+1,5,description.strip(' '))
             
-            sheet1.write(i+1,0,All_3partAPIinfo_list[i][6])
-            sheet1.write(i+1,1,All_3partAPIinfo_list[i][7])
+            sheet1.write(i+1,6,All_3partAPIinfo_list[i][6])
+            sheet1.write(i+1,7,All_3partAPIinfo_list[i][7])
      
-    f.save('Input/allAPI_info')
+    f.save('Input/allAPI_info0.xls')
     """
     allAPI_info_dir = 'Input/allAPI_info.xls'
     workbook = xlrd.open_workbook(allAPI_info_dir,'r')
     sheet2 = workbook.sheet_by_name('sheet1')
     
     allAPI_info_list=[]
-    for i in range(len(sheet2.nrows)):
+    for i in range(sheet2.nrows):
         API=(sheet2.cell(i,0).value,#原
              sheet2.cell(i,1).value,#原
              sheet2.cell(i,2).value.split(' '),#进过文本预处理的地方，将单词分开
              sheet2.cell(i,3).value.split(' '),
              sheet2.cell(i,4).value.split(' '),
              sheet2.cell(i,5).value.split(' '))
-    allAPI_info_list.append(API)
+        allAPI_info_list.append(API)
     All_3partAPIinfo_list = allAPI_info_list
     return All_3partAPIinfo_list
-
+    
 def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPIinfo_list):      #,Src_info_file_dir):
     all_APIdescription = []
     for ele in All_3partAPIinfo_list:
@@ -227,7 +227,7 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     newRportSD= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary,newReportDescription] )
     scores = Half_computeSimilarity(newRportSD,all_APIdescription)
     
-    print time(),44
+    #print time(),44
     Scores={}
     for i  in range(len(All_3partAPIinfo_list)):
         API = All_3partAPIinfo_list[i][0]+ '.' + All_3partAPIinfo_list[i][1]
@@ -239,7 +239,7 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     """
     return Scores   #直接用字典，这样便于后续的关键字查找
 
-num_list = range(4,1004)
+num_list = range(104,1004)
 def main():#即issuekey的行号【4:1004】 是全部
 
     workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
@@ -255,7 +255,7 @@ def main():#即issuekey的行号【4:1004】 是全部
         newReportDescription=sheet.cell(i,28).value.encode('utf-8')
         Scores = computeSimilarityScors(newReportSummary, newReportDescription, All_3partAPIinfo_list)
         Scores_dict[issuekey] = Scores
-    return Scores
+    return Scores_dict
 
 
 #if __name__=='__main__':
