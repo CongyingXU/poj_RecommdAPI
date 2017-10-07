@@ -1,0 +1,168 @@
+From e83cd5b75d6d5cd5e942ba3b28c818c532f2d1f5 Mon Sep 17 00:00:00 2001
+From: Guanghao Zhang <zghaobac@gmail.com>
+Date: Wed, 30 Nov 2016 18:41:11 +0800
+Subject: [PATCH] HBASE-17205 Add a metric for the duration of region in
+ transition
+
+---
+ .../org/apache/hadoop/hbase/master/RegionState.java | 21 +++++++++++++++++++++
+ .../master/MetricsAssignmentManagerSource.java      |  3 +++
+ .../master/MetricsAssignmentManagerSourceImpl.java  |  7 +++++++
+ .../hbase/master/MetricsAssignmentManager.java      |  8 ++++++++
+ .../apache/hadoop/hbase/master/RegionStates.java    | 17 +++++++++++++++--
+ 5 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+index 04f62d4..1d1df0a 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+@@ -176,6 +176,8 @@ public class RegionState {
+   private final HRegionInfo hri;
+   private final ServerName serverName;
+   private final State state;
++  // The duration of region in transition
++  private long ritDuration;
+ 
+   public RegionState(HRegionInfo region, State state) {
+     this(region, state, System.currentTimeMillis(), null);
+@@ -188,10 +190,16 @@ public class RegionState {
+ 
+   public RegionState(HRegionInfo region,
+       State state, long stamp, ServerName serverName) {
++    this(region, state, stamp, serverName, 0);
++  }
++
++  public RegionState(HRegionInfo region, State state, long stamp, ServerName serverName,
++      long ritDuration) {
+     this.hri = region;
+     this.state = state;
+     this.stamp = stamp;
+     this.serverName = serverName;
++    this.ritDuration = ritDuration;
+   }
+ 
+   public State getState() {
+@@ -210,6 +218,19 @@ public class RegionState {
+     return serverName;
+   }
+ 
++  public long getRitDuration() {
++    return ritDuration;
++  }
++
++  /**
++   * Update the duration of region in transition
++   * @param previousStamp previous RegionState's timestamp
++   * @return this RegionState
++   */
++  public void updateRitDuration(long previousStamp) {
++    this.ritDuration += (this.stamp - previousStamp);
++  }
++
+   /**
+    * PENDING_CLOSE (to be removed) is the same as CLOSING
+    */
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
+index 6c8a280..f6c9cb8 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
+@@ -45,6 +45,7 @@ public interface MetricsAssignmentManagerSource extends BaseSource {
+   String RIT_COUNT_NAME = "ritCount";
+   String RIT_COUNT_OVER_THRESHOLD_NAME = "ritCountOverThreshold";
+   String RIT_OLDEST_AGE_NAME = "ritOldestAge";
++  String RIT_DURATION_NAME = "ritDuration";
+   String ASSIGN_TIME_NAME = "assign";
+   String BULK_ASSIGN_TIME_NAME = "bulkAssign";
+ 
+@@ -72,4 +73,6 @@ public interface MetricsAssignmentManagerSource extends BaseSource {
+    * @param age age of the oldest RIT.
+    */
+   void setRITOldestAge(long age);
++
++  void updateRitDuration(long duration);
+ }
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
+index a2192d2..ab504f5 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
+@@ -31,6 +31,7 @@ public class MetricsAssignmentManagerSourceImpl
+   private MutableGaugeLong ritGauge;
+   private MutableGaugeLong ritCountOverThresholdGauge;
+   private MutableGaugeLong ritOldestAgeGauge;
++  private MetricHistogram ritDurationHisto;
+   private MetricHistogram assignTimeHisto;
+   private MetricHistogram bulkAssignTimeHisto;
+ 
+@@ -50,6 +51,7 @@ public class MetricsAssignmentManagerSourceImpl
+     ritOldestAgeGauge = metricsRegistry.newGauge(RIT_OLDEST_AGE_NAME, "", 0l);
+     assignTimeHisto = metricsRegistry.newTimeHistogram(ASSIGN_TIME_NAME);
+     bulkAssignTimeHisto = metricsRegistry.newTimeHistogram(BULK_ASSIGN_TIME_NAME);
++    ritDurationHisto = metricsRegistry.newTimeHistogram(RIT_DURATION_NAME);
+   }
+ 
+   @Override
+@@ -73,4 +75,9 @@ public class MetricsAssignmentManagerSourceImpl
+   public void setRITOldestAge(long ritCount) {
+     ritOldestAgeGauge.set(ritCount);
+   }
++
++  @Override
++  public void updateRitDuration(long duration) {
++    ritDurationHisto.add(duration);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManager.java
+index b89d2da..40e79ae 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManager.java
+@@ -64,4 +64,12 @@ public class MetricsAssignmentManager {
+   public void updateRITOldestAge(long timestamp) {
+     assignmentManagerSource.setRITOldestAge(timestamp);
+   }
++
++  /**
++   * update the duration metrics of region is transition
++   * @param duration
++   */
++  public void updateRitDuration(long duration) {
++    assignmentManagerSource.updateRitDuration(duration);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+index fbc5c68..fb8aaa7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+@@ -451,7 +451,15 @@ public class RegionStates {
+     updateRegionState(hri, State.OPEN, serverName, openSeqNum);
+ 
+     synchronized (this) {
+-      regionsInTransition.remove(encodedName);
++      RegionState regionState = regionsInTransition.remove(encodedName);
++      // When region is online and remove from regionsInTransition,
++      // update the RIT duration to assignment manager metrics
++      if (regionState != null && this.server.getAssignmentManager() != null) {
++        long ritDuration = System.currentTimeMillis() - regionState.getStamp()
++            + regionState.getRitDuration();
++        this.server.getAssignmentManager().getAssignmentManagerMetrics()
++            .updateRitDuration(ritDuration);
++      }
+       ServerName oldServerName = regionAssignments.put(hri, serverName);
+       if (!serverName.equals(oldServerName)) {
+         if (LOG.isDebugEnabled()) {
+@@ -1126,7 +1134,12 @@ public class RegionStates {
+     }
+ 
+     synchronized (this) {
+-      regionsInTransition.put(encodedName, regionState);
++      RegionState oldRegionState = regionsInTransition.put(encodedName, regionState);
++      // When region transform old region state to new region state,
++      // accumulate the RIT duration to new region state.
++      if (oldRegionState != null) {
++        regionState.updateRitDuration(oldRegionState.getStamp());
++      }
+       putRegionState(regionState);
+ 
+       // For these states, region should be properly closed.
+-- 
+1.9.1
+

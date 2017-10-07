@@ -1,0 +1,567 @@
+From e9ecd9dac0d17e43533278f7401aee4359b998f6 Mon Sep 17 00:00:00 2001
+From: Loknath Priyatham Teja Singamsetty <singams.teja@gmail.com>
+Date: Wed, 19 Oct 2016 14:32:40 +0530
+Subject: [PATCH] Added capability to autostart/autorestart hbase services and
+ have capability to restrict the number of retries within given window size
+ with the help of --autostart-window-size and --autostart-window-retry-limit
+ args
+
+---
+ bin/hbase-config.sh        |  18 ++++++
+ bin/hbase-daemon.sh        | 140 ++++++++++++++++++++++++++++++++-------------
+ bin/hbase-daemons.sh       |  19 ++++--
+ bin/local-master-backup.sh |  10 +++-
+ bin/local-regionservers.sh |  18 ++++--
+ bin/regionservers.sh       |   7 ++-
+ bin/rolling-restart.sh     |  36 ++++++++----
+ bin/start-hbase.sh         |  22 ++++---
+ 8 files changed, 196 insertions(+), 74 deletions(-)
+
+diff --git a/bin/hbase-config.sh b/bin/hbase-config.sh
+index d7d7e6f..5db74cf 100644
+--- a/bin/hbase-config.sh
++++ b/bin/hbase-config.sh
+@@ -66,6 +66,24 @@ do
+     shift
+     # shellcheck disable=SC2034
+     AUTH_AS_SERVER="true"
++  elif [ "--autostart-window-size" = "$1" ]
++  then
++    shift
++    AUTOSTART_WINDOW_SIZE=$(( $1 + 0 ))
++    if [ $AUTOSTART_WINDOW_SIZE -lt 0 ]; then
++      echo "Invalid value for --autostart-window-size, should be a positive integer"
++      exit 1
++    fi
++    shift
++  elif [ "--autostart-window-retry-limit" = "$1" ]
++  then
++    shift
++    AUTOSTART_WINDOW_RETRY_LIMIT=$(( $1 + 0 ))
++    if [ $AUTOSTART_WINDOW_RETRY_LIMIT -lt 0 ]; then
++      echo "Invalid value for --autostart-window-retry-limit, should be a positive integer"
++      exit 1
++    fi
++    shift
+   else
+     # Presume we are at end of options and break
+     break
+diff --git a/bin/hbase-daemon.sh b/bin/hbase-daemon.sh
+index 3d1c4b0..6c895e9 100755
+--- a/bin/hbase-daemon.sh
++++ b/bin/hbase-daemon.sh
+@@ -17,7 +17,7 @@
+ # * See the License for the specific language governing permissions and
+ # * limitations under the License.
+ # */
+-# 
++#
+ # Runs a Hadoop hbase command as a daemon.
+ #
+ # Environment Variables
+@@ -33,7 +33,9 @@
+ # Modelled after $HADOOP_HOME/bin/hadoop-daemon.sh
+ 
+ usage="Usage: hbase-daemon.sh [--config <conf-dir>]\
+- (start|stop|restart|autorestart|foreground_start) <hbase-command> \
++ [--autostart-window-size <window size in hours>]\
++ [--autostart-window-retry-limit <retry count limit for autostart>]\
++ (start|stop|restart|autostart|autorestart|foreground_start) <hbase-command> \
+  <args...>"
+ 
+ # if no args specified, show usage
+@@ -42,6 +44,10 @@ if [ $# -le 1 ]; then
+   exit 1
+ fi
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ bin=`dirname "${BASH_SOURCE-$0}"`
+ bin=`cd "$bin">/dev/null; pwd`
+ 
+@@ -153,7 +159,7 @@ if [ -z "${HBASE_ROOT_LOGGER}" ]; then
+ export HBASE_ROOT_LOGGER=${HBASE_ROOT_LOGGER:-"INFO,RFA"}
+ fi
+ 
+-if [ -z "${HBASE_SECURITY_LOGGER}" ]; then 
++if [ -z "${HBASE_SECURITY_LOGGER}" ]; then
+ export HBASE_SECURITY_LOGGER=${HBASE_SECURITY_LOGGER:-"INFO,RFAS"}
+ fi
+ 
+@@ -162,7 +168,7 @@ HBASE_LOGGC=${HBASE_LOGGC:-"$HBASE_LOG_DIR/$HBASE_LOG_PREFIX.gc"}
+ HBASE_LOGLOG=${HBASE_LOGLOG:-"${HBASE_LOG_DIR}/${HBASE_LOGFILE}"}
+ HBASE_PID=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.pid
+ export HBASE_ZNODE_FILE=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.znode
+-export HBASE_START_FILE=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.autorestart
++export HBASE_AUTOSTART_FILE=$HBASE_PID_DIR/hbase-$HBASE_IDENT_STRING-$command.autostart
+ 
+ if [ -n "$SERVER_GC_OPTS" ]; then
+   export SERVER_GC_OPTS=${SERVER_GC_OPTS/"-Xloggc:<FILE-PATH>"/"-Xloggc:${HBASE_LOGGC}"}
+@@ -185,19 +191,38 @@ case $startStop in
+     check_before_start
+     hbase_rotate_log $HBASE_LOGOUT
+     hbase_rotate_log $HBASE_LOGGC
+-    echo starting $command, logging to $HBASE_LOGOUT
++    echo running $command, logging to $HBASE_LOGOUT
+     $thiscmd --config "${HBASE_CONF_DIR}" \
+         foreground_start $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
+     disown -h -r
+     sleep 1; head "${HBASE_LOGOUT}"
+   ;;
+ 
++(autostart)
++    check_before_start
++    hbase_rotate_log $HBASE_LOGOUT
++    hbase_rotate_log $HBASE_LOGGC
++    echo running $command, logging to $HBASE_LOGOUT
++    nohup $thiscmd --config "${HBASE_CONF_DIR}" --autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} \
++        internal_autostart $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
++  ;;
++
+ (autorestart)
++    echo running $command, logging to $HBASE_LOGOUT
++    # stop the command
++    $thiscmd --config "${HBASE_CONF_DIR}" stop $command $args &
++    wait_until_done $!
++    # wait a user-specified sleep period
++    sp=${HBASE_RESTART_SLEEP:-3}
++    if [ $sp -gt 0 ]; then
++      sleep $sp
++    fi
++
+     check_before_start
+     hbase_rotate_log $HBASE_LOGOUT
+     hbase_rotate_log $HBASE_LOGGC
+-    nohup $thiscmd --config "${HBASE_CONF_DIR}" \
+-        internal_autorestart $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
++    nohup $thiscmd --config "${HBASE_CONF_DIR}" --autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} \
++        internal_autostart $command $args < /dev/null > ${HBASE_LOGOUT} 2>&1  &
+   ;;
+ 
+ (foreground_start)
+@@ -226,48 +251,84 @@ case $startStop in
+     wait $hbase_pid
+   ;;
+ 
+-(internal_autorestart)
+-    touch "$HBASE_START_FILE"
+-    #keep starting the command until asked to stop. Reloop on software crash
+-    while true
+-      do
+-        lastLaunchDate=`date +%s`
+-        $thiscmd --config "${HBASE_CONF_DIR}" foreground_start $command $args
++(internal_autostart)
++    ONE_HOUR_IN_SECS=3600
++    autostartWindowStartDate=`date +%s`
++    autostartCount=0
++    touch "$HBASE_AUTOSTART_FILE"
+ 
++    # keep starting the command until asked to stop. Reloop on software crash
++    while true
++    do
++      if [ -f $HBASE_PID ] &&  kill -0 "$(cat "$HBASE_PID")" > /dev/null 2>&1 ; then
++        wait "$(cat "$HBASE_PID")"
++      else
+         #if the file does not exist it means that it was not stopped properly by the stop command
+-        if [ ! -f "$HBASE_START_FILE" ]; then
++        if [ ! -f "$HBASE_AUTOSTART_FILE" ]; then
++          echo "`date` HBase might be stopped removing the autostart file. Exiting Autostart process" >> ${HBASE_LOGOUT}
+           exit 1
+         fi
+ 
+-        #if the cluster is being stopped then do not restart it again.
+-        zparent=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool zookeeper.znode.parent`
+-        if [ "$zparent" == "null" ]; then zparent="/hbase"; fi
+-        zkrunning=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool zookeeper.znode.state`
+-        if [ "$zkrunning" == "null" ]; then zkrunning="running"; fi
+-        zkFullRunning=$zparent/$zkrunning
+-        $bin/hbase zkcli stat $zkFullRunning 2>&1 | grep "Node does not exist"  1>/dev/null 2>&1
+-        #grep returns 0 if it found something, 1 otherwise
+-        if [ $? -eq 0 ]; then
+-          exit 1
++        echo "`date` Autostarting hbase $command service. Attempt no: $(( $autostartCount + 1))" >> ${HBASE_LOGLOG}
++        touch "$HBASE_AUTOSTART_FILE"
++        $thiscmd --config "${HBASE_CONF_DIR}" foreground_start $command $args
++        autostartCount=$(( $autostartCount + 1 ))
++
++        # HBASE-6504 - only take the first line of the output in case verbose gc is on
++        distMode=`$bin/hbase --config "$HBASE_CONF_DIR" org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed | head -n 1`
++
++        if [ "$distMode" != 'false' ]; then
++          #if the cluster is being stopped then do not restart it again.
++          zparent=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool zookeeper.znode.parent`
++          if [ "$zparent" == "null" ]; then zparent="/hbase"; fi
++          zkrunning=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool zookeeper.znode.state`
++          if [ "$zkrunning" == "null" ]; then zkrunning="running"; fi
++          zkFullRunning=$zparent/$zkrunning
++          $bin/hbase zkcli stat $zkFullRunning 2>&1 | grep "Node does not exist"  1>/dev/null 2>&1
++
++          #grep returns 0 if it found something, 1 otherwise
++          if [ $? -eq 0 ]; then
++            echo "`date` hbase znode does not exist. Exiting Autostart process" >> ${HBASE_LOGOUT}
++            rm -f "$HBASE_AUTOSTART_FILE"
++            exit 1
++          fi
++
++          #If ZooKeeper cannot be found, then do not restart
++          $bin/hbase zkcli stat $zkFullRunning 2>&1 | grep Exception | grep ConnectionLoss  1>/dev/null 2>&1
++          if [ $? -eq 0 ]; then
++            echo "`date` zookeeper not found. Exiting Autostart process" >> ${HBASE_LOGOUT}
++            rm -f "$HBASE_AUTOSTART_FILE"
++            exit 1
++          fi
+         fi
++      fi
+ 
+-        #If ZooKeeper cannot be found, then do not restart
+-        $bin/hbase zkcli stat $zkFullRunning 2>&1 | grep Exception | grep ConnectionLoss  1>/dev/null 2>&1
+-        if [ $? -eq 0 ]; then
+-          exit 1
+-        fi
++      curDate=`date +%s`
++      autostartWindowReset=false
+ 
+-        #if it was launched less than 5 minutes ago, then wait for 5 minutes before starting it again.
+-        curDate=`date +%s`
+-        limitDate=`expr $lastLaunchDate + 300`
+-        if [ $limitDate -gt $curDate ]; then
+-          sleep 300
+-        fi
+-      done
+-    ;;
++      # reset the auto start window size if it exceeds
++      if [ $AUTOSTART_WINDOW_SIZE -gt 0 ] && [ $(( $curDate - $autostartWindowStartDate )) -gt $(( $AUTOSTART_WINDOW_SIZE * $ONE_HOUR_IN_SECS )) ]; then
++        echo "Resetting Autorestart window size: $autostartWindowStartDate" >> ${HBASE_LOGOUT}
++        autostartWindowStartDate=$curDate
++        autostartWindowReset=true
++        autostartCount=0
++      fi
++
++      # kill autostart if the retry limit is exceeded within the given window size (window size other then 0)
++      if ! $autostartWindowReset && [ $AUTOSTART_WINDOW_RETRY_LIMIT -gt 0 ] && [ $autostartCount -gt $AUTOSTART_WINDOW_RETRY_LIMIT ]; then
++        echo "`date` Autostart window retry limit: $AUTOSTART_WINDOW_RETRY_LIMIT exceeded for given window size: $AUTOSTART_WINDOW_SIZE hours.. Exiting..." >> ${HBASE_LOGLOG}
++        rm -f "$HBASE_AUTOSTART_FILE"
++        exit 1
++      fi
++
++      # wait for shutdown hook to complete
++      sleep 20
++    done
++  ;;
+ 
+ (stop)
+-    rm -f "$HBASE_START_FILE"
++    echo running $command, logging to $HBASE_LOGOUT
++    rm -f "$HBASE_AUTOSTART_FILE"
+     if [ -f $HBASE_PID ]; then
+       pidToKill=`cat $HBASE_PID`
+       # kill -0 == see if the PID exists
+@@ -287,6 +348,7 @@ case $startStop in
+   ;;
+ 
+ (restart)
++    echo running $command, logging to $HBASE_LOGOUT
+     # stop the command
+     $thiscmd --config "${HBASE_CONF_DIR}" stop $command $args &
+     wait_until_done $!
+diff --git a/bin/hbase-daemons.sh b/bin/hbase-daemons.sh
+index 21ce635..b1785f6 100755
+--- a/bin/hbase-daemons.sh
++++ b/bin/hbase-daemons.sh
+@@ -17,12 +17,13 @@
+ # * See the License for the specific language governing permissions and
+ # * limitations under the License.
+ # */
+-# 
++#
+ # Run a hbase command on all slave hosts.
+ # Modelled after $HADOOP_HOME/bin/hadoop-daemons.sh
+ 
+-usage="Usage: hbase-daemons.sh [--config <hbase-confdir>] \
+- [--hosts regionserversfile] [start|stop] command args..."
++usage="Usage: hbase-daemons.sh [--config <hbase-confdir>] [--autostart-window-size <window size in hours>]\
++      [--autostart-window-retry-limit <retry count limit for autostart>] \
++      [--hosts regionserversfile] [autostart|autorestart|restart|start|stop] command args..."
+ 
+ # if no args specified, show usage
+ if [ $# -le 1 ]; then
+@@ -33,9 +34,18 @@ fi
+ bin=`dirname "${BASH_SOURCE-$0}"`
+ bin=`cd "$bin">/dev/null; pwd`
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ . $bin/hbase-config.sh
+ 
+-remote_cmd="cd ${HBASE_HOME}; $bin/hbase-daemon.sh --config ${HBASE_CONF_DIR} $@"
++if [[ "$1" = "autostart" || "$1" = "autorestart" ]]
++then
++  autostart_args="--autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT}"
++fi
++
++remote_cmd="$bin/hbase-daemon.sh --config ${HBASE_CONF_DIR} ${autostart_args} $@"
+ args="--hosts ${HBASE_REGIONSERVERS} --config ${HBASE_CONF_DIR} $remote_cmd"
+ 
+ command=$2
+@@ -50,4 +60,3 @@ case $command in
+     exec "$bin/regionservers.sh" $args
+     ;;
+ esac
+-
+diff --git a/bin/local-master-backup.sh b/bin/local-master-backup.sh
+index cc2dc56..b0aa2f7 100755
+--- a/bin/local-master-backup.sh
++++ b/bin/local-master-backup.sh
+@@ -25,12 +25,16 @@ bin=`cd "$bin" >/dev/null && pwd`
+ 
+ if [ $# -lt 2 ]; then
+   S=`basename "${BASH_SOURCE-$0}"`
+-  echo "Usage: $S [--config <conf-dir>] [start|stop] offset(s)"
+-  echo ""
++  echo "Usage: $S [--config <conf-dir>] [--autostart-window-size <window size in hours>]"
++  echo "   [--autostart-window-retry-limit <retry count limit for autostart>] [autostart|start|stop] offset(s)"
+   echo "    e.g. $S start 1"
+   exit
+ fi
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ . "$bin"/hbase-config.sh
+ 
+ # sanity check: make sure your master opts don't use ports [i.e. JMX/DBG]
+@@ -45,7 +49,7 @@ run_master () {
+     -D hbase.regionserver.port=`expr 16020 + $DN` \
+     -D hbase.regionserver.info.port=`expr 16030 + $DN` \
+     --backup"
+-  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" $1 master $HBASE_MASTER_ARGS
++  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" --autostart-window-size "${AUTOSTART_WINDOW_SIZE}" --autostart-window-retry-limit "${AUTOSTART_WINDOW_RETRY_LIMIT}" $1 master $HBASE_MASTER_ARGS
+ }
+ 
+ cmd=$1
+diff --git a/bin/local-regionservers.sh b/bin/local-regionservers.sh
+index 78b4195..40ba93e 100755
+--- a/bin/local-regionservers.sh
++++ b/bin/local-regionservers.sh
+@@ -25,12 +25,16 @@ bin=`cd "$bin" >/dev/null && pwd`
+ 
+ if [ $# -lt 2 ]; then
+   S=`basename "${BASH_SOURCE-$0}"`
+-  echo "Usage: $S [--config <conf-dir>] [start|stop] offset(s)"
+-  echo ""
++  echo "Usage: $S [--config <conf-dir>]  [--autostart-window-size <window size in hours>]"
++  echo "  [--autostart-window-retry-limit <retry count limit for autostart>] [autostart|start|stop] offset(s)"
+   echo "    e.g. $S start 1 2"
+   exit
+ fi
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ . "$bin"/hbase-config.sh
+ 
+ # sanity check: make sure your regionserver opts don't use ports [i.e. JMX/DBG]
+@@ -40,9 +44,13 @@ run_regionserver () {
+   DN=$2
+   export HBASE_IDENT_STRING="$USER-$DN"
+   HBASE_REGIONSERVER_ARGS="\
+-    -D hbase.regionserver.port=`expr 16200 + $DN` \
+-    -D hbase.regionserver.info.port=`expr 16300 + $DN`"
+-  "$bin"/hbase-daemon.sh  --config "${HBASE_CONF_DIR}" $1 regionserver $HBASE_REGIONSERVER_ARGS
++    -Dhbase.regionserver.port=`expr 16200 + $DN` \
++    -Dhbase.regionserver.info.port=`expr 16300 + $DN`"
++
++  "$bin"/hbase-daemon.sh  --config "${HBASE_CONF_DIR}" \
++    --autostart-window-size "${AUTOSTART_WINDOW_SIZE}" \
++    --autostart-window-retry-limit "${AUTOSTART_WINDOW_RETRY_LIMIT}" \
++    $1 regionserver $HBASE_REGIONSERVER_ARGS
+ }
+ 
+ cmd=$1
+diff --git a/bin/regionservers.sh b/bin/regionservers.sh
+index af26ba9..6db11bb 100755
+--- a/bin/regionservers.sh
++++ b/bin/regionservers.sh
+@@ -59,7 +59,12 @@ fi
+ 
+ regionservers=`cat "$HOSTLIST"`
+ if [ "$regionservers" = "localhost" ]; then
+-  "$bin"/local-regionservers.sh start 1
++  HBASE_REGIONSERVER_ARGS="\
++    -Dhbase.regionserver.port=16201 \
++    -Dhbase.regionserver.info.port=16301"
++
++  $"${@// /\\ }" ${HBASE_REGIONSERVER_ARGS} \
++        2>&1 | sed "s/^/$regionserver: /" &
+ else
+   for regionserver in `cat "$HOSTLIST"`; do
+     if ${HBASE_SLAVE_PARALLEL:-true}; then
+diff --git a/bin/rolling-restart.sh b/bin/rolling-restart.sh
+index 9ac4d64..11c091d 100755
+--- a/bin/rolling-restart.sh
++++ b/bin/rolling-restart.sh
+@@ -17,7 +17,7 @@
+ # * See the License for the specific language governing permissions and
+ # * limitations under the License.
+ # */
+-# 
++#
+ # Run a shell command on all regionserver hosts.
+ #
+ # Environment Variables
+@@ -27,13 +27,14 @@
+ #   HADOOP_CONF_DIR  Alternate conf dir. Default is ${HADOOP_HOME}/conf.
+ #   HBASE_CONF_DIR  Alternate hbase conf dir. Default is ${HBASE_HOME}/conf.
+ #   HBASE_SLAVE_SLEEP Seconds to sleep between spawning remote commands.
+-#   HBASE_SLAVE_TIMEOUT Seconds to wait for timing out a remote command. 
++#   HBASE_SLAVE_TIMEOUT Seconds to wait for timing out a remote command.
+ #   HBASE_SSH_OPTS Options passed to ssh when running remote commands.
+ #
+ # Modelled after $HADOOP_HOME/bin/slaves.sh.
+ 
+-usage_str="Usage: `basename $0` [--config <hbase-confdir>] [--rs-only] [--master-only]\
+- [--graceful [--maxthreads xx] [--noack] [--movetimeout]]"
++usage_str="Usage: `basename $0` [--config <hbase-confdir>] [--autostart-window-size <window size in hours>]\
++      [--autostart-window-retry-limit <retry count limit for autostart>] [--autostart] [--rs-only] [--master-only] \
++      [--graceful] [--maxthreads xx] [--noack] [--movetimeout]]"
+ 
+ function usage() {
+   echo "${usage_str}"
+@@ -42,6 +43,10 @@ function usage() {
+ bin=`dirname "$0"`
+ bin=`cd "$bin">/dev/null; pwd`
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ . "$bin"/hbase-config.sh
+ 
+ # start hbase daemons
+@@ -55,8 +60,9 @@ RR_RS=1
+ RR_MASTER=1
+ RR_GRACEFUL=0
+ RR_MAXTHREADS=1
+-RR_NOACK=
+-RR_MOVE_TIMEOUT=2147483647
++START_CMD_NON_DIST_MODE=restart
++START_CMD_DIST_MODE=start
++RESTART_CMD_REGIONSERVER=restart
+ 
+ while [ $# -gt 0 ]; do
+   case "$1" in
+@@ -66,6 +72,12 @@ while [ $# -gt 0 ]; do
+       RR_GRACEFUL=0
+       shift
+       ;;
++    --autostart)
++      START_CMD_NON_DIST_MODE="--autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} autorestart"
++      START_CMD_DIST_MODE="--autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} autostart"
++      RESTART_CMD_REGIONSERVER="--autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} autorestart"
++      shift
++      ;;
+     --master-only)
+       RR_RS=0
+       RR_MASTER=1
+@@ -112,14 +124,14 @@ if [ "$distMode" == 'false' ]; then
+     echo Cant do selective rolling restart if not running distributed
+     exit 1
+   fi
+-  "$bin"/hbase-daemon.sh restart master
+-else 
++  "$bin"/hbase-daemon.sh ${START_CMD_NON_DIST_MODE} master
++else
+   zparent=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool zookeeper.znode.parent`
+   if [ "$zparent" == "null" ]; then zparent="/hbase"; fi
+ 
+   if [ $RR_MASTER -eq 1 ]; then
+     # stop all masters before re-start to avoid races for master znode
+-    "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" stop master 
++    "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" stop master
+     "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+       --hosts "${HBASE_BACKUP_MASTERS}" stop master-backup
+ 
+@@ -136,9 +148,9 @@ else
+     echo #force a newline
+ 
+     # all masters are down, now restart
+-    "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" start master 
++    "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" ${START_CMD_DIST_MODE} master
+     "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+-      --hosts "${HBASE_BACKUP_MASTERS}" start master-backup
++      --hosts "${HBASE_BACKUP_MASTERS}" ${START_CMD_DIST_MODE} master-backup
+ 
+     echo "Wait a minute for master to come up join cluster"
+     sleep 60
+@@ -177,7 +189,7 @@ else
+     # unlike the masters, roll all regionservers one-at-a-time
+     export HBASE_SLAVE_PARALLEL=false
+     "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+-      --hosts "${HBASE_REGIONSERVERS}" restart regionserver
++      --hosts "${HBASE_REGIONSERVERS}" ${RESTART_CMD_REGIONSERVER} regionserver
+   fi
+ 
+   if [ $RR_GRACEFUL -eq 1 ]; then
+diff --git a/bin/start-hbase.sh b/bin/start-hbase.sh
+index aeb9469..f053526 100755
+--- a/bin/start-hbase.sh
++++ b/bin/start-hbase.sh
+@@ -22,11 +22,17 @@
+ 
+ # Start hadoop hbase daemons.
+ # Run this on master node.
+-usage="Usage: start-hbase.sh"
++usage="Usage: start-hbase.sh [--autostart-window-size <window size in hours>]\
++      [--autostart-window-retry-limit <retry count limit for autostart>]\
++      [autostart|start]"
+ 
+ bin=`dirname "${BASH_SOURCE-$0}"`
+ bin=`cd "$bin">/dev/null; pwd`
+ 
++# default autostart args value indicating infinite window size and no retry limit
++AUTOSTART_WINDOW_SIZE=0
++AUTOSTART_WINDOW_RETRY_LIMIT=0
++
+ . "$bin"/hbase-config.sh
+ 
+ # start hbase daemons
+@@ -36,24 +42,22 @@ then
+   exit $errCode
+ fi
+ 
+-
+-if [ "$1" = "autorestart" ]
++if [ "$1" = "autostart" ]
+ then
+-  commandToRun="autorestart"
+-else 
++  commandToRun="--autostart-window-size ${AUTOSTART_WINDOW_SIZE} --autostart-window-retry-limit ${AUTOSTART_WINDOW_RETRY_LIMIT} autostart"
++else
+   commandToRun="start"
+ fi
+ 
+ # HBASE-6504 - only take the first line of the output in case verbose gc is on
+ distMode=`$bin/hbase --config "$HBASE_CONF_DIR" org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed | head -n 1`
+ 
+-
+-if [ "$distMode" == 'false' ] 
++if [ "$distMode" == 'false' ]
+ then
+-  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" $commandToRun master $@
++  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" $commandToRun master
+ else
+   "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" $commandToRun zookeeper
+-  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" $commandToRun master 
++  "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" $commandToRun master
+   "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+     --hosts "${HBASE_REGIONSERVERS}" $commandToRun regionserver
+   "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+-- 
+2.7.4 (Apple Git-66)
+

@@ -1,0 +1,454 @@
+From 552fb1faa4c9f47b5500e159d05e2a56a05cfbc2 Mon Sep 17 00:00:00 2001
+From: Xiang Li <waterlx@gmail.com>
+Date: Mon, 19 Sep 2016 23:51:53 +0800
+Subject: [PATCH] HBASE-14882: Provide a Put API that adds the provided family,
+ qualifier, value without copying
+
+---
+ .../java/org/apache/hadoop/hbase/client/Put.java   |   8 +-
+ .../org/apache/hadoop/hbase/client/TestPut.java    |  42 ++++
+ .../java/org/apache/hadoop/hbase/HConstants.java   |   5 +
+ .../hadoop/hbase/IndividualBytesFieldCell.java     | 240 +++++++++++++++++++++
+ .../hadoop/hbase/TestIndividualBytesFieldCell.java |  81 +++++++
+ 5 files changed, 371 insertions(+), 5 deletions(-)
+ create mode 100644 hbase-common/src/main/java/org/apache/hadoop/hbase/IndividualBytesFieldCell.java
+ create mode 100644 hbase-common/src/test/java/org/apache/hadoop/hbase/TestIndividualBytesFieldCell.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
+index dbaf3a7..6ea67ac 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Put.java
+@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.IndividualBytesFieldCell;
+ import org.apache.hadoop.hbase.Tag;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+@@ -226,12 +227,9 @@ public class Put extends Mutation implements HeapSize, Comparable<Row> {
+    * for usage internal HBase to and for advanced client applications.
+    */
+   public Put addImmutable(byte [] family, byte [] qualifier, long ts, byte [] value) {
+-    if (ts < 0) {
+-      throw new IllegalArgumentException("Timestamp cannot be negative. ts=" + ts);
+-    }
+     List<Cell> list = getCellList(family);
+-    KeyValue kv = createPutKeyValue(family, qualifier, ts, value);
+-    list.add(kv);
++    list.add(new IndividualBytesFieldCell(this.row, family, qualifier, ts, KeyValue.Type.Put.getCode(),
++        0L /* sequence Id */, value, HConstants.EMPTY_BYTE_ARRAY /* tags */));
+     familyMap.put(family, list);
+     return this;
+   }
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
+index 8603fe1..0523d14 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestPut.java
+@@ -19,7 +19,9 @@
+ 
+ package org.apache.hadoop.hbase.client;
+ 
++import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.util.Bytes;
++
+ import org.junit.Test;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotEquals;
+@@ -56,4 +58,44 @@ public class TestPut {
+     Put putRowIsNotImmutable = new Put(rowKey, 1000L, false);
+     assertTrue(rowKey != putRowIsNotImmutable.getRow());  // A local copy is made
+   }
++
++  // HBASE-14882
++  @Test
++  public void testAddImmutable() {
++    byte[] row        = Bytes.toBytes("immutable-row");
++    byte[] family     = Bytes.toBytes("immutable-family");
++
++    byte[] qualifier0 = Bytes.toBytes("immutable-qualifier-0");
++    byte[] value0     = Bytes.toBytes("immutable-value-0");
++
++    byte[] qualifier1 = Bytes.toBytes("immutable-qualifier-1");
++    byte[] value1     = Bytes.toBytes("immutable-value-1");
++    long   ts1        = 5000L;
++
++    Put put = new Put(row, true);  // "true" indicates that the input row is immutable
++    put.addImmutable(family, qualifier0, value0);
++    put.addImmutable(family, qualifier1, ts1, value1);
++
++    // Verify the cell of family:qualifier0
++    Cell cell0 = put.get(family, qualifier0).get(0);
++
++    // Verify no local copy is made for family, qualifier or value
++    assertTrue(cell0.getFamilyArray()    == family);
++    assertTrue(cell0.getQualifierArray() == qualifier0);
++    assertTrue(cell0.getValueArray()     == value0);
++
++    // Verify timestamp
++    assertTrue(cell0.getTimestamp()      == put.getTimeStamp());
++
++    // Verify the cell of family:qualifier1
++    Cell cell1 = put.get(family, qualifier1).get(0);
++
++    // Verify no local copy is made for family, qualifier or value
++    assertTrue(cell1.getFamilyArray()    == family);
++    assertTrue(cell1.getQualifierArray() == qualifier1);
++    assertTrue(cell1.getValueArray()     == value1);
++
++    // Verify timestamp
++    assertTrue(cell1.getTimestamp()      == ts1);
++  }
+ }
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 4a8f55c..7bf546d 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -547,6 +547,11 @@ public final class HConstants {
+   public static final int MAX_ROW_LENGTH = Short.MAX_VALUE;
+ 
+   /**
++   * Max length of column family
++   */
++  public static final int MAX_FAMILY_LENGTH = Byte.MAX_VALUE;
++
++  /**
+    * Timestamp to use when we want to refer to the latest cell.
+    * This is the timestamp sent by clients when no timestamp is specified on
+    * commit.
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/IndividualBytesFieldCell.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/IndividualBytesFieldCell.java
+new file mode 100644
+index 0000000..ac41bd6
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/IndividualBytesFieldCell.java
+@@ -0,0 +1,240 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++import org.apache.hadoop.hbase.io.HeapSize;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ClassSize;
++
++@InterfaceAudience.Private
++public class IndividualBytesFieldCell implements Cell, HeapSize, Cloneable, SettableSequenceId, SettableTimestamp {
++  // Individual byte arrays to back the following fields
++  private byte[] row;
++  private byte[] family;
++  private byte[] qualifier;
++  private byte[] value;
++
++  // Other fields
++  private long   timestamp;
++  private byte   type;
++  private long   seqId;
++  private byte[] tags;  // Please note tags here is a byte array, rather than an array of org.apache.hadoop.hbase.Tag
++
++  public IndividualBytesFieldCell(byte[] row, byte[] family, byte[] qualifier,
++                                  long timestamp, byte type, long seqId, byte[] value, byte[] tags) {
++    // Check family
++    if (family == null || family.length == 0 || family.length > HConstants.MAX_FAMILY_LENGTH) {
++      throw new IllegalArgumentException("Family cannot be null. " +
++          "And its length cannot be 0 or greater than " + HConstants.MAX_FAMILY_LENGTH);
++    }
++
++    // Check qualifier
++    if (qualifier == null) {
++      throw new IllegalArgumentException("Qualifier is null");
++    }
++    // Do not need to check if qualifier.length is greater than Integer.MAX_VALUE,
++    // because the length of an array can not be greater than Integer.MAX_VALUE.
++
++    // Check value
++    if (value == null) {
++      throw new IllegalArgumentException("Value is null");
++    }
++    // Do not need to check if value.length is greater than Integer.MAX_VALUE,
++    // because the length of an array can not be greater than Integer.MAX_VALUE.
++
++    // Check timestamp
++    if (timestamp < 0) {
++      throw new IllegalArgumentException("Timestamp cannot be negative. ts=" + timestamp);
++    }
++
++    // No local copy is made, but reference to the input directly
++    this.row       = row;
++    this.family    = family;
++    this.qualifier = qualifier;
++    this.value     = value;
++
++    // Set others
++    this.timestamp = timestamp;
++    this.type      = type;
++    this.seqId     = seqId;
++    this.tags      = tags;
++  }
++
++  /**
++   * Implement Cell interface
++   */
++  // 1) Row
++  @Override
++  public byte[] getRowArray() {
++        return row;
++    }
++
++  @Override
++  public int getRowOffset() {
++        return 0;
++    }
++
++  @Override
++  public short getRowLength() {
++    // row.length is checked by Mutation#checkRow() in the constructor of Put,
++    // so it is safe to make the type conversion.
++    return (short)(row.length);
++  }
++
++  // 2) Family
++  @Override
++  public byte[] getFamilyArray() {
++        return family;
++    }
++
++  @Override
++  public int getFamilyOffset() {
++        return 0;
++    }
++
++  @Override
++  public byte getFamilyLength() {
++    // family.length is checked in the constructor, so it is safe to make the type conversion.
++    return (byte)(family.length);
++  }
++
++  // 3) Qualifier
++  @Override
++  public byte[] getQualifierArray() {
++        return qualifier;
++    }
++
++  @Override
++  public int getQualifierOffset() {
++    return 0;
++  }
++
++  @Override
++  public int getQualifierLength() {
++    return qualifier.length;
++  }
++
++  // 4) Timestamp
++  @Override
++  public long getTimestamp() {
++    return timestamp;
++  }
++
++  //5) Type
++  @Override
++  public byte getTypeByte() {
++    return type;
++  }
++
++  //6) Sequence ID
++  @Override
++  public long getSequenceId() {
++    return seqId;
++  }
++
++  //7) Value
++  @Override
++  public byte[] getValueArray() {
++    return value;
++  }
++
++  @Override
++  public int getValueOffset() {
++    return 0;
++  }
++
++  @Override
++  public int getValueLength() {
++    return value.length;
++  }
++
++  // 8) Tags
++  @Override
++  public byte[] getTagsArray() {
++    return tags;
++  }
++
++  @Override
++  public int getTagsOffset() {
++    return 0;
++  }
++
++  @Override
++  public int getTagsLength() {
++    return tags.length;
++  }
++
++  /**
++   * Implement HeapSize interface
++   */
++  @Override
++  public long heapSize() {
++    // The instance of this class
++    int sumOfInstance = 0;
++    sumOfInstance += ClassSize.OBJECT;         // object header
++    sumOfInstance += 5 * ClassSize.REFERENCE;  // pointers to all byte arrays: row, family, qualifier, value, tags
++    sumOfInstance +=     Bytes.SIZEOF_BYTE;    // type
++    sumOfInstance += 2 * Bytes.SIZEOF_LONG;    // timestamp and sequence id
++
++    sumOfInstance = ClassSize.align(sumOfInstance);  // do alignment(padding)
++
++    // All backing byte arrays
++    int sumOfBackingByteArrays = 0;
++    // For each backing byte array, add array header size and array length together, then do alignment(padding)
++    sumOfBackingByteArrays += ClassSize.align(ClassSize.ARRAY + row.length);        // row
++    sumOfBackingByteArrays += ClassSize.align(ClassSize.ARRAY + family.length);     // family
++    sumOfBackingByteArrays += ClassSize.align(ClassSize.ARRAY + qualifier.length);  // qualifier
++    sumOfBackingByteArrays += ClassSize.align(ClassSize.ARRAY + value.length);      // value
++    sumOfBackingByteArrays += ClassSize.align(ClassSize.ARRAY + tags.length);       // tags
++
++    // Return the sum of instance and all backing byte arrays
++    return (sumOfInstance + sumOfBackingByteArrays);
++  }
++
++  /**
++   * Implement Cloneable interface
++   */
++  @Override
++  public Object clone() throws CloneNotSupportedException {
++    return super.clone();  // only a shadow copy
++  }
++
++  /**
++   * Implement SettableSequenceId interface
++   */
++  @Override
++  public void setSequenceId(long seqId) {
++    this.seqId = seqId;
++  }
++
++  /**
++   * Implement SettableTimestamp interface
++   */
++  @Override
++  public void setTimestamp(long ts) {
++    this.timestamp = ts;
++  }
++
++  @Override
++  public void setTimestamp(byte[] ts, int tsOffset) {
++    this.timestamp = Bytes.toLong(ts, tsOffset);
++  }
++}
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/TestIndividualBytesFieldCell.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/TestIndividualBytesFieldCell.java
+new file mode 100644
+index 0000000..99f926c
+--- /dev/null
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/TestIndividualBytesFieldCell.java
+@@ -0,0 +1,81 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase;
++
++import org.apache.hadoop.hbase.util.Bytes;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.assertEquals;
++
++public class TestIndividualBytesFieldCell {
++  private static IndividualBytesFieldCell c = null;
++
++  @BeforeClass
++  public static void testConstructorAndVerify() {
++    // Immutable inputs
++    byte[] row = Bytes.toBytes("immutable-row");
++    byte[] family = Bytes.toBytes("immutable-family");
++    byte[] qualifier = Bytes.toBytes("immutable-qualifier");
++    byte[] value = Bytes.toBytes("immutable-value");
++
++    // Other inputs
++    long ts = 5000L;
++    byte type = KeyValue.Type.Put.getCode();
++    long seqId = 0L;
++    byte[] tags = HConstants.EMPTY_BYTE_ARRAY;
++
++    c = new IndividualBytesFieldCell(row, family, qualifier, ts, type, seqId, value, tags);
++
++    // Verify if no local copy is made for row, family, qualifier or value
++    assertTrue(c.getRowArray()       == row);
++    assertTrue(c.getFamilyArray()    == family);
++    assertTrue(c.getQualifierArray() == qualifier);
++    assertTrue(c.getValueArray()     == value);
++
++    // Verify others
++    assertEquals(ts,    c.getTimestamp());
++    assertEquals(type,  c.getTypeByte());
++    assertEquals(seqId, c.getSequenceId());
++    assertEquals(tags,  c.getTagsArray());
++  }
++
++  // Verify if SettableSequenceId interface is implemented
++  @Test
++  public void testIfSettableSequenceIdImplemented() {
++    assertTrue(c instanceof SettableSequenceId);
++  }
++
++  // Verify if SettableTimestamp interface is implemented
++  @Test
++  public void testIfSettableTimestampImplemented() {
++    assertTrue(c instanceof SettableTimestamp);
++  }
++
++  // Verify clone() only makes shadow copies for backing byte arrays
++  @Test
++  public void testClone() throws CloneNotSupportedException {
++    IndividualBytesFieldCell cloned = (IndividualBytesFieldCell)c.clone();
++    assertTrue(cloned.getRowArray()       == c.getRowArray());
++    assertTrue(cloned.getFamilyArray()    == c.getFamilyArray());
++    assertTrue(cloned.getQualifierArray() == c.getQualifierArray());
++    assertTrue(cloned.getValueArray()     == c.getValueArray());
++  }
++}
+-- 
+2.7.4 (Apple Git-66)
+

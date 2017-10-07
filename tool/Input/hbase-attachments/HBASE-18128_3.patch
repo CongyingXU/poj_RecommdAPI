@@ -1,0 +1,320 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.hadoop.hbase.wal;
+
+import com.google.common.collect.ImmutableMap;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.wal.InstrumentedLogWriter;
+import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString;
+import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos;
+import org.apache.hadoop.hbase.testclassification.RegionServerTests;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hdfs.DFSTestUtil;
+import org.junit.*;
+import org.junit.experimental.categories.Category;
+import org.junit.rules.TestName;
+
+import java.io.IOException;
+import java.util.*;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+@Category({ RegionServerTests.class, SmallTests.class })
+public class TestCompactionMarker {
+  private final static Log LOG = LogFactory.getLog(TestCompactionMarker.class);
+
+  private static Configuration conf;
+  private FileSystem fs;
+
+  protected final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+
+  private Path HBASEDIR;
+  private Path HBASELOGDIR;
+  private Path WALDIR;
+  private Path OLDLOGDIR;
+  private Path TABLEDIR;
+
+  private static final TableName TABLE_NAME = TableName.valueOf("t1");
+  private static final byte[] FAMILY = "f1".getBytes();
+  private static final byte[] QUALIFIER = "q1".getBytes();
+  private static final byte[] VALUE = "v1".getBytes();
+  private static final String WAL_FILE_PREFIX = "wal.dat.";
+  private static List<String> REGIONS = new ArrayList<>();
+  private static final String HBASE_SKIP_ERRORS = "hbase.hlog.split.skip.errors";
+  private static String ROBBER;
+  private static String ZOMBIE;
+  private static String[] GROUP = new String[] { "supergroup" };
+
+  @BeforeClass
+  public static void setUpBeforeClass() throws Exception {
+    conf = TEST_UTIL.getConfiguration();
+    conf.setClass("hbase.regionserver.hlog.writer.impl", InstrumentedLogWriter.class,
+        WALProvider.Writer.class);
+    // This is how you turn off shortcircuit read currently.  TODO: Fix.  Should read config.
+    System.setProperty("hbase.tests.use.shortcircuit.reads", "false");
+    // Create fake maping user to group and set it to the conf.
+    Map<String, String[]> u2g_map = new HashMap<>(2);
+    ROBBER = User.getCurrent().getName() + "-robber";
+    ZOMBIE = User.getCurrent().getName() + "-zombie";
+    u2g_map.put(ROBBER, GROUP);
+    u2g_map.put(ZOMBIE, GROUP);
+    DFSTestUtil.updateConfWithFakeGroupMapping(conf, u2g_map);
+    conf.setInt("dfs.heartbeat.interval", 1);
+    TEST_UTIL.startMiniDFSCluster(2);
+  }
+
+  @AfterClass
+  public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniDFSCluster();
+  }
+
+  @Rule
+  public TestName name = new TestName();
+  private WALFactory wals = null;
+
+  @Before
+  public void setUp() throws Exception {
+    LOG.info("Cleaning up cluster for new test.");
+    fs = TEST_UTIL.getDFSCluster().getFileSystem();
+    HBASEDIR = TEST_UTIL.createRootDir();
+    HBASELOGDIR = TEST_UTIL.createWALRootDir();
+    OLDLOGDIR = new Path(HBASELOGDIR, HConstants.HREGION_OLDLOGDIR_NAME);
+    TABLEDIR = FSUtils.getTableDir(HBASEDIR, TABLE_NAME);
+    REGIONS.clear();
+    Collections.addAll(REGIONS, "bbb", "ccc");
+    InstrumentedLogWriter.activateFailure = false;
+    wals = new WALFactory(conf, null, name.getMethodName());
+    WALDIR = new Path(HBASELOGDIR, AbstractFSWALProvider.getWALDirectoryName(
+        ServerName.valueOf(name.getMethodName(), 16010, System.currentTimeMillis()).toString()));
+    //fs.mkdirs(WALDIR);
+  }
+
+  @After
+  public void tearDown() throws Exception {
+    try {
+      wals.close();
+    } catch (IOException exception) {
+      // Some tests will move WALs out from under us. In those cases, we'll get an error on close.
+      LOG.info("Ignoring an error while closing down our WALFactory. Fine for some tests, but if"
+          + " you see a failure look here.");
+      LOG.debug("exception details", exception);
+    } finally {
+      wals = null;
+      fs.delete(HBASEDIR, true);
+      fs.delete(HBASELOGDIR, true);
+    }
+  }
+
+  @Test
+  public void testSplitLeavesCompactionMarker() throws IOException {
+    HRegionInfo hri = new HRegionInfo(TABLE_NAME);
+    REGIONS.clear();
+    REGIONS.add(hri.getEncodedName());
+    Path regionDir = new Path(FSUtils.getTableDir(HBASEDIR, TABLE_NAME), hri.getEncodedName());
+    LOG.info("Creating region directory: " + regionDir);
+    assertTrue(fs.mkdirs(regionDir));
+
+    WALProvider.Writer writer = generateWALs(1, 10, 0, 10);
+
+    String[] compactInputs = new String[] { "file0", "file1", "file2" };
+    String compactOutput = "file3";
+    appendCompactionEvent(writer, hri, compactInputs, compactOutput);
+    writer.close();
+
+    useDifferentDFSClient();
+    WALSplitter.split(HBASEDIR, WALDIR, OLDLOGDIR, fs, conf, wals);
+
+    Path originalLog = (fs.listStatus(OLDLOGDIR))[0].getPath();
+    // original log should have 10 test edits, 10 region markers, 1 compaction marker
+    assertEquals(21, countWAL(originalLog));
+
+    Path[] splitLog = getLogForRegion(HBASEDIR, TABLE_NAME, hri.getEncodedName());
+    assertEquals(1, splitLog.length);
+
+    assertFalse("edits differ after split", logsAreEqual(originalLog, splitLog[0]));
+    // split log should have 10 test edits plus 1 compaction marker
+    assertEquals(11, countWAL(splitLog[0]));
+
+  }
+
+  private boolean logsAreEqual(Path p1, Path p2) throws IOException {
+    WAL.Reader in1, in2;
+    in1 = wals.createReader(fs, p1);
+    in2 = wals.createReader(fs, p2);
+    WAL.Entry entry1;
+    WAL.Entry entry2;
+    while ((entry1 = in1.next()) != null) {
+      entry2 = in2.next();
+      if ((entry1.getKey().compareTo(entry2.getKey()) != 0) || (!entry1.getEdit().toString()
+          .equals(entry2.getEdit().toString()))) {
+        return false;
+      }
+    }
+    in1.close();
+    in2.close();
+    return true;
+  }
+
+  private void useDifferentDFSClient() throws IOException {
+    // make fs act as a different client now
+    // initialize will create a new DFSClient with a new client ID
+    fs.initialize(fs.getUri(), conf);
+  }
+
+  private int countWAL(Path log) throws IOException {
+    int count = 0;
+    WAL.Reader in = wals.createReader(fs, log);
+    while (in.next() != null) {
+      count++;
+    }
+    in.close();
+    return count;
+  }
+
+  private Path[] getLogForRegion(Path rootdir, TableName table, String region) throws IOException {
+    Path tdir = FSUtils.getTableDir(rootdir, table);
+    @SuppressWarnings("deprecation") Path editsdir = WALSplitter.getRegionDirRecoveredEditsDir(
+        HRegion.getRegionDir(tdir, Bytes.toString(region.getBytes())));
+    FileStatus[] files = fs.listStatus(editsdir, new PathFilter() {
+      @Override
+      public boolean accept(Path p) {
+        if (WALSplitter.isSequenceIdFile(p)) {
+          return false;
+        }
+        return true;
+      }
+    });
+    Path[] paths = new Path[files.length];
+    for (int i = 0; i < files.length; i++) {
+      paths[i] = files[i].getPath();
+    }
+    return paths;
+  }
+
+  private static void appendCompactionEvent(WALProvider.Writer w, HRegionInfo hri, String[] inputs,
+      String output) throws IOException {
+    WALProtos.CompactionDescriptor.Builder desc = WALProtos.CompactionDescriptor.newBuilder();
+    desc.setTableName(ByteString.copyFrom(hri.getTable().toBytes()))
+        .setEncodedRegionName(ByteString.copyFrom(hri.getEncodedNameAsBytes()))
+        .setRegionName(ByteString.copyFrom(hri.getRegionName()))
+        .setFamilyName(ByteString.copyFrom(FAMILY))
+        .setStoreHomeDir(hri.getEncodedName() + "/" + Bytes.toString(FAMILY))
+        .addAllCompactionInput(Arrays.asList(inputs)).addCompactionOutput(output);
+
+    WALEdit edit = WALEdit.createCompaction(hri, desc.build());
+    //Since the seqId is -1 if there are no sequence checker, we should set seqNum to -2 so it will
+    //be smaller than lastFlushedSequenceId. Then we can test if it will skip compaction marker.
+    WALKey key = new WALKey(hri.getEncodedNameAsBytes(), TABLE_NAME, -2,
+        EnvironmentEdgeManager.currentTime(), HConstants.DEFAULT_CLUSTER_ID);
+    w.append(new WAL.Entry(key, edit));
+    w.sync();
+  }
+
+  /**
+   * @param leaveOpen index to leave un-closed. -1 to close all.
+   * @return the writer that's still open, or null if all were closed.
+   */
+  private WALProvider.Writer generateWALs(int writers, int entries, int leaveOpen, int regionEvents)
+      throws IOException {
+    makeRegionDirs(REGIONS);
+    fs.mkdirs(WALDIR);
+    WALProvider.Writer[] ws = new WALProvider.Writer[writers];
+    int seq = 0;
+    int numRegionEventsAdded = 0;
+    for (int i = 0; i < writers; i++) {
+      ws[i] = wals.createWALWriter(fs, new Path(WALDIR, WAL_FILE_PREFIX + i));
+      for (int j = 0; j < entries; j++) {
+        int prefix = 0;
+        for (String region : REGIONS) {
+          String row_key = region + prefix++ + i + j;
+          appendEntry(ws[i], TABLE_NAME, region.getBytes(), row_key.getBytes(), FAMILY, QUALIFIER,
+              VALUE, seq++);
+
+          if (numRegionEventsAdded < regionEvents) {
+            numRegionEventsAdded++;
+            appendRegionEvent(ws[i], region);
+          }
+        }
+      }
+      if (i != leaveOpen) {
+        ws[i].close();
+        LOG.info("Closing writer " + i);
+      }
+    }
+    if (leaveOpen < 0 || leaveOpen >= writers) {
+      return null;
+    }
+    return ws[leaveOpen];
+  }
+
+  private void makeRegionDirs(List<String> regions) throws IOException {
+    for (String region : regions) {
+      LOG.debug("Creating dir for region " + region);
+      fs.mkdirs(new Path(TABLEDIR, region));
+    }
+  }
+
+  private static void appendRegionEvent(WALProvider.Writer w, String region) throws IOException {
+    WALProtos.RegionEventDescriptor regionOpenDesc = ProtobufUtil
+        .toRegionEventDescriptor(WALProtos.RegionEventDescriptor.EventType.REGION_OPEN,
+            TABLE_NAME.toBytes(), region.getBytes(), String.valueOf(region.hashCode()).getBytes(),
+            1, ServerName.parseServerName("ServerName:9099"),
+            ImmutableMap.<byte[], List<Path>>of());
+    final long time = EnvironmentEdgeManager.currentTime();
+    KeyValue kv = new KeyValue(region.getBytes(), WALEdit.METAFAMILY, WALEdit.REGION_EVENT, time,
+        regionOpenDesc.toByteArray());
+    final WALKey walKey =
+        new WALKey(region.getBytes(), TABLE_NAME, 1, time, HConstants.DEFAULT_CLUSTER_ID);
+    w.append(new WAL.Entry(walKey, new WALEdit().add(kv)));
+    w.sync();
+  }
+
+  public static long appendEntry(WALProvider.Writer writer, TableName table, byte[] region,
+      byte[] row, byte[] family, byte[] qualifier, byte[] value, long seq) throws IOException {
+    LOG.info(Thread.currentThread().getName() + " append");
+    writer.append(createTestEntry(table, region, row, family, qualifier, value, seq));
+    LOG.info(Thread.currentThread().getName() + " sync");
+    writer.sync();
+    return seq;
+  }
+
+  private static WAL.Entry createTestEntry(TableName table, byte[] region, byte[] row,
+      byte[] family, byte[] qualifier, byte[] value, long seq) {
+    long time = System.nanoTime();
+
+    seq++;
+    final KeyValue cell = new KeyValue(row, family, qualifier, time, KeyValue.Type.Put, value);
+    WALEdit edit = new WALEdit();
+    edit.add(cell);
+    return new WAL.Entry(new WALKey(region, table, seq, time, HConstants.DEFAULT_CLUSTER_ID), edit);
+  }
+}

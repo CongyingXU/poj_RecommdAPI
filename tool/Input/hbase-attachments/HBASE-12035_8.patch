@@ -1,0 +1,3208 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+index cc91aed..51352bb 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+@@ -1332,6 +1332,17 @@ public class HTableDescriptor implements Comparable<HTableDescriptor> {
+               .setBloomFilterType(BloomType.NONE)
+               // Enable cache of data blocks in L1 if more than one caching tier deployed:
+               // e.g. if using CombinedBlockCache (BucketCache).
++              .setCacheDataInL1(true),
++          new HColumnDescriptor(HConstants.TABLE_FAMILY)
++              // Ten is arbitrary number.  Keep versions to help debugging.
++              .setMaxVersions(10)
++              .setInMemory(true)
++              .setBlocksize(8 * 1024)
++              .setScope(HConstants.REPLICATION_SCOPE_LOCAL)
++                  // Disable blooms for meta.  Needs work.  Seems to mess w/ getClosestOrBefore.
++              .setBloomFilterType(BloomType.NONE)
++                  // Enable cache of data blocks in L1 if more than one caching tier deployed:
++                  // e.g. if using CombinedBlockCache (BucketCache).
+               .setCacheDataInL1(true)
+       });
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java
+index cb031ce..bd61508 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java
+@@ -17,9 +17,23 @@
+  */
+ package org.apache.hadoop.hbase;
+ 
++import javax.annotation.Nullable;
++import java.io.IOException;
++import java.io.InterruptedIOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.NavigableMap;
++import java.util.Set;
++import java.util.SortedMap;
++import java.util.TreeMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.ServiceException;
+-
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -38,6 +52,8 @@ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.client.TableState;
++import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
+@@ -48,18 +64,6 @@ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.PairOfSameType;
+ import org.apache.hadoop.hbase.util.Threads;
+ 
+-import java.io.IOException;
+-import java.io.InterruptedIOException;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.NavigableMap;
+-import java.util.Set;
+-import java.util.SortedMap;
+-import java.util.TreeMap;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
+ /**
+  * Read/write operations on region and assignment information store in
+  * <code>hbase:meta</code>.
+@@ -78,6 +82,11 @@ public class MetaTableAccessor {
+    * HRI defined which is called default replica.
+    *
+    * Meta layout (as of 0.98 + HBASE-10070) is like:
++   *
++   * For each table there is single row in column family 'table' formatted:
++   * <tableName> including namespace and columns are:
++   * table: state             => contains table state
++   *
+    * For each table range, there is a single row, formatted like:
+    * <tableName>,<startKey>,<regionId>,<encodedRegionName>. This row corresponds to the regionName
+    * of the default region replica.
+@@ -120,6 +129,24 @@ public class MetaTableAccessor {
+       META_REGION_PREFIX, 0, len);
+   }
+ 
++
++  @InterfaceAudience.Private
++  public enum QueryType {
++    ALL(HConstants.TABLE_FAMILY, HConstants.CATALOG_FAMILY),
++    REGION(HConstants.CATALOG_FAMILY),
++    TABLE(HConstants.TABLE_FAMILY);
++
++    private final byte[][] families;
++
++    QueryType(byte[]... families) {
++      this.families = families;
++    }
++
++    byte[][] getFamilies() {
++      return this.families;
++    }
++  }
++
+   /** The delimiter for meta columns for replicaIds > 0 */
+   protected static final char META_REPLICA_ID_DELIMITER = '_';
+ 
+@@ -131,40 +158,64 @@ public class MetaTableAccessor {
+   // Reading operations //
+   ////////////////////////
+ 
+- /**
+-   * Performs a full scan of a <code>hbase:meta</code> table.
+-   * @return List of {@link org.apache.hadoop.hbase.client.Result}
++  /**
++   * Performs a full scan of <code>hbase:meta</code> for regions.
++   * @param connection connection we're using
++   * @param visitor Visitor invoked against each row in regions family.
+    * @throws IOException
+    */
+-  public static List<Result> fullScanOfMeta(Connection connection)
+-  throws IOException {
+-    CollectAllVisitor v = new CollectAllVisitor();
+-    fullScan(connection, v, null);
+-    return v.getResults();
++  public static void fullScanRegions(Connection connection,
++      final Visitor visitor)
++      throws IOException {
++    fullScan(connection, visitor, null, QueryType.REGION);
++  }
++
++  /**
++   * Performs a full scan of <code>hbase:meta</code> for regions.
++   * @param connection connection we're using
++   * @throws IOException
++   */
++  public static List<Result> fullScanRegions(Connection connection)
++      throws IOException {
++    return fullScan(connection, QueryType.REGION);
++  }
++
++  /**
++   * Performs a full scan of <code>hbase:meta</code> for tables.
++   * @param connection connection we're using
++   * @param visitor Visitor invoked against each row in tables family.
++   * @throws IOException
++   */
++  public static void fullScanTables(Connection connection,
++      final Visitor visitor)
++      throws IOException {
++    fullScan(connection, visitor, null, QueryType.TABLE);
+   }
+ 
+   /**
+    * Performs a full scan of <code>hbase:meta</code>.
+    * @param connection connection we're using
+    * @param visitor Visitor invoked against each row.
++   * @param type scanned part of meta
+    * @throws IOException
+    */
+   public static void fullScan(Connection connection,
+-      final Visitor visitor)
++      final Visitor visitor, QueryType type)
+   throws IOException {
+-    fullScan(connection, visitor, null);
++    fullScan(connection, visitor, null, type);
+   }
+ 
+   /**
+    * Performs a full scan of <code>hbase:meta</code>.
+    * @param connection connection we're using
++   * @param type scanned part of meta
+    * @return List of {@link Result}
+    * @throws IOException
+    */
+-  public static List<Result> fullScan(Connection connection)
++  public static List<Result> fullScan(Connection connection, QueryType type)
+     throws IOException {
+     CollectAllVisitor v = new CollectAllVisitor();
+-    fullScan(connection, v, null);
++    fullScan(connection, v, null, type);
+     return v.getResults();
+   }
+ 
+@@ -305,6 +356,7 @@ public class MetaTableAccessor {
+    * @return null if it doesn't contain merge qualifier, else two merge regions
+    * @throws IOException
+    */
++  @Nullable
+   public static Pair<HRegionInfo, HRegionInfo> getRegionsFromMergeQualifier(
+       Connection connection, byte[] regionName) throws IOException {
+     Result result = getRegionResult(connection, regionName);
+@@ -327,42 +379,9 @@ public class MetaTableAccessor {
+   public static boolean tableExists(Connection connection,
+       final TableName tableName)
+   throws IOException {
+-    if (tableName.equals(TableName.META_TABLE_NAME)) {
+-      // Catalog tables always exist.
+-      return true;
+-    }
+-    // Make a version of ResultCollectingVisitor that only collects the first
+-    CollectingVisitor<HRegionInfo> visitor = new CollectingVisitor<HRegionInfo>() {
+-      private HRegionInfo current = null;
+-
+-      @Override
+-      public boolean visit(Result r) throws IOException {
+-        RegionLocations locations = getRegionLocations(r);
+-        if (locations == null || locations.getRegionLocation().getRegionInfo() == null) {
+-          LOG.warn("No serialized HRegionInfo in " + r);
+-          return true;
+-        }
+-        this.current = locations.getRegionLocation().getRegionInfo();
+-        if (this.current == null) {
+-          LOG.warn("No serialized HRegionInfo in " + r);
+-          return true;
+-        }
+-        if (!isInsideTable(this.current, tableName)) return false;
+-        // Else call super and add this Result to the collection.
+-        super.visit(r);
+-        // Stop collecting regions from table after we get one.
+-        return false;
+-      }
+-
+-      @Override
+-      void add(Result r) {
+-        // Add the current HRI.
+-        this.results.add(this.current);
+-      }
+-    };
+-    fullScan(connection, visitor, getTableStartRowForMeta(tableName));
+-    // If visitor has results >= 1 then table exists.
+-    return visitor.getResults().size() >= 1;
++    // Catalog tables always exist.
++    return tableName.equals(TableName.META_TABLE_NAME)
++        || getTableState(connection, tableName) != null;
+   }
+ 
+   /**
+@@ -399,6 +418,7 @@ public class MetaTableAccessor {
+     return getListOfHRegionInfos(result);
+   }
+ 
++  @Nullable
+   static List<HRegionInfo> getListOfHRegionInfos(final List<Pair<HRegionInfo, ServerName>> pairs) {
+     if (pairs == null || pairs.isEmpty()) return null;
+     List<HRegionInfo> result = new ArrayList<HRegionInfo>(pairs.size());
+@@ -511,7 +531,7 @@ public class MetaTableAccessor {
+           }
+         }
+       };
+-    fullScan(connection, visitor, getTableStartRowForMeta(tableName));
++    fullScan(connection, visitor, getTableStartRowForMeta(tableName), QueryType.REGION);
+     return visitor.getResults();
+   }
+ 
+@@ -543,7 +563,7 @@ public class MetaTableAccessor {
+         }
+       }
+     };
+-    fullScan(connection, v);
++    fullScan(connection, v, QueryType.REGION);
+     return hris;
+   }
+ 
+@@ -554,17 +574,22 @@ public class MetaTableAccessor {
+       public boolean visit(Result r) throws IOException {
+         if (r ==  null || r.isEmpty()) return true;
+         LOG.info("fullScanMetaAndPrint.Current Meta Row: " + r);
+-        RegionLocations locations = getRegionLocations(r);
+-        if (locations == null) return true;
+-        for (HRegionLocation loc : locations.getRegionLocations()) {
+-          if (loc != null) {
+-            LOG.info("fullScanMetaAndPrint.HRI Print= " + loc.getRegionInfo());
++        TableState state = getTableState(r);
++        if (state != null) {
++          LOG.info("Table State: " + state);
++        } else {
++          RegionLocations locations = getRegionLocations(r);
++          if (locations == null) return true;
++          for (HRegionLocation loc : locations.getRegionLocations()) {
++            if (loc != null) {
++              LOG.info("fullScanMetaAndPrint.HRI Print= " + loc.getRegionInfo());
++            }
+           }
+         }
+         return true;
+       }
+     };
+-    fullScan(connection, v);
++    fullScan(connection, v, QueryType.ALL);
+   }
+ 
+   /**
+@@ -573,11 +598,12 @@ public class MetaTableAccessor {
+    * @param visitor Visitor invoked against each row.
+    * @param startrow Where to start the scan. Pass null if want to begin scan
+    * at first row.
++   * @param type scanned part of meta
+    * <code>hbase:meta</code>, the default (pass false to scan hbase:meta)
+    * @throws IOException
+    */
+   public static void fullScan(Connection connection,
+-    final Visitor visitor, final byte [] startrow)
++      final Visitor visitor, final byte[] startrow, QueryType type)
+   throws IOException {
+     Scan scan = new Scan();
+     if (startrow != null) scan.setStartRow(startrow);
+@@ -586,7 +612,9 @@ public class MetaTableAccessor {
+           .getInt(HConstants.HBASE_META_SCANNER_CACHING, 100);
+       scan.setCaching(caching);
+     }
+-    scan.addFamily(HConstants.CATALOG_FAMILY);
++    for (byte[] family : type.getFamilies()) {
++      scan.addFamily(family);
++    }
+     Table metaTable = getMetaHTable(connection);
+     ResultScanner scanner = null;
+     try {
+@@ -607,11 +635,19 @@ public class MetaTableAccessor {
+    * Returns the column family used for meta columns.
+    * @return HConstants.CATALOG_FAMILY.
+    */
+-  protected static byte[] getFamily() {
++  protected static byte[] getCatalogFamily() {
+     return HConstants.CATALOG_FAMILY;
+   }
+ 
+   /**
++   * Returns the column family used for table columns.
++   * @return HConstants.TABLE_FAMILY.
++   */
++  protected static byte[] getTableFamily() {
++    return HConstants.TABLE_FAMILY;
++  }
++
++  /**
+    * Returns the column qualifier for serialized region info
+    * @return HConstants.REGIONINFO_QUALIFIER
+    */
+@@ -620,6 +656,15 @@ public class MetaTableAccessor {
+   }
+ 
+   /**
++   * Returns the column qualifier for serialized table state
++   *
++   * @return HConstants.TABLE_STATE_QUALIFIER
++   */
++  protected static byte[] getStateColumn() {
++    return HConstants.TABLE_STATE_QUALIFIER;
++  }
++
++  /**
+    * Returns the column qualifier for server column for replicaId
+    * @param replicaId the replicaId of the region
+    * @return a byte[] for server column qualifier
+@@ -685,14 +730,15 @@ public class MetaTableAccessor {
+    * @param r Result to pull from
+    * @return A ServerName instance or null if necessary fields not found or empty.
+    */
++  @Nullable
+   private static ServerName getServerName(final Result r, final int replicaId) {
+     byte[] serverColumn = getServerColumn(replicaId);
+-    Cell cell = r.getColumnLatestCell(getFamily(), serverColumn);
++    Cell cell = r.getColumnLatestCell(getCatalogFamily(), serverColumn);
+     if (cell == null || cell.getValueLength() == 0) return null;
+     String hostAndPort = Bytes.toString(
+       cell.getValueArray(), cell.getValueOffset(), cell.getValueLength());
+     byte[] startcodeColumn = getStartCodeColumn(replicaId);
+-    cell = r.getColumnLatestCell(getFamily(), startcodeColumn);
++    cell = r.getColumnLatestCell(getCatalogFamily(), startcodeColumn);
+     if (cell == null || cell.getValueLength() == 0) return null;
+     return ServerName.valueOf(hostAndPort,
+       Bytes.toLong(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength()));
+@@ -705,7 +751,7 @@ public class MetaTableAccessor {
+    * @return SeqNum, or HConstants.NO_SEQNUM if there's no value written.
+    */
+   private static long getSeqNumDuringOpen(final Result r, final int replicaId) {
+-    Cell cell = r.getColumnLatestCell(getFamily(), getSeqNumColumn(replicaId));
++    Cell cell = r.getColumnLatestCell(getCatalogFamily(), getSeqNumColumn(replicaId));
+     if (cell == null || cell.getValueLength() == 0) return HConstants.NO_SEQNUM;
+     return Bytes.toLong(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength());
+   }
+@@ -715,6 +761,7 @@ public class MetaTableAccessor {
+    * @return an HRegionLocationList containing all locations for the region range or null if
+    *  we can't deserialize the result.
+    */
++  @Nullable
+   public static RegionLocations getRegionLocations(final Result r) {
+     if (r == null) return null;
+     HRegionInfo regionInfo = getHRegionInfo(r, getRegionInfoColumn());
+@@ -725,7 +772,7 @@ public class MetaTableAccessor {
+ 
+     locations.add(getRegionLocation(r, regionInfo, 0));
+ 
+-    NavigableMap<byte[], byte[]> infoMap = familyMap.get(getFamily());
++    NavigableMap<byte[], byte[]> infoMap = familyMap.get(getCatalogFamily());
+     if (infoMap == null) return new RegionLocations(locations);
+ 
+     // iterate until all serverName columns are seen
+@@ -787,8 +834,9 @@ public class MetaTableAccessor {
+    * @param qualifier Column family qualifier
+    * @return An HRegionInfo instance or null.
+    */
++  @Nullable
+   private static HRegionInfo getHRegionInfo(final Result r, byte [] qualifier) {
+-    Cell cell = r.getColumnLatestCell(getFamily(), qualifier);
++    Cell cell = r.getColumnLatestCell(getCatalogFamily(), qualifier);
+     if (cell == null) return null;
+     return HRegionInfo.parseFromOrNull(cell.getValueArray(),
+       cell.getValueOffset(), cell.getValueLength());
+@@ -823,6 +871,80 @@ public class MetaTableAccessor {
+   }
+ 
+   /**
++   * Fetch table state for given table from META table
++   * @param conn connection to use
++   * @param tableName table to fetch state for
++   * @return state
++   * @throws IOException
++   */
++  @Nullable
++  public static TableState getTableState(Connection conn, TableName tableName)
++      throws IOException {
++    Table metaHTable = getMetaHTable(conn);
++    Get get = new Get(tableName.getName()).addColumn(getTableFamily(), getStateColumn());
++    long time = EnvironmentEdgeManager.currentTime();
++    get.setTimeRange(0, time);
++    Result result =
++        metaHTable.get(get);
++    return getTableState(result);
++  }
++
++  /**
++   * Fetch table states from META table
++   * @param conn connection to use
++   * @return map {tableName -> state}
++   * @throws IOException
++   */
++  public static Map<TableName, TableState> getTableStates(Connection conn)
++      throws IOException {
++    final Map<TableName, TableState> states = new LinkedHashMap<>();
++    Visitor collector = new Visitor() {
++      @Override
++      public boolean visit(Result r) throws IOException {
++        TableState state = getTableState(r);
++        if (state != null)
++          states.put(state.getTableName(), state);
++        return true;
++      }
++    };
++    fullScanTables(conn, collector);
++    return states;
++  }
++
++  /**
++   * Updates state in META
++   * @param conn connection to use
++   * @param tableName table to look for
++   * @throws IOException
++   */
++  public static void updateTableState(Connection conn, TableName tableName,
++      TableState.State actual) throws IOException {
++    updateTableState(conn, new TableState(tableName, actual));
++  }
++
++  /**
++   * Decode table state from META Result.
++   * Should contain cell from HConstants.TABLE_FAMILY
++   * @param r result
++   * @return null if not found
++   * @throws IOException
++   */
++  @Nullable
++  public static TableState getTableState(Result r)
++      throws IOException {
++    Cell cell = r.getColumnLatestCell(getTableFamily(), getStateColumn());
++    if (cell == null) return null;
++    try {
++      return TableState.parseFrom(TableName.valueOf(r.getRow()),
++          Arrays.copyOfRange(cell.getValueArray(),
++          cell.getValueOffset(), cell.getValueOffset() + cell.getValueLength()));
++    } catch (DeserializationException e) {
++      throw new IOException(e);
++    }
++
++  }
++
++  /**
+    * Implementations 'visit' a catalog table row.
+    */
+   public interface Visitor {
+@@ -919,7 +1041,8 @@ public class MetaTableAccessor {
+    */
+   public static Put makePutFromRegionInfo(HRegionInfo regionInfo)
+     throws IOException {
+-    Put put = new Put(regionInfo.getRegionName());
++    long now = EnvironmentEdgeManager.currentTime();
++    Put put = new Put(regionInfo.getRegionName(), now);
+     addRegionInfo(put, regionInfo);
+     return put;
+   }
+@@ -932,7 +1055,9 @@ public class MetaTableAccessor {
+     if (regionInfo == null) {
+       throw new IllegalArgumentException("Can't make a delete for null region");
+     }
++    long now = EnvironmentEdgeManager.currentTime();
+     Delete delete = new Delete(regionInfo.getRegionName());
++    delete.addFamily(getCatalogFamily(), now);
+     return delete;
+   }
+ 
+@@ -1033,14 +1158,15 @@ public class MetaTableAccessor {
+       throws IOException {
+     int absoluteIndex = replicaIndexToDeleteFrom + numReplicasToRemove;
+     for (byte[] row : metaRows) {
++      long now = EnvironmentEdgeManager.currentTime();
+       Delete deleteReplicaLocations = new Delete(row);
+       for (int i = replicaIndexToDeleteFrom; i < absoluteIndex; i++) {
+-        deleteReplicaLocations.deleteColumns(HConstants.CATALOG_FAMILY,
+-          getServerColumn(i));
+-        deleteReplicaLocations.deleteColumns(HConstants.CATALOG_FAMILY,
+-          getSeqNumColumn(i));
+-        deleteReplicaLocations.deleteColumns(HConstants.CATALOG_FAMILY,
+-          getStartCodeColumn(i));
++        deleteReplicaLocations.addColumns(getCatalogFamily(),
++          getServerColumn(i), now);
++        deleteReplicaLocations.addColumns(getCatalogFamily(),
++          getSeqNumColumn(i), now);
++        deleteReplicaLocations.addColumns(getCatalogFamily(),
++          getStartCodeColumn(i), now);
+       }
+       deleteFromMetaTable(connection, deleteReplicaLocations);
+     }
+@@ -1170,7 +1296,8 @@ public class MetaTableAccessor {
+   public static void addDaughter(final Connection connection,
+       final HRegionInfo regionInfo, final ServerName sn, final long openSeqNum)
+       throws NotAllMetaRegionsOnlineException, IOException {
+-    Put put = new Put(regionInfo.getRegionName());
++    long now = EnvironmentEdgeManager.currentTime();
++    Put put = new Put(regionInfo.getRegionName(), now);
+     addRegionInfo(put, regionInfo);
+     if (sn != null) {
+       addLocation(put, sn, openSeqNum, regionInfo.getReplicaId());
+@@ -1272,6 +1399,45 @@ public class MetaTableAccessor {
+   }
+ 
+   /**
++   * Update state of the table in meta.
++   * @param connection what we use for update
++   * @param state new state
++   * @throws IOException
++   */
++  public static void updateTableState(Connection connection, TableState state)
++      throws IOException {
++    Put put = makePutFromTableState(state);
++    putToMetaTable(connection, put);
++    LOG.info(
++        "Updated table " + state.getTableName() + " state to " + state.getState() + " in META");
++  }
++
++  /**
++   * Construct PUT for given state
++   * @param state new state
++   */
++  public static Put makePutFromTableState(TableState state) {
++    long time = EnvironmentEdgeManager.currentTime();
++    Put put = new Put(state.getTableName().getName(), time);
++    put.add(getTableFamily(), getStateColumn(), state.convert().toByteArray());
++    return put;
++  }
++
++  /**
++   * Remove state for table from meta
++   * @param connection to use for deletion
++   * @param table to delete state for
++   */
++  public static void deleteTableState(Connection connection, TableName table)
++      throws IOException {
++    long time = EnvironmentEdgeManager.currentTime();
++    Delete delete = new Delete(table.getName());
++    delete.addColumns(getTableFamily(), getStateColumn(), time);
++    deleteFromMetaTable(connection, delete);
++    LOG.info("Deleted table " + table + " state from META");
++  }
++
++  /**
+    * Performs an atomic multi-Mutate operation against the given table.
+    */
+   private static void multiMutate(Table table, byte[] row, Mutation... mutations)
+@@ -1336,7 +1502,8 @@ public class MetaTableAccessor {
+                                      HRegionInfo regionInfo, ServerName sn, long openSeqNum)
+     throws IOException {
+     // region replicas are kept in the primary region's row
+-    Put put = new Put(getMetaKeyForRegion(regionInfo));
++    long time = EnvironmentEdgeManager.currentTime();
++    Put put = new Put(getMetaKeyForRegion(regionInfo), time);
+     addLocation(put, sn, openSeqNum, regionInfo.getReplicaId());
+     putToMetaTable(connection, put);
+     LOG.info("Updated row " + regionInfo.getRegionNameAsString() +
+@@ -1352,7 +1519,9 @@ public class MetaTableAccessor {
+   public static void deleteRegion(Connection connection,
+                                   HRegionInfo regionInfo)
+     throws IOException {
++    long time = EnvironmentEdgeManager.currentTime();
+     Delete delete = new Delete(regionInfo.getRegionName());
++    delete.addFamily(getCatalogFamily(), time);
+     deleteFromMetaTable(connection, delete);
+     LOG.info("Deleted " + regionInfo.getRegionNameAsString());
+   }
+@@ -1366,8 +1535,11 @@ public class MetaTableAccessor {
+   public static void deleteRegions(Connection connection,
+                                    List<HRegionInfo> regionsInfo) throws IOException {
+     List<Delete> deletes = new ArrayList<Delete>(regionsInfo.size());
++    long time = EnvironmentEdgeManager.currentTime();
+     for (HRegionInfo hri: regionsInfo) {
+-      deletes.add(new Delete(hri.getRegionName()));
++      Delete e = new Delete(hri.getRegionName());
++      e.addFamily(getCatalogFamily(), time);
++      deletes.add(e);
+     }
+     deleteFromMetaTable(connection, deletes);
+     LOG.info("Deleted " + regionsInfo);
+@@ -1387,7 +1559,7 @@ public class MetaTableAccessor {
+     List<Mutation> mutation = new ArrayList<Mutation>();
+     if (regionsToRemove != null) {
+       for (HRegionInfo hri: regionsToRemove) {
+-        mutation.add(new Delete(hri.getRegionName()));
++        mutation.add(makeDeleteFromRegionInfo(hri));
+       }
+     }
+     if (regionsToAdd != null) {
+@@ -1430,9 +1602,10 @@ public class MetaTableAccessor {
+    */
+   public static void deleteMergeQualifiers(Connection connection,
+                                            final HRegionInfo mergedRegion) throws IOException {
++    long time = EnvironmentEdgeManager.currentTime();
+     Delete delete = new Delete(mergedRegion.getRegionName());
+-    delete.deleteColumns(HConstants.CATALOG_FAMILY, HConstants.MERGEA_QUALIFIER);
+-    delete.deleteColumns(HConstants.CATALOG_FAMILY, HConstants.MERGEB_QUALIFIER);
++    delete.addColumns(getCatalogFamily(), HConstants.MERGEA_QUALIFIER, time);
++    delete.addColumns(getCatalogFamily(), HConstants.MERGEB_QUALIFIER, time);
+     deleteFromMetaTable(connection, delete);
+     LOG.info("Deleted references in merged region "
+       + mergedRegion.getRegionNameAsString() + ", qualifier="
+@@ -1442,7 +1615,7 @@ public class MetaTableAccessor {
+ 
+   private static Put addRegionInfo(final Put p, final HRegionInfo hri)
+     throws IOException {
+-    p.addImmutable(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER,
++    p.addImmutable(getCatalogFamily(), HConstants.REGIONINFO_QUALIFIER,
+       hri.toByteArray());
+     return p;
+   }
+@@ -1451,20 +1624,20 @@ public class MetaTableAccessor {
+     // using regionserver's local time as the timestamp of Put.
+     // See: HBASE-11536
+     long now = EnvironmentEdgeManager.currentTime();
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getServerColumn(replicaId), now,
++    p.addImmutable(getCatalogFamily(), getServerColumn(replicaId), now,
+       Bytes.toBytes(sn.getHostAndPort()));
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getStartCodeColumn(replicaId), now,
++    p.addImmutable(getCatalogFamily(), getStartCodeColumn(replicaId), now,
+       Bytes.toBytes(sn.getStartcode()));
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getSeqNumColumn(replicaId), now,
++    p.addImmutable(getCatalogFamily(), getSeqNumColumn(replicaId), now,
+       Bytes.toBytes(openSeqNum));
+     return p;
+   }
+ 
+   public static Put addEmptyLocation(final Put p, int replicaId) {
+     long now = EnvironmentEdgeManager.currentTime();
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getServerColumn(replicaId), now, null);
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getStartCodeColumn(replicaId), now, null);
+-    p.addImmutable(HConstants.CATALOG_FAMILY, getSeqNumColumn(replicaId), now, null);
++    p.addImmutable(getCatalogFamily(), getServerColumn(replicaId), now, null);
++    p.addImmutable(getCatalogFamily(), getStartCodeColumn(replicaId), now, null);
++    p.addImmutable(getCatalogFamily(), getSeqNumColumn(replicaId), now, null);
+     return p;
+   }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionCallable.java
+new file mode 100644
+index 0000000..3f44927
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionCallable.java
+@@ -0,0 +1,56 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.client;
++
++import java.io.Closeable;
++import java.io.IOException;
++
++/**
++ * A RetryingCallable for generic connection operations.
++ * @param <V> return type
++ */
++abstract class ConnectionCallable<V> implements RetryingCallable<V>, Closeable {
++  protected Connection connection;
++
++  public ConnectionCallable(final Connection connection) {
++    this.connection = connection;
++  }
++
++  @Override
++  public void prepare(boolean reload) throws IOException {
++  }
++
++  @Override
++  public void close() throws IOException {
++  }
++
++  @Override
++  public void throwable(Throwable t, boolean retrying) {
++  }
++
++  @Override
++  public String getExceptionMessageAdditionalDetail() {
++    return "";
++  }
++
++  @Override
++  public long sleep(long pause, int tries) {
++    return ConnectionUtils.getPauseTime(pause, tries);
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+index dbd555c..b9131be 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+@@ -929,30 +929,36 @@ final class ConnectionManager {
+ 
+     @Override
+     public boolean isTableAvailable(final TableName tableName) throws IOException {
+-      final AtomicBoolean available = new AtomicBoolean(true);
+-      final AtomicInteger regionCount = new AtomicInteger(0);
+-      MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+-        @Override
+-        public boolean processRow(Result row) throws IOException {
+-          HRegionInfo info = MetaScanner.getHRegionInfo(row);
+-          if (info != null && !info.isSplitParent()) {
+-            if (tableName.equals(info.getTable())) {
+-              ServerName server = HRegionInfo.getServerName(row);
+-              if (server == null) {
+-                available.set(false);
++      try {
++        if (!isTableEnabled(tableName))
++          return false;
++        final AtomicBoolean available = new AtomicBoolean(true);
++        final AtomicInteger regionCount = new AtomicInteger(0);
++        MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
++          @Override
++          public boolean processRow(Result row) throws IOException {
++            HRegionInfo info = MetaScanner.getHRegionInfo(row);
++            if (info != null && !info.isSplitParent()) {
++              if (tableName.equals(info.getTable())) {
++                ServerName server = HRegionInfo.getServerName(row);
++                if (server == null) {
++                  available.set(false);
++                  return false;
++                }
++                regionCount.incrementAndGet();
++              } else if (tableName.compareTo(info.getTable()) < 0) {
++                // Return if we are done with the current table
+                 return false;
+               }
+-              regionCount.incrementAndGet();
+-            } else if (tableName.compareTo(info.getTable()) < 0) {
+-              // Return if we are done with the current table
+-              return false;
+             }
++            return true;
+           }
+-          return true;
+-        }
+-      };
+-      MetaScanner.metaScan(this, visitor, tableName);
+-      return available.get() && (regionCount.get() > 0);
++        };
++        MetaScanner.metaScan(this, visitor, tableName);
++        return available.get() && (regionCount.get() > 0);
++      } catch (TableNotFoundException tnfe) {
++        return false;
++      }
+     }
+ 
+     @Override
+@@ -963,42 +969,48 @@ final class ConnectionManager {
+     @Override
+     public boolean isTableAvailable(final TableName tableName, final byte[][] splitKeys)
+         throws IOException {
+-      final AtomicBoolean available = new AtomicBoolean(true);
+-      final AtomicInteger regionCount = new AtomicInteger(0);
+-      MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+-        @Override
+-        public boolean processRow(Result row) throws IOException {
+-          HRegionInfo info = MetaScanner.getHRegionInfo(row);
+-          if (info != null && !info.isSplitParent()) {
+-            if (tableName.equals(info.getTable())) {
+-              ServerName server = HRegionInfo.getServerName(row);
+-              if (server == null) {
+-                available.set(false);
+-                return false;
+-              }
+-              if (!Bytes.equals(info.getStartKey(), HConstants.EMPTY_BYTE_ARRAY)) {
+-                for (byte[] splitKey : splitKeys) {
+-                  // Just check if the splitkey is available
+-                  if (Bytes.equals(info.getStartKey(), splitKey)) {
+-                    regionCount.incrementAndGet();
+-                    break;
++      try {
++        if (!isTableEnabled(tableName))
++          return false;
++        final AtomicBoolean available = new AtomicBoolean(true);
++        final AtomicInteger regionCount = new AtomicInteger(0);
++        MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
++          @Override
++          public boolean processRow(Result row) throws IOException {
++            HRegionInfo info = MetaScanner.getHRegionInfo(row);
++            if (info != null && !info.isSplitParent()) {
++              if (tableName.equals(info.getTable())) {
++                ServerName server = HRegionInfo.getServerName(row);
++                if (server == null) {
++                  available.set(false);
++                  return false;
++                }
++                if (!Bytes.equals(info.getStartKey(), HConstants.EMPTY_BYTE_ARRAY)) {
++                  for (byte[] splitKey : splitKeys) {
++                    // Just check if the splitkey is available
++                    if (Bytes.equals(info.getStartKey(), splitKey)) {
++                      regionCount.incrementAndGet();
++                      break;
++                    }
+                   }
++                } else {
++                  // Always empty start row should be counted
++                  regionCount.incrementAndGet();
+                 }
+-              } else {
+-                // Always empty start row should be counted
+-                regionCount.incrementAndGet();
++              } else if (tableName.compareTo(info.getTable()) < 0) {
++                // Return if we are done with the current table
++                return false;
+               }
+-            } else if (tableName.compareTo(info.getTable()) < 0) {
+-              // Return if we are done with the current table
+-              return false;
+             }
++            return true;
+           }
+-          return true;
+-        }
+-      };
+-      MetaScanner.metaScan(this, visitor, tableName);
+-      // +1 needs to be added so that the empty start row is also taken into account
+-      return available.get() && (regionCount.get() == splitKeys.length + 1);
++        };
++        MetaScanner.metaScan(this, visitor, tableName);
++        // +1 needs to be added so that the empty start row is also taken into account
++        return available.get() && (regionCount.get() == splitKeys.length + 1);
++      } catch (TableNotFoundException tnf) {
++        return false;
++      }
+     }
+ 
+     @Override
+@@ -2485,7 +2497,7 @@ final class ConnectionManager {
+       GetTableDescriptorsResponse htds;
+       try {
+         GetTableDescriptorsRequest req =
+-          RequestConverter.buildGetTableDescriptorsRequest(tableName);
++            RequestConverter.buildGetTableDescriptorsRequest(tableName);
+         htds = master.getTableDescriptors(null, req);
+       } catch (ServiceException se) {
+         throw ProtobufUtil.getRemoteException(se);
+@@ -2510,16 +2522,11 @@ final class ConnectionManager {
+ 
+     @Override
+     public TableState getTableState(TableName tableName) throws IOException {
+-      MasterKeepAliveConnection master = getKeepAliveMasterService();
+-      try {
+-        GetTableStateResponse resp = master.getTableState(null,
+-                RequestConverter.buildGetTableStateRequest(tableName));
+-        return TableState.convert(resp.getTableState());
+-      } catch (ServiceException se) {
+-        throw ProtobufUtil.getRemoteException(se);
+-      } finally {
+-        master.close();
+-      }
++      ClusterConnection conn = getConnectionInternal(getConfiguration());
++      TableState tableState = MetaTableAccessor.getTableState(conn, tableName);
++      if (tableState == null)
++        throw new TableNotFoundException(tableName);
++      return tableState;
+     }
+ 
+     @Override
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index d14e369..3acaaf9 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.hadoop.hbase.client;
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.net.SocketTimeoutException;
+@@ -286,7 +287,12 @@ public class HBaseAdmin implements Admin {
+    */
+   @Override
+   public boolean tableExists(final TableName tableName) throws IOException {
+-    return MetaTableAccessor.tableExists(connection, tableName);
++    return executeCallable(new ConnectionCallable<Boolean>(getConnection()) {
++      @Override
++      public Boolean call(int callTimeout) throws ServiceException, IOException {
++        return MetaTableAccessor.tableExists(connection, tableName);
++      }
++    });
+   }
+ 
+   public boolean tableExists(final byte[] tableName)
+@@ -547,11 +553,11 @@ public class HBaseAdmin implements Admin {
+     }
+     int numRegs = (splitKeys == null ? 1 : splitKeys.length + 1) * desc.getRegionReplication();
+     int prevRegCount = 0;
+-    boolean doneWithMetaScan = false;
++    boolean tableWasEnabled = false;
+     for (int tries = 0; tries < this.numRetries * this.retryLongerMultiplier;
+       ++tries) {
+-      if (!doneWithMetaScan) {
+-        // Wait for new table to come on-line
++      if (tableWasEnabled) {
++        // Wait all table regions comes online
+         final AtomicInteger actualRegCount = new AtomicInteger(0);
+         MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+           @Override
+@@ -599,17 +605,26 @@ public class HBaseAdmin implements Admin {
+             tries = -1;
+           }
+         } else {
+-          doneWithMetaScan = true;
+-          tries = -1;
++          return;
+         }
+-      } else if (isTableEnabled(desc.getTableName())) {
+-        return;
+       } else {
+-        try { // Sleep
+-          Thread.sleep(getPauseTime(tries));
+-        } catch (InterruptedException e) {
+-          throw new InterruptedIOException("Interrupted when waiting" +
+-            " for table to be enabled; meta scan was done");
++        try {
++          tableWasEnabled = isTableAvailable(desc.getTableName());
++        } catch (TableNotFoundException tnfe) {
++          LOG.debug(
++              "Table " + desc.getTableName() + " was not enabled, sleeping, still " + numRetries
++                  + " retries left");
++        }
++        if (tableWasEnabled) {
++          // no we will scan meta to ensure all regions are online
++          tries = -1;
++        } else {
++          try { // Sleep
++            Thread.sleep(getPauseTime(tries));
++          } catch (InterruptedException e) {
++            throw new InterruptedIOException("Interrupted when waiting" +
++                " for table to be enabled; meta scan was done");
++          }
+         }
+       }
+     }
+@@ -698,24 +713,11 @@ public class HBaseAdmin implements Admin {
+     });
+ 
+     int failures = 0;
+-    // Wait until all regions deleted
+     for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
+       try {
+-        // Find whether all regions are deleted.
+-        List<RegionLocations> regionLations =
+-            MetaScanner.listTableRegionLocations(conf, connection, tableName);
+-
+-        // let us wait until hbase:meta table is updated and
+-        // HMaster removes the table from its HTableDescriptors
+-        if (regionLations == null || regionLations.size() == 0) {
+-          HTableDescriptor htd = getTableDescriptorByTableName(tableName);
+-
+-          if (htd == null) {
+-            // table could not be found in master - we are done.
+-            tableExists = false;
+-            break;
+-          }
+-        }
++        tableExists = tableExists(tableName);
++        if (!tableExists)
++          break;
+       } catch (IOException ex) {
+         failures++;
+         if(failures >= numRetries - 1) {           // no more tries left
+@@ -1109,9 +1111,17 @@ public class HBaseAdmin implements Admin {
+    * @throws IOException if a remote or network exception occurs
+    */
+   @Override
+-  public boolean isTableEnabled(TableName tableName) throws IOException {
++  public boolean isTableEnabled(final TableName tableName) throws IOException {
+     checkTableExistence(tableName);
+-    return connection.isTableEnabled(tableName);
++    return executeCallable(new ConnectionCallable<Boolean>(getConnection()) {
++      @Override
++      public Boolean call(int callTimeout) throws ServiceException, IOException {
++        TableState tableState = MetaTableAccessor.getTableState(connection, tableName);
++        if (tableState == null)
++          throw new TableNotFoundException(tableName);
++        return tableState.inStates(TableState.State.ENABLED);
++      }
++    });
+   }
+ 
+   public boolean isTableEnabled(byte[] tableName) throws IOException {
+@@ -2296,10 +2306,15 @@ public class HBaseAdmin implements Admin {
+    */
+   private TableName checkTableExists(final TableName tableName)
+       throws IOException {
+-    if (!MetaTableAccessor.tableExists(connection, tableName)) {
+-      throw new TableNotFoundException(tableName);
+-    }
+-    return tableName;
++    return executeCallable(new ConnectionCallable<TableName>(getConnection()) {
++      @Override
++      public TableName call(int callTimeout) throws ServiceException, IOException {
++        if (!MetaTableAccessor.tableExists(connection, tableName)) {
++          throw new TableNotFoundException(tableName);
++        }
++        return tableName;
++      }
++    });
+   }
+ 
+   /**
+@@ -3667,7 +3682,8 @@ public class HBaseAdmin implements Admin {
+     return QuotaRetriever.open(conf, filter);
+   }
+ 
+-  private <V> V executeCallable(MasterCallable<V> callable) throws IOException {
++  private <C extends RetryingCallable<V> & Closeable, V> V executeCallable(C callable)
++      throws IOException {
+     RpcRetryingCaller<V> caller = rpcCallerFactory.newCaller();
+     try {
+       return caller.callWithRetries(callable, operationTimeout);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java
+index be9b80c..77c90f5 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableState.java
+@@ -17,9 +17,11 @@
+  */
+ package org.apache.hadoop.hbase.client;
+ 
++import com.google.protobuf.InvalidProtocolBufferException;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
++import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+ 
+@@ -171,20 +173,30 @@ public class TableState {
+   public HBaseProtos.TableState convert() {
+     return HBaseProtos.TableState.newBuilder()
+         .setState(this.state.convert())
+-        .setTable(ProtobufUtil.toProtoTableName(this.tableName))
++        .setTable(ProtobufUtil.toProtoTableName(this.tableName)) // set for backward compatibility
+         .setTimestamp(this.timestamp)
+             .build();
+   }
+ 
+   /**
+    * Covert from PB version of TableState
++   *
++   * @param tableName table this state of
+    * @param tableState convert from
+    * @return POJO
+    */
+-  public static TableState convert(HBaseProtos.TableState tableState) {
++  public static TableState convert(TableName tableName, HBaseProtos.TableState tableState) {
+     TableState.State state = State.convert(tableState.getState());
+-    return new TableState(ProtobufUtil.toTableName(tableState.getTable()),
+-        state, tableState.getTimestamp());
++    return new TableState(tableName, state, tableState.getTimestamp());
++  }
++
++  public static TableState parseFrom(TableName tableName, byte[] bytes)
++      throws DeserializationException {
++    try {
++      return convert(tableName, HBaseProtos.TableState.parseFrom(bytes));
++    } catch (InvalidProtocolBufferException e) {
++      throw new DeserializationException(e);
++    }
+   }
+ 
+   /**
+@@ -200,4 +212,36 @@ public class TableState {
+     }
+     return false;
+   }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) return true;
++    if (o == null || getClass() != o.getClass()) return false;
++
++    TableState that = (TableState) o;
++
++    if (timestamp != that.timestamp) return false;
++    if (state != that.state) return false;
++    if (tableName != null ? !tableName.equals(that.tableName) : that.tableName != null)
++      return false;
++
++    return true;
++  }
++
++  @Override
++  public int hashCode() {
++    int result = (int) (timestamp ^ (timestamp >>> 32));
++    result = 31 * result + (tableName != null ? tableName.hashCode() : 0);
++    result = 31 * result + (state != null ? state.hashCode() : 0);
++    return result;
++  }
++
++  @Override
++  public String toString() {
++    return "TableState{" +
++        "timestamp=" + timestamp +
++        ", tableName=" + tableName +
++        ", state=" + state +
++        '}';
++  }
+ }
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 49bb7e1..78da7f9 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase;
+ 
+ import static org.apache.hadoop.hbase.io.hfile.BlockType.MAGIC_LENGTH;
+ 
+-import java.nio.ByteBuffer;
+ import java.nio.charset.Charset;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -451,6 +450,16 @@ public final class HConstants {
+   /** The upper-half merge region column qualifier */
+   public static final byte[] MERGEB_QUALIFIER = Bytes.toBytes("mergeB");
+ 
++  /** The catalog family as a string*/
++  public static final String TABLE_FAMILY_STR = "table";
++
++  /** The catalog family */
++  public static final byte [] TABLE_FAMILY = Bytes.toBytes(TABLE_FAMILY_STR);
++
++  /** The serialized table state qualifier */
++  public static final byte[] TABLE_STATE_QUALIFIER = Bytes.toBytes("state");
++
++
+   /**
+    * The meta table version column qualifier.
+    * We keep current version of the meta table in this column in <code>-ROOT-</code>
+@@ -738,7 +747,8 @@ public final class HConstants {
+   /**
+    * The client scanner timeout period in milliseconds.
+    */
+-  public static final String HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD = "hbase.client.scanner.timeout.period";
++  public static final String HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD =
++      "hbase.client.scanner.timeout.period";
+ 
+   /**
+    * Use {@link #HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD} instead.
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/HBaseProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/HBaseProtos.java
+index 2947f40..a96ef17 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/HBaseProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/HBaseProtos.java
+@@ -3450,15 +3450,15 @@ public final class HBaseProtos {
+      */
+     org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableSchemaOrBuilder getSchemaOrBuilder();
+ 
+-    // optional .TableState.State state = 2 [default = ENABLED];
++    // optional .TableState.State state = 2 [default = ENABLED, deprecated = true];
+     /**
+-     * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++     * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+      */
+-    boolean hasState();
++    @java.lang.Deprecated boolean hasState();
+     /**
+-     * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++     * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+      */
+-    org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState();
++    @java.lang.Deprecated org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState();
+   }
+   /**
+    * Protobuf type {@code TableDescriptor}
+@@ -3601,19 +3601,19 @@ public final class HBaseProtos {
+       return schema_;
+     }
+ 
+-    // optional .TableState.State state = 2 [default = ENABLED];
++    // optional .TableState.State state = 2 [default = ENABLED, deprecated = true];
+     public static final int STATE_FIELD_NUMBER = 2;
+     private org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State state_;
+     /**
+-     * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++     * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+      */
+-    public boolean hasState() {
++    @java.lang.Deprecated public boolean hasState() {
+       return ((bitField0_ & 0x00000002) == 0x00000002);
+     }
+     /**
+-     * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++     * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+      */
+-    public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState() {
++    @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState() {
+       return state_;
+     }
+ 
+@@ -4054,24 +4054,24 @@ public final class HBaseProtos {
+         return schemaBuilder_;
+       }
+ 
+-      // optional .TableState.State state = 2 [default = ENABLED];
++      // optional .TableState.State state = 2 [default = ENABLED, deprecated = true];
+       private org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State state_ = org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State.ENABLED;
+       /**
+-       * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++       * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+        */
+-      public boolean hasState() {
++      @java.lang.Deprecated public boolean hasState() {
+         return ((bitField0_ & 0x00000002) == 0x00000002);
+       }
+       /**
+-       * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++       * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+        */
+-      public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState() {
++      @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State getState() {
+         return state_;
+       }
+       /**
+-       * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++       * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+        */
+-      public Builder setState(org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State value) {
++      @java.lang.Deprecated public Builder setState(org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State value) {
+         if (value == null) {
+           throw new NullPointerException();
+         }
+@@ -4081,9 +4081,9 @@ public final class HBaseProtos {
+         return this;
+       }
+       /**
+-       * <code>optional .TableState.State state = 2 [default = ENABLED];</code>
++       * <code>optional .TableState.State state = 2 [default = ENABLED, deprecated = true];</code>
+        */
+-      public Builder clearState() {
++      @java.lang.Deprecated public Builder clearState() {
+         bitField0_ = (bitField0_ & ~0x00000002);
+         state_ = org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.TableState.State.ENABLED;
+         onChanged();
+@@ -18197,52 +18197,52 @@ public final class HBaseProtos {
+       "TableState.State\022\031\n\005table\030\002 \002(\0132\n.TableN" +
+       "ame\022\021\n\ttimestamp\030\003 \001(\004\"?\n\005State\022\013\n\007ENABL" +
+       "ED\020\000\022\014\n\010DISABLED\020\001\022\r\n\tDISABLING\020\002\022\014\n\010ENA",
+-      "BLING\020\003\"Z\n\017TableDescriptor\022\034\n\006schema\030\001 \002" +
+-      "(\0132\014.TableSchema\022)\n\005state\030\002 \001(\0162\021.TableS" +
+-      "tate.State:\007ENABLED\"o\n\022ColumnFamilySchem" +
+-      "a\022\014\n\004name\030\001 \002(\014\022#\n\nattributes\030\002 \003(\0132\017.By" +
+-      "tesBytesPair\022&\n\rconfiguration\030\003 \003(\0132\017.Na" +
+-      "meStringPair\"\232\001\n\nRegionInfo\022\021\n\tregion_id" +
+-      "\030\001 \002(\004\022\036\n\ntable_name\030\002 \002(\0132\n.TableName\022\021" +
+-      "\n\tstart_key\030\003 \001(\014\022\017\n\007end_key\030\004 \001(\014\022\017\n\007of" +
+-      "fline\030\005 \001(\010\022\r\n\005split\030\006 \001(\010\022\025\n\nreplica_id" +
+-      "\030\007 \001(\005:\0010\"1\n\014FavoredNodes\022!\n\014favored_nod",
+-      "e\030\001 \003(\0132\013.ServerName\"\225\001\n\017RegionSpecifier" +
+-      "\0222\n\004type\030\001 \002(\0162$.RegionSpecifier.RegionS" +
+-      "pecifierType\022\r\n\005value\030\002 \002(\014\"?\n\023RegionSpe" +
+-      "cifierType\022\017\n\013REGION_NAME\020\001\022\027\n\023ENCODED_R" +
+-      "EGION_NAME\020\002\"%\n\tTimeRange\022\014\n\004from\030\001 \001(\004\022" +
+-      "\n\n\002to\030\002 \001(\004\"A\n\nServerName\022\021\n\thost_name\030\001" +
+-      " \002(\t\022\014\n\004port\030\002 \001(\r\022\022\n\nstart_code\030\003 \001(\004\"\033" +
+-      "\n\013Coprocessor\022\014\n\004name\030\001 \002(\t\"-\n\016NameStrin" +
+-      "gPair\022\014\n\004name\030\001 \002(\t\022\r\n\005value\030\002 \002(\t\",\n\rNa" +
+-      "meBytesPair\022\014\n\004name\030\001 \002(\t\022\r\n\005value\030\002 \001(\014",
+-      "\"/\n\016BytesBytesPair\022\r\n\005first\030\001 \002(\014\022\016\n\006sec" +
+-      "ond\030\002 \002(\014\",\n\rNameInt64Pair\022\014\n\004name\030\001 \001(\t" +
+-      "\022\r\n\005value\030\002 \001(\003\"\314\001\n\023SnapshotDescription\022" +
+-      "\014\n\004name\030\001 \002(\t\022\r\n\005table\030\002 \001(\t\022\030\n\rcreation" +
+-      "_time\030\003 \001(\003:\0010\022.\n\004type\030\004 \001(\0162\031.SnapshotD" +
+-      "escription.Type:\005FLUSH\022\017\n\007version\030\005 \001(\005\022" +
+-      "\r\n\005owner\030\006 \001(\t\".\n\004Type\022\014\n\010DISABLED\020\000\022\t\n\005" +
+-      "FLUSH\020\001\022\r\n\tSKIPFLUSH\020\002\"}\n\024ProcedureDescr" +
+-      "iption\022\021\n\tsignature\030\001 \002(\t\022\020\n\010instance\030\002 " +
+-      "\001(\t\022\030\n\rcreation_time\030\003 \001(\003:\0010\022&\n\rconfigu",
+-      "ration\030\004 \003(\0132\017.NameStringPair\"\n\n\010EmptyMs" +
+-      "g\"\033\n\007LongMsg\022\020\n\010long_msg\030\001 \002(\003\"\037\n\tDouble" +
+-      "Msg\022\022\n\ndouble_msg\030\001 \002(\001\"\'\n\rBigDecimalMsg" +
+-      "\022\026\n\016bigdecimal_msg\030\001 \002(\014\"5\n\004UUID\022\026\n\016leas" +
+-      "t_sig_bits\030\001 \002(\004\022\025\n\rmost_sig_bits\030\002 \002(\004\"" +
+-      "K\n\023NamespaceDescriptor\022\014\n\004name\030\001 \002(\014\022&\n\r" +
+-      "configuration\030\002 \003(\0132\017.NameStringPair\"$\n\020" +
+-      "RegionServerInfo\022\020\n\010infoPort\030\001 \001(\005*r\n\013Co" +
+-      "mpareType\022\010\n\004LESS\020\000\022\021\n\rLESS_OR_EQUAL\020\001\022\t" +
+-      "\n\005EQUAL\020\002\022\r\n\tNOT_EQUAL\020\003\022\024\n\020GREATER_OR_E",
+-      "QUAL\020\004\022\013\n\007GREATER\020\005\022\t\n\005NO_OP\020\006*n\n\010TimeUn" +
+-      "it\022\017\n\013NANOSECONDS\020\001\022\020\n\014MICROSECONDS\020\002\022\020\n" +
+-      "\014MILLISECONDS\020\003\022\013\n\007SECONDS\020\004\022\013\n\007MINUTES\020" +
+-      "\005\022\t\n\005HOURS\020\006\022\010\n\004DAYS\020\007B>\n*org.apache.had" +
+-      "oop.hbase.protobuf.generatedB\013HBaseProto" +
+-      "sH\001\240\001\001"
++      "BLING\020\003\"^\n\017TableDescriptor\022\034\n\006schema\030\001 \002" +
++      "(\0132\014.TableSchema\022-\n\005state\030\002 \001(\0162\021.TableS" +
++      "tate.State:\007ENABLEDB\002\030\001\"o\n\022ColumnFamilyS" +
++      "chema\022\014\n\004name\030\001 \002(\014\022#\n\nattributes\030\002 \003(\0132" +
++      "\017.BytesBytesPair\022&\n\rconfiguration\030\003 \003(\0132" +
++      "\017.NameStringPair\"\232\001\n\nRegionInfo\022\021\n\tregio" +
++      "n_id\030\001 \002(\004\022\036\n\ntable_name\030\002 \002(\0132\n.TableNa" +
++      "me\022\021\n\tstart_key\030\003 \001(\014\022\017\n\007end_key\030\004 \001(\014\022\017" +
++      "\n\007offline\030\005 \001(\010\022\r\n\005split\030\006 \001(\010\022\025\n\nreplic" +
++      "a_id\030\007 \001(\005:\0010\"1\n\014FavoredNodes\022!\n\014favored",
++      "_node\030\001 \003(\0132\013.ServerName\"\225\001\n\017RegionSpeci" +
++      "fier\0222\n\004type\030\001 \002(\0162$.RegionSpecifier.Reg" +
++      "ionSpecifierType\022\r\n\005value\030\002 \002(\014\"?\n\023Regio" +
++      "nSpecifierType\022\017\n\013REGION_NAME\020\001\022\027\n\023ENCOD" +
++      "ED_REGION_NAME\020\002\"%\n\tTimeRange\022\014\n\004from\030\001 " +
++      "\001(\004\022\n\n\002to\030\002 \001(\004\"A\n\nServerName\022\021\n\thost_na" +
++      "me\030\001 \002(\t\022\014\n\004port\030\002 \001(\r\022\022\n\nstart_code\030\003 \001" +
++      "(\004\"\033\n\013Coprocessor\022\014\n\004name\030\001 \002(\t\"-\n\016NameS" +
++      "tringPair\022\014\n\004name\030\001 \002(\t\022\r\n\005value\030\002 \002(\t\"," +
++      "\n\rNameBytesPair\022\014\n\004name\030\001 \002(\t\022\r\n\005value\030\002",
++      " \001(\014\"/\n\016BytesBytesPair\022\r\n\005first\030\001 \002(\014\022\016\n" +
++      "\006second\030\002 \002(\014\",\n\rNameInt64Pair\022\014\n\004name\030\001" +
++      " \001(\t\022\r\n\005value\030\002 \001(\003\"\314\001\n\023SnapshotDescript" +
++      "ion\022\014\n\004name\030\001 \002(\t\022\r\n\005table\030\002 \001(\t\022\030\n\rcrea" +
++      "tion_time\030\003 \001(\003:\0010\022.\n\004type\030\004 \001(\0162\031.Snaps" +
++      "hotDescription.Type:\005FLUSH\022\017\n\007version\030\005 " +
++      "\001(\005\022\r\n\005owner\030\006 \001(\t\".\n\004Type\022\014\n\010DISABLED\020\000" +
++      "\022\t\n\005FLUSH\020\001\022\r\n\tSKIPFLUSH\020\002\"}\n\024ProcedureD" +
++      "escription\022\021\n\tsignature\030\001 \002(\t\022\020\n\010instanc" +
++      "e\030\002 \001(\t\022\030\n\rcreation_time\030\003 \001(\003:\0010\022&\n\rcon",
++      "figuration\030\004 \003(\0132\017.NameStringPair\"\n\n\010Emp" +
++      "tyMsg\"\033\n\007LongMsg\022\020\n\010long_msg\030\001 \002(\003\"\037\n\tDo" +
++      "ubleMsg\022\022\n\ndouble_msg\030\001 \002(\001\"\'\n\rBigDecima" +
++      "lMsg\022\026\n\016bigdecimal_msg\030\001 \002(\014\"5\n\004UUID\022\026\n\016" +
++      "least_sig_bits\030\001 \002(\004\022\025\n\rmost_sig_bits\030\002 " +
++      "\002(\004\"K\n\023NamespaceDescriptor\022\014\n\004name\030\001 \002(\014" +
++      "\022&\n\rconfiguration\030\002 \003(\0132\017.NameStringPair" +
++      "\"$\n\020RegionServerInfo\022\020\n\010infoPort\030\001 \001(\005*r" +
++      "\n\013CompareType\022\010\n\004LESS\020\000\022\021\n\rLESS_OR_EQUAL" +
++      "\020\001\022\t\n\005EQUAL\020\002\022\r\n\tNOT_EQUAL\020\003\022\024\n\020GREATER_",
++      "OR_EQUAL\020\004\022\013\n\007GREATER\020\005\022\t\n\005NO_OP\020\006*n\n\010Ti" +
++      "meUnit\022\017\n\013NANOSECONDS\020\001\022\020\n\014MICROSECONDS\020" +
++      "\002\022\020\n\014MILLISECONDS\020\003\022\013\n\007SECONDS\020\004\022\013\n\007MINU" +
++      "TES\020\005\022\t\n\005HOURS\020\006\022\010\n\004DAYS\020\007B>\n*org.apache" +
++      ".hadoop.hbase.protobuf.generatedB\013HBaseP" +
++      "rotosH\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+diff --git a/hbase-protocol/src/main/protobuf/HBase.proto b/hbase-protocol/src/main/protobuf/HBase.proto
+index c3c8c6a..1566846 100644
+--- a/hbase-protocol/src/main/protobuf/HBase.proto
++++ b/hbase-protocol/src/main/protobuf/HBase.proto
+@@ -55,14 +55,14 @@ message TableState {
+   }
+   // This is the table's state.
+   required State state = 1;
+-  required TableName table = 2;
++  required TableName table = 2 [deprecated = true];
+   optional uint64 timestamp = 3;
+ }
+ 
+ /** On HDFS representation of table state. */
+ message TableDescriptor {
+   required TableSchema schema = 1;
+-  optional TableState.State state = 2 [ default = ENABLED ];
++  optional TableState.State state = 2 [ default = ENABLED, deprecated = true ];
+ }
+ 
+ /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/TableDescriptor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/TableDescriptor.java
+index d27bfb7..d1935db 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/TableDescriptor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/TableDescriptor.java
+@@ -17,12 +17,13 @@
+  */
+ package org.apache.hadoop.hbase;
+ 
++import javax.annotation.Nullable;
+ import java.io.IOException;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.protobuf.InvalidProtocolBufferException;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.TableState;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+@@ -35,15 +36,23 @@ import org.apache.hadoop.hbase.regionserver.BloomType;
+ @InterfaceAudience.Private
+ public class TableDescriptor {
+   private HTableDescriptor hTableDescriptor;
++  /**
++   * Don't use, state was moved to meta, use MetaTableAccessor instead
++   * @deprecated state was moved to meta
++   */
++  @Deprecated
++  @Nullable
+   private TableState.State tableState;
+ 
+   /**
+    * Creates TableDescriptor with all fields.
+    * @param hTableDescriptor HTableDescriptor to use
+    * @param tableState table state
++   * @deprecated state was moved to meta
+    */
++  @Deprecated
+   public TableDescriptor(HTableDescriptor hTableDescriptor,
+-      TableState.State tableState) {
++      @Nullable TableState.State tableState) {
+     this.hTableDescriptor = hTableDescriptor;
+     this.tableState = tableState;
+   }
+@@ -69,22 +78,35 @@ public class TableDescriptor {
+     this.hTableDescriptor = hTableDescriptor;
+   }
+ 
++  /**
++   * @return table state
++   * @deprecated state was moved to meta
++   */
++  @Deprecated
++  @Nullable
+   public TableState.State getTableState() {
+     return tableState;
+   }
+ 
+-  public void setTableState(TableState.State tableState) {
++  /**
++   * @param tableState state to set for table
++   * @deprecated state was moved to meta
++   */
++  @Deprecated
++  public void setTableState(@Nullable TableState.State tableState) {
+     this.tableState = tableState;
+   }
+ 
+   /**
+    * Convert to PB.
+    */
++  @SuppressWarnings("deprecation")
+   public HBaseProtos.TableDescriptor convert() {
+-    return HBaseProtos.TableDescriptor.newBuilder()
+-        .setSchema(hTableDescriptor.convert())
+-        .setState(tableState.convert())
+-        .build();
++    HBaseProtos.TableDescriptor.Builder builder = HBaseProtos.TableDescriptor.newBuilder()
++        .setSchema(hTableDescriptor.convert());
++    if (tableState!= null)
++      builder.setState(tableState.convert());
++    return builder.build();
+   }
+ 
+   /**
+@@ -92,7 +114,9 @@ public class TableDescriptor {
+    */
+   public static TableDescriptor convert(HBaseProtos.TableDescriptor proto) {
+     HTableDescriptor hTableDescriptor = HTableDescriptor.convert(proto.getSchema());
+-    TableState.State state = TableState.State.convert(proto.getState());
++    TableState.State state = proto.hasState()?
++        TableState.State.convert(proto.getState())
++        :null;
+     return new TableDescriptor(hTableDescriptor, state);
+   }
+ 
+@@ -170,6 +194,17 @@ public class TableDescriptor {
+                 .setBloomFilterType(BloomType.NONE)
+                     // Enable cache of data blocks in L1 if more than one caching tier deployed:
+                     // e.g. if using CombinedBlockCache (BucketCache).
++                .setCacheDataInL1(true),
++            new HColumnDescriptor(HConstants.TABLE_FAMILY)
++                // Ten is arbitrary number.  Keep versions to help debugging.
++                .setMaxVersions(10)
++                .setInMemory(true)
++                .setBlocksize(8 * 1024)
++                .setScope(HConstants.REPLICATION_SCOPE_LOCAL)
++                    // Disable blooms for meta.  Needs work.  Seems to mess w/ getClosestOrBefore.
++                .setBloomFilterType(BloomType.NONE)
++                    // Enable cache of data blocks in L1 if more than one caching tier deployed:
++                    // e.g. if using CombinedBlockCache (BucketCache).
+                 .setCacheDataInL1(true)
+         }) {
+     };
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+index 5eb9a52..93a9c87 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcServer.java
+@@ -198,6 +198,7 @@ public class RpcServer implements RpcServerInterface {
+ 
+   protected final InetSocketAddress isa;
+   protected int port;                             // port we listen on
++  protected InetSocketAddress address;            // inet address we listen on
+   private int readThreads;                        // number of read threads
+   protected int maxIdleTime;                      // the maximum idle time after
+                                                   // which a client may be
+@@ -528,6 +529,7 @@ public class RpcServer implements RpcServerInterface {
+       // Bind the server socket to the local host and port
+       bind(acceptChannel.socket(), isa, backlogLength);
+       port = acceptChannel.socket().getLocalPort(); //Could be an ephemeral port
++      address = (InetSocketAddress)acceptChannel.socket().getLocalSocketAddress();
+       // create a selector;
+       selector= Selector.open();
+ 
+@@ -753,7 +755,7 @@ public class RpcServer implements RpcServerInterface {
+     }
+ 
+     InetSocketAddress getAddress() {
+-      return (InetSocketAddress)acceptChannel.socket().getLocalSocketAddress();
++      return address;
+     }
+ 
+     void doAccept(SelectionKey key) throws IOException, OutOfMemoryError {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+index 4d9ff13..f861529 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+@@ -54,7 +54,6 @@ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.MetaTableAccessor;
+ import org.apache.hadoop.hbase.NotServingRegionException;
+ import org.apache.hadoop.hbase.RegionLocations;
+-import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.TableNotFoundException;
+@@ -99,7 +98,7 @@ import com.google.common.annotations.VisibleForTesting;
+ public class AssignmentManager {
+   private static final Log LOG = LogFactory.getLog(AssignmentManager.class);
+ 
+-  protected final Server server;
++  protected final MasterServices server;
+ 
+   private ServerManager serverManager;
+ 
+@@ -130,8 +129,8 @@ public class AssignmentManager {
+   private final int maximumAttempts;
+ 
+   /**
+-   * The sleep time for which the assignment will wait before retrying in case of hbase:meta assignment
+-   * failure due to lack of availability of region plan or bad region plan
++   * The sleep time for which the assignment will wait before retrying in case of
++   * hbase:meta assignment failure due to lack of availability of region plan or bad region plan
+    */
+   private final long sleepTimeBeforeRetryingMetaAssignment;
+ 
+@@ -209,7 +208,7 @@ public class AssignmentManager {
+    * @param tableLockManager TableLock manager
+    * @throws IOException
+    */
+-  public AssignmentManager(Server server, ServerManager serverManager,
++  public AssignmentManager(MasterServices server, ServerManager serverManager,
+       final LoadBalancer balancer,
+       final ExecutorService service, MetricsMaster metricsMaster,
+       final TableLockManager tableLockManager,
+@@ -1570,7 +1569,7 @@ public class AssignmentManager {
+             TableState.State.ENABLING);
+ 
+     // Region assignment from META
+-    List<Result> results = MetaTableAccessor.fullScanOfMeta(server.getConnection());
++    List<Result> results = MetaTableAccessor.fullScanRegions(server.getConnection());
+     // Get any new but slow to checkin region server that joined the cluster
+     Set<ServerName> onlineServers = serverManager.getOnlineServers().keySet();
+     // Set of offline servers to be returned
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 020d6fb..f21edc2 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -344,7 +344,8 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+       conf.getLong("hbase.master.buffer.for.rs.fatals", 1*1024*1024));
+ 
+     LOG.info("hbase.rootdir=" + FSUtils.getRootDir(this.conf) +
+-        ", hbase.cluster.distributed=" + this.conf.getBoolean(HConstants.CLUSTER_DISTRIBUTED, false));
++        ", hbase.cluster.distributed=" + this.conf.getBoolean(HConstants.CLUSTER_DISTRIBUTED,
++        false));
+ 
+     // Disable usage of meta replicas in the master
+     this.conf.setBoolean(HConstants.USE_META_REPLICAS, false);
+@@ -430,6 +431,11 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+     return connector.getLocalPort();
+   }
+ 
++  @Override
++  protected TableDescriptors getFsTableDescriptors() throws IOException {
++    return super.getFsTableDescriptors();
++  }
++
+   /**
+    * For compatibility, if failed with regionserver credentials, try the master one
+    */
+@@ -629,9 +635,7 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+ 
+     // Invalidate all write locks held previously
+     this.tableLockManager.reapWriteLocks();
+-
+     this.tableStateManager = new TableStateManager(this);
+-    this.tableStateManager.start();
+ 
+     status.setStatus("Initializing ZK system trackers");
+     initializeZKBasedSystemTrackers();
+@@ -869,7 +873,10 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+       assigned++;
+     }
+ 
+-    if (replicaId == HRegionInfo.DEFAULT_REPLICA_ID) enableMeta(TableName.META_TABLE_NAME);
++    if (replicaId == HRegionInfo.DEFAULT_REPLICA_ID)
++      getTableStateManager().setTableState(TableName.META_TABLE_NAME, TableState.State.ENABLED);
++    // TODO: should we prevent from using state manager before meta was initialized?
++    // tableStateManager.start();
+ 
+     if ((RecoveryMode.LOG_REPLAY == this.getMasterFileSystem().getLogRecoveryMode())
+         && (!previouslyFailedMetaRSs.isEmpty())) {
+@@ -878,6 +885,9 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+       this.fileSystemManager.splitMetaLog(previouslyFailedMetaRSs);
+     }
+ 
++    this.assignmentManager.setEnabledTable(TableName.META_TABLE_NAME);
++    tableStateManager.start();
++
+     // Make sure a hbase:meta location is set. We need to enable SSH here since
+     // if the meta region server is died at this time, we need it to be re-assigned
+     // by SSH so that system tables can be assigned.
+@@ -934,13 +944,6 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+     }
+   }
+ 
+-  private void enableMeta(TableName metaTableName) {
+-    if (!this.tableStateManager.isTableState(metaTableName,
+-            TableState.State.ENABLED)) {
+-      this.assignmentManager.setEnabledTable(metaTableName);
+-    }
+-  }
+-
+   /**
+    * This function returns a set of region server names under hbase:meta recovering region ZK node
+    * @return Set of meta server names which were recorded in ZK
+@@ -1173,7 +1176,8 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+           if (rpCount < plans.size() &&
+               // if performing next balance exceeds cutoff time, exit the loop
+               (System.currentTimeMillis() + (totalRegPlanExecTime / rpCount)) > cutoffTime) {
+-            //TODO: After balance, there should not be a cutoff time (keeping it as a security net for now)
++            //TODO: After balance, there should not be a cutoff time (keeping it as
++            // a security net for now)
+             LOG.debug("No more balancing till next balance run; maximumBalanceTime=" +
+               maximumBalanceTime);
+             break;
+@@ -1463,7 +1467,8 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+           LOG.fatal("Failed to become active master", t);
+           // HBASE-5680: Likely hadoop23 vs hadoop 20.x/1.x incompatibility
+           if (t instanceof NoClassDefFoundError &&
+-              t.getMessage().contains("org/apache/hadoop/hdfs/protocol/FSConstants$SafeModeAction")) {
++              t.getMessage()
++                  .contains("org/apache/hadoop/hdfs/protocol/FSConstants$SafeModeAction")) {
+             // improved error message for this special case
+             abort("HBase is having a problem with its Hadoop jars.  You may need to "
+               + "recompile HBase against Hadoop version "
+@@ -2192,15 +2197,18 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+         }
+ 
+         for (HTableDescriptor desc: htds) {
+-          if (includeSysTables || !desc.getTableName().isSystemTable()) {
++          if (tableStateManager.isTablePresent(desc.getTableName())
++              && (includeSysTables || !desc.getTableName().isSystemTable())) {
+             descriptors.add(desc);
+           }
+         }
+       } else {
+         for (TableName s: tableNameList) {
+-          HTableDescriptor desc = tableDescriptors.get(s);
+-          if (desc != null) {
+-            descriptors.add(desc);
++          if (tableStateManager.isTablePresent(s)) {
++            HTableDescriptor desc = tableDescriptors.get(s);
++            if (desc != null) {
++              descriptors.add(desc);
++            }
+           }
+         }
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/LoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/LoadBalancer.java
+index f979403..c4eecfa 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/LoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/LoadBalancer.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.hadoop.hbase.master;
+ 
++import javax.annotation.Nullable;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -88,6 +89,7 @@ public interface LoadBalancer extends Configurable, Stoppable, ConfigurationObse
+    * @param servers
+    * @return List of plans
+    */
++  @Nullable
+   Map<ServerName, List<HRegionInfo>> retainAssignment(
+     Map<HRegionInfo, ServerName> regions,
+     List<ServerName> servers
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+index 4d72312..78e4c11 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+@@ -471,7 +471,7 @@ public class MasterFileSystem {
+     // we should get them from registry.
+     FSTableDescriptors fsd = new FSTableDescriptors(c, fs, rd);
+     fsd.createTableDescriptor(
+-        new TableDescriptor(fsd.get(TableName.META_TABLE_NAME), TableState.State.ENABLING));
++        new TableDescriptor(fsd.get(TableName.META_TABLE_NAME)));
+ 
+     return rd;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+index 0e81461..4af53a4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+@@ -850,8 +850,6 @@ public class MasterRpcServices extends RSRpcServices
+       TableName tableName = ProtobufUtil.toTableName(request.getTableName());
+       TableState.State state = master.getTableStateManager()
+               .getTableState(tableName);
+-      if (state == null)
+-        throw new TableNotFoundException(tableName);
+       MasterProtos.GetTableStateResponse.Builder builder =
+               MasterProtos.GetTableStateResponse.newBuilder();
+       builder.setTableState(new TableState(tableName, state).convert());
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java
+index 9dd412c..df61b45 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java
+@@ -230,7 +230,8 @@ public class RegionStateStore {
+         }
+       }
+       // Called when meta is not on master
+-      multiHConnection.processBatchCallback(Arrays.asList(put), TableName.META_TABLE_NAME, null, null);
++      multiHConnection.processBatchCallback(Arrays.asList(put),
++          TableName.META_TABLE_NAME, null, null);
+ 
+     } catch (IOException ioe) {
+       LOG.error("Failed to persist region state " + newState, ioe);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+index c98a998..ed4cb8e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+@@ -40,7 +40,6 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.MetaTableAccessor;
+-import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.ServerLoad;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+@@ -141,13 +140,13 @@ public class RegionStates {
+   private final TableStateManager tableStateManager;
+   private final RegionStateStore regionStateStore;
+   private final ServerManager serverManager;
+-  private final Server server;
++  private final MasterServices server;
+ 
+   // The maximum time to keep a log split info in region states map
+   static final String LOG_SPLIT_TIME = "hbase.master.maximum.logsplit.keeptime";
+   static final long DEFAULT_LOG_SPLIT_TIME = 7200000L; // 2 hours
+ 
+-  RegionStates(final Server master, final TableStateManager tableStateManager,
++  RegionStates(final MasterServices master, final TableStateManager tableStateManager,
+       final ServerManager serverManager, final RegionStateStore regionStateStore) {
+     this.tableStateManager = tableStateManager;
+     this.regionStateStore = regionStateStore;
+@@ -806,7 +805,7 @@ public class RegionStates {
+ 
+   private int getRegionReplication(HRegionInfo r) throws IOException {
+     if (tableStateManager != null) {
+-      HTableDescriptor htd = tableStateManager.getTableDescriptors().get(r.getTable());
++      HTableDescriptor htd = server.getTableDescriptors().get(r.getTable());
+       if (htd != null) {
+         return htd.getRegionReplication();
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java
+index b03611c..39beba8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java
+@@ -141,7 +141,7 @@ public class SnapshotOfRegionAssignmentFromMeta {
+       }
+     };
+     // Scan hbase:meta to pick up user regions
+-    MetaTableAccessor.fullScan(connection, v);
++    MetaTableAccessor.fullScanRegions(connection, v);
+     //regionToRegionServerMap = regions;
+     LOG.info("Finished to scan the hbase:meta for the current region assignment" +
+       "snapshot");
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java
+index d8199ea..5d1e638 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableStateManager.java
+@@ -17,19 +17,27 @@
+  */
+ package org.apache.hadoop.hbase.master;
+ 
++import javax.annotation.Nonnull;
++import javax.annotation.Nullable;
+ import java.io.IOException;
++import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+-import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.MetaTableAccessor;
+ import org.apache.hadoop.hbase.TableDescriptor;
+ import org.apache.hadoop.hbase.TableDescriptors;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.TableNotFoundException;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.client.ClusterConnection;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.TableState;
+ 
+ /**
+@@ -39,24 +47,12 @@ import org.apache.hadoop.hbase.client.TableState;
+ @InterfaceAudience.Private
+ public class TableStateManager {
+   private static final Log LOG = LogFactory.getLog(TableStateManager.class);
+-  private final TableDescriptors descriptors;
+ 
+-  private final Map<TableName, TableState.State> tableStates = Maps.newConcurrentMap();
++  private final ReadWriteLock lock = new ReentrantReadWriteLock();
++  private final MasterServices master;
+ 
+   public TableStateManager(MasterServices master) {
+-    this.descriptors = master.getTableDescriptors();
+-  }
+-
+-  public void start() throws IOException {
+-    Map<String, TableDescriptor> all = descriptors.getAllDescriptors();
+-    for (TableDescriptor table : all.values()) {
+-      TableName tableName = table.getHTableDescriptor().getTableName();
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Adding table state: " + tableName
+-            + ": " + table.getTableState());
+-      }
+-      tableStates.put(tableName, table.getTableState());
+-    }
++    this.master = master;
+   }
+ 
+   /**
+@@ -67,16 +63,13 @@ public class TableStateManager {
+    * @throws IOException
+    */
+   public void setTableState(TableName tableName, TableState.State newState) throws IOException {
+-    synchronized (tableStates) {
+-      TableDescriptor descriptor = readDescriptor(tableName);
+-      if (descriptor == null) {
+-        throw new TableNotFoundException(tableName);
+-      }
+-      if (descriptor.getTableState() != newState) {
+-        writeDescriptor(
+-            new TableDescriptor(descriptor.getHTableDescriptor(), newState));
+-      }
++    lock.writeLock().lock();
++    try {
++      udpateMetaState(tableName, newState);
++    } finally {
++      lock.writeLock().unlock();
+     }
++
+   }
+ 
+   /**
+@@ -91,21 +84,23 @@ public class TableStateManager {
+                                          TableState.State newState,
+                                          TableState.State... states)
+           throws IOException {
+-    synchronized (tableStates) {
+-      TableDescriptor descriptor = readDescriptor(tableName);
+-      if (descriptor == null) {
++    lock.writeLock().lock();
++    try {
++      TableState currentState = readMetaState(tableName);
++      if (currentState == null) {
+         throw new TableNotFoundException(tableName);
+       }
+-      if (TableState.isInStates(descriptor.getTableState(), states)) {
+-        writeDescriptor(
+-            new TableDescriptor(descriptor.getHTableDescriptor(), newState));
++      if (currentState.inStates(states)) {
++        udpateMetaState(tableName, newState);
+         return true;
+       } else {
+         return false;
+       }
++    } finally {
++      lock.writeLock().unlock();
+     }
+-  }
+ 
++  }
+ 
+   /**
+    * Set table state to provided but only if table not in specified states
+@@ -119,42 +114,36 @@ public class TableStateManager {
+                                             TableState.State newState,
+                                             TableState.State... states)
+           throws IOException {
+-    synchronized (tableStates) {
+-      TableDescriptor descriptor = readDescriptor(tableName);
+-      if (descriptor == null) {
+-        throw new TableNotFoundException(tableName);
+-      }
+-      if (!TableState.isInStates(descriptor.getTableState(), states)) {
+-        writeDescriptor(
+-            new TableDescriptor(descriptor.getHTableDescriptor(), newState));
+-        return true;
+-      } else {
+-        return false;
+-      }
++    TableState currentState = readMetaState(tableName);
++    if (currentState == null) {
++      throw new TableNotFoundException(tableName);
++    }
++    if (!currentState.inStates(states)) {
++      udpateMetaState(tableName, newState);
++      return true;
++    } else {
++      return false;
+     }
+   }
+ 
+   public boolean isTableState(TableName tableName, TableState.State... states) {
+-    TableState.State tableState = null;
+     try {
+-      tableState = getTableState(tableName);
++      TableState.State tableState = getTableState(tableName);
++      return TableState.isInStates(tableState, states);
+     } catch (IOException e) {
+-      LOG.error("Unable to get table state, probably table not exists");
++      LOG.error("Unable to get table " + tableName + " state, probably table not exists");
+       return false;
+     }
+-    return tableState != null && TableState.isInStates(tableState, states);
+   }
+ 
+   public void setDeletedTable(TableName tableName) throws IOException {
+-    TableState.State remove = tableStates.remove(tableName);
+-    if (remove == null) {
+-      LOG.warn("Moving table " + tableName + " state to deleted but was " +
+-              "already deleted");
+-    }
++    if (tableName.equals(TableName.META_TABLE_NAME))
++      return;
++    MetaTableAccessor.deleteTableState(master.getConnection(), tableName);
+   }
+ 
+   public boolean isTablePresent(TableName tableName) throws IOException {
+-    return getTableState(tableName) != null;
++    return readMetaState(tableName) != null;
+   }
+ 
+   /**
+@@ -164,57 +153,82 @@ public class TableStateManager {
+    * @return tables in given states
+    * @throws IOException
+    */
+-  public Set<TableName> getTablesInStates(TableState.State... states) throws IOException {
+-    Set<TableName> rv = Sets.newHashSet();
+-    for (Map.Entry<TableName, TableState.State> entry : tableStates.entrySet()) {
+-      if (TableState.isInStates(entry.getValue(), states))
+-        rv.add(entry.getKey());
+-    }
++  public Set<TableName> getTablesInStates(final TableState.State... states) throws IOException {
++    final Set<TableName> rv = Sets.newHashSet();
++    MetaTableAccessor.fullScanTables(master.getConnection(), new MetaTableAccessor.Visitor() {
++      @Override
++      public boolean visit(Result r) throws IOException {
++        TableState tableState = MetaTableAccessor.getTableState(r);
++        if (tableState != null && tableState.inStates(states))
++          rv.add(tableState.getTableName());
++        return true;
++      }
++    });
+     return rv;
+   }
+ 
++  @Nonnull
+   public TableState.State getTableState(TableName tableName) throws IOException {
+-    TableState.State tableState = tableStates.get(tableName);
+-    if (tableState == null) {
+-      TableDescriptor descriptor = readDescriptor(tableName);
+-      if (descriptor != null)
+-        tableState = descriptor.getTableState();
++    TableState currentState = readMetaState(tableName);
++    if (currentState == null) {
++      throw new TableNotFoundException(tableName);
+     }
+-    return tableState;
++    return currentState.getState();
+   }
+ 
+-  TableDescriptors getTableDescriptors() {
+-    return descriptors;
++  protected void udpateMetaState(TableName tableName, TableState.State newState)
++      throws IOException {
++    MetaTableAccessor.updateTableState(master.getConnection(), tableName, newState);
+   }
+ 
+-  /**
+-   * Write descriptor in place, update cache of states.
+-   * Write lock should be hold by caller.
+-   *
+-   * @param descriptor what to write
+-   */
+-  private void writeDescriptor(TableDescriptor descriptor) throws IOException {
+-    TableName tableName = descriptor.getHTableDescriptor().getTableName();
+-    TableState.State state = descriptor.getTableState();
+-    descriptors.add(descriptor);
+-    LOG.debug("Table " + tableName + " written descriptor for state " + state);
+-    tableStates.put(tableName, state);
+-    LOG.debug("Table " + tableName + " updated state to " + state);
++  @Nullable
++  protected TableState readMetaState(TableName tableName) throws IOException {
++    if (tableName.equals(TableName.META_TABLE_NAME))
++      return new TableState(tableName, TableState.State.ENABLED);
++    return MetaTableAccessor.getTableState(master.getConnection(), tableName);
+   }
+ 
+-  /**
+-   * Read current descriptor for table, update cache of states.
+-   *
+-   * @param table descriptor to read
+-   * @return descriptor
+-   * @throws IOException
+-   */
+-  private TableDescriptor readDescriptor(TableName tableName) throws IOException {
+-    TableDescriptor descriptor = descriptors.getDescriptor(tableName);
+-    if (descriptor == null)
+-      tableStates.remove(tableName);
+-    else
+-      tableStates.put(tableName, descriptor.getTableState());
+-    return descriptor;
++  @SuppressWarnings("deprecation")
++  public void start() throws IOException {
++    TableDescriptors tableDescriptors = master.getTableDescriptors();
++    Connection connection = master.getConnection();
++    fixTableStates(tableDescriptors, connection);
++  }
++
++  public static void fixTableStates(TableDescriptors tableDescriptors, Connection connection)
++      throws IOException {
++    final Map<String, TableDescriptor> allDescriptors =
++        tableDescriptors.getAllDescriptors();
++    final Map<String, TableState> states = new HashMap<>();
++    MetaTableAccessor.fullScanTables(connection, new MetaTableAccessor.Visitor() {
++      @Override
++      public boolean visit(Result r) throws IOException {
++        TableState state = MetaTableAccessor.getTableState(r);
++        if (state != null)
++          states.put(state.getTableName().getNameAsString(), state);
++        return true;
++      }
++    });
++    for (Map.Entry<String, TableDescriptor> entry : allDescriptors.entrySet()) {
++      String table = entry.getKey();
++      if (table.equals(TableName.META_TABLE_NAME.getNameAsString()))
++        continue;
++      if (!states.containsKey(table)) {
++        LOG.warn("Found table without state " + table);
++        TableDescriptor td = entry.getValue();
++        TableState.State tds = td.getTableState();
++        if (tds != null) {
++          LOG.warn("Found table with state in descriptor, using that state");
++          MetaTableAccessor.updateTableState(connection, TableName.valueOf(table), tds);
++          LOG.warn("Updating table descriptor");
++          td.setTableState(null);
++          tableDescriptors.add(td);
++        } else {
++          LOG.warn("Found table with no state in descriptor, assuming ENABLED");
++          MetaTableAccessor.updateTableState(connection, TableName.valueOf(table),
++              TableState.State.ENABLED);
++        }
++      }
++    }
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+index dea0828..470a308 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hbase.master.balancer;
+ 
++import javax.annotation.Nullable;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java
+index 2007ed4..b60733e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java
+@@ -70,6 +70,7 @@ public class CreateTableHandler extends EventHandler {
+   private final AssignmentManager assignmentManager;
+   private final TableLockManager tableLockManager;
+   private final HRegionInfo [] newRegions;
++  private final MasterServices masterServices;
+   private final TableLock tableLock;
+   private User activeUser;
+ 
+@@ -82,6 +83,7 @@ public class CreateTableHandler extends EventHandler {
+     this.hTableDescriptor = hTableDescriptor;
+     this.conf = conf;
+     this.newRegions = newRegions;
++    this.masterServices = masterServices;
+     this.assignmentManager = masterServices.getAssignmentManager();
+     this.tableLockManager = masterServices.getTableLockManager();
+ 
+@@ -209,10 +211,11 @@ public class CreateTableHandler extends EventHandler {
+     // 1. Create Table Descriptor
+     // using a copy of descriptor, table will be created enabling first
+     TableDescriptor underConstruction = new TableDescriptor(
+-        this.hTableDescriptor, TableState.State.ENABLING);
++        this.hTableDescriptor);
+     Path tempTableDir = FSUtils.getTableDir(tempdir, tableName);
+-    new FSTableDescriptors(this.conf).createTableDescriptorForTableDirectory(
+-      tempTableDir, underConstruction, false);
++    ((FSTableDescriptors)(masterServices.getTableDescriptors()))
++        .createTableDescriptorForTableDirectory(
++        tempTableDir, underConstruction, false);
+     Path tableDir = FSUtils.getTableDir(fileSystemManager.getRootDir(), tableName);
+ 
+     // 2. Create Regions
+@@ -223,6 +226,12 @@ public class CreateTableHandler extends EventHandler {
+         " to hbase root=" + tableDir);
+     }
+ 
++    // populate descriptors cache to be visible in getAll
++    masterServices.getTableDescriptors().get(tableName);
++
++    MetaTableAccessor.updateTableState(this.server.getConnection(), hTableDescriptor.getTableName(),
++        TableState.State.ENABLING);
++
+     if (regionInfos != null && regionInfos.size() > 0) {
+       // 4. Add regions to META
+       addRegionsToMeta(regionInfos, hTableDescriptor.getRegionReplication());
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java
+index 993edb2..7b237f4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java
+@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutorService;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.TableNotDisabledException;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.HRegionInfo;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+index 280e3e4..dba1ae9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+@@ -26,14 +26,15 @@ import java.util.Map;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.HBaseIOException;
+ import org.apache.hadoop.hbase.HRegionInfo;
++import org.apache.hadoop.hbase.MetaTableAccessor;
+ import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.TableNotDisabledException;
+ import org.apache.hadoop.hbase.TableNotFoundException;
+-import org.apache.hadoop.hbase.MetaTableAccessor;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.TableState;
+ import org.apache.hadoop.hbase.executor.EventHandler;
+ import org.apache.hadoop.hbase.executor.EventType;
+@@ -201,25 +202,29 @@ public class EnableTableHandler extends EventHandler {
+     int regionsCount = regionsToAssign.size();
+     if (regionsCount == 0) {
+       done = true;
+-    }
+-    LOG.info("Table '" + this.tableName + "' has " + countOfRegionsInTable
+-      + " regions, of which " + regionsCount + " are offline.");
+-    List<ServerName> onlineServers = serverManager.createDestinationServersList();
+-    Map<ServerName, List<HRegionInfo>> bulkPlan =
+-        this.assignmentManager.getBalancer().retainAssignment(regionsToAssign, onlineServers);
+-    LOG.info("Bulk assigning " + regionsCount + " region(s) across " + bulkPlan.size()
+-      + " server(s), retainAssignment=true");
++    } else {
++      LOG.info("Table '" + this.tableName + "' has " + countOfRegionsInTable
++          + " regions, of which " + regionsCount + " are offline.");
++      List<ServerName> onlineServers = serverManager.createDestinationServersList();
++      Map<ServerName, List<HRegionInfo>> bulkPlan =
++          this.assignmentManager.getBalancer().retainAssignment(regionsToAssign, onlineServers);
++      if (bulkPlan == null)
++        throw new HBaseIOException("Unable to generate assignment plan");
++      LOG.info("Bulk assigning " + regionsCount + " region(s) across " + bulkPlan.size()
++          + " server(s), retainAssignment=true");
+ 
+-    BulkAssigner ba = new GeneralBulkAssigner(this.server, bulkPlan, this.assignmentManager, true);
+-    try {
+-      if (ba.bulkAssign()) {
+-        done = true;
++      BulkAssigner ba =
++          new GeneralBulkAssigner(this.server, bulkPlan, this.assignmentManager, true);
++      try {
++        if (ba.bulkAssign()) {
++          done = true;
++        }
++      } catch (InterruptedException e) {
++        LOG.warn("Enable operation was interrupted when enabling table '"
++            + this.tableName + "'");
++        // Preserve the interrupt.
++        Thread.currentThread().interrupt();
+       }
+-    } catch (InterruptedException e) {
+-      LOG.warn("Enable operation was interrupted when enabling table '"
+-        + this.tableName + "'");
+-      // Preserve the interrupt.
+-      Thread.currentThread().interrupt();
+     }
+     if (done) {
+       // Flip the table to enabled.
+@@ -228,8 +233,10 @@ public class EnableTableHandler extends EventHandler {
+       LOG.info("Table '" + this.tableName
+       + "' was successfully enabled. Status: done=" + done);
+     } else {
++      this.assignmentManager.getTableStateManager()
++          .setTableState(tableName, TableState.State.DISABLED);
+       LOG.warn("Table '" + this.tableName
+-      + "' wasn't successfully enabled. Status: done=" + done);
++          + "' wasn't successfully enabled. Status: done=" + done);
+     }
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java
+index ee40153..15a5b8f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java
+@@ -95,10 +95,10 @@ public class TruncateTableHandler extends DeleteTableHandler {
+     AssignmentManager assignmentManager = this.masterServices.getAssignmentManager();
+ 
+     // 1. Create Table Descriptor
+-    TableDescriptor underConstruction = new TableDescriptor(
+-        this.hTableDescriptor, TableState.State.ENABLING);
++    TableDescriptor underConstruction = new TableDescriptor(this.hTableDescriptor);
+     Path tempTableDir = FSUtils.getTableDir(tempdir, this.tableName);
+-    new FSTableDescriptors(server.getConfiguration())
++
++    ((FSTableDescriptors)(masterServices.getTableDescriptors()))
+       .createTableDescriptorForTableDirectory(tempTableDir, underConstruction, false);
+     Path tableDir = FSUtils.getTableDir(mfs.getRootDir(), this.tableName);
+ 
+@@ -123,6 +123,11 @@ public class TruncateTableHandler extends DeleteTableHandler {
+         " to hbase root=" + tableDir);
+     }
+ 
++    // populate descriptors cache to be visible in getAll
++    masterServices.getTableDescriptors().get(tableName);
++
++    assignmentManager.getTableStateManager().setTableState(tableName,
++        TableState.State.ENABLING);
+     // 4. Add regions to META
+     MetaTableAccessor.addRegionsToMeta(masterServices.getConnection(),
+       regionInfos, hTableDescriptor.getRegionReplication());
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 409107f..0f8c466 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -528,8 +528,7 @@ public class HRegionServer extends HasThread implements
+     boolean useHBaseChecksum = conf.getBoolean(HConstants.HBASE_CHECKSUM_VERIFICATION, true);
+     this.fs = new HFileSystem(this.conf, useHBaseChecksum);
+     this.rootDir = FSUtils.getRootDir(this.conf);
+-    this.tableDescriptors = new FSTableDescriptors(this.conf,
+-      this.fs, this.rootDir, !canUpdateTableDescriptor(), false);
++    this.tableDescriptors = getFsTableDescriptors();
+ 
+     service = new ExecutorService(getServerName().toShortString());
+     spanReceiverHost = SpanReceiverHost.getInstance(getConfiguration());
+@@ -561,6 +560,11 @@ public class HRegionServer extends HasThread implements
+     this.choreService = new ChoreService(getServerName().toString());
+   }
+ 
++  protected TableDescriptors getFsTableDescriptors() throws IOException {
++    return new FSTableDescriptors(this.conf,
++      this.fs, this.rootDir, !canUpdateTableDescriptor(), false);
++  }
++
+   protected void login(UserProvider user, String host) throws IOException {
+     user.login("hbase.regionserver.keytab.file",
+       "hbase.regionserver.kerberos.principal", host);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotManifest.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotManifest.java
+index a3cfa04..d0ffcab 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotManifest.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/SnapshotManifest.java
+@@ -18,8 +18,8 @@
+ 
+ package org.apache.hadoop.hbase.snapshot;
+ 
+-import java.io.IOException;
+ import java.io.FileNotFoundException;
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -30,7 +30,6 @@ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+@@ -39,20 +38,20 @@ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableDescriptor;
+-import org.apache.hadoop.hbase.client.TableState;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.errorhandling.ForeignExceptionSnare;
++import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
+ import org.apache.hadoop.hbase.protobuf.generated.SnapshotProtos.SnapshotDataManifest;
+ import org.apache.hadoop.hbase.protobuf.generated.SnapshotProtos.SnapshotRegionManifest;
+-import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
+ import org.apache.hadoop.hbase.regionserver.Store;
+ import org.apache.hadoop.hbase.regionserver.StoreFile;
+ import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
+ import org.apache.hadoop.hbase.util.Bytes;
+-import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.FSTableDescriptors;
++import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.Threads;
+ 
+ /**
+@@ -357,7 +356,7 @@ public class SnapshotManifest {
+       // write a copy of descriptor to the snapshot directory
+       new FSTableDescriptors(conf, fs, rootDir)
+         .createTableDescriptorForTableDirectory(workingDir, new TableDescriptor(
+-            htd, TableState.State.ENABLED), false);
++            htd), false);
+     } else {
+       LOG.debug("Convert to Single Snapshot Manifest");
+       convertToV2SingleManifest();
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSTableDescriptors.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSTableDescriptors.java
+index 7a6811c..cce37d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSTableDescriptors.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSTableDescriptors.java
+@@ -33,7 +33,6 @@ import com.google.common.primitives.Ints;
+ import org.apache.commons.lang.NotImplementedException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+@@ -47,7 +46,7 @@ import org.apache.hadoop.hbase.TableDescriptor;
+ import org.apache.hadoop.hbase.TableDescriptors;
+ import org.apache.hadoop.hbase.TableInfoMissingException;
+ import org.apache.hadoop.hbase.TableName;
+-import org.apache.hadoop.hbase.client.TableState;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ 
+@@ -154,7 +153,7 @@ public class FSTableDescriptors implements TableDescriptors {
+     invocations++;
+     if (TableName.META_TABLE_NAME.equals(tablename)) {
+       cachehits++;
+-      return new TableDescriptor(metaTableDescritor, TableState.State.ENABLED);
++      return new TableDescriptor(metaTableDescritor);
+     }
+     // hbase:meta is already handled. If some one tries to get the descriptor for
+     // .logs, .oldlogs or .corrupt throw an exception.
+@@ -218,7 +217,7 @@ public class FSTableDescriptors implements TableDescriptors {
+       }
+       // add hbase:meta to the response
+       tds.put(this.metaTableDescritor.getNameAsString(),
+-        new TableDescriptor(metaTableDescritor, TableState.State.ENABLED));
++          new TableDescriptor(metaTableDescritor));
+     } else {
+       LOG.debug("Fetching table descriptors from the filesystem.");
+       boolean allvisited = true;
+@@ -592,7 +591,7 @@ public class FSTableDescriptors implements TableDescriptors {
+         HTableDescriptor htd = HTableDescriptor.parseFrom(content);
+         LOG.warn("Found old table descriptor, converting to new format for table " +
+             htd.getTableName() + "; NOTE table will be in ENABLED state!");
+-        td = new TableDescriptor(htd, TableState.State.ENABLED);
++        td = new TableDescriptor(htd);
+         if (rewritePb) rewriteTableDescriptor(fs, status, td);
+       } catch (DeserializationException e1) {
+         throw new IOException("content=" + Bytes.toShort(content), e);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+index 8e1d848..a8c35b1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+@@ -53,12 +53,16 @@ import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import com.google.common.base.Joiner;
++import com.google.common.base.Preconditions;
++import com.google.common.collect.Lists;
++import com.google.common.collect.Multimap;
++import com.google.common.collect.TreeMultimap;
++import com.google.protobuf.ServiceException;
+ import org.apache.commons.lang.RandomStringUtils;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.conf.Configured;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+@@ -85,15 +89,15 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.ZooKeeperConnectionException;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.ClusterConnection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Delete;
+ import org.apache.hadoop.hbase.client.Get;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+-import org.apache.hadoop.hbase.client.HConnectable;
+ import org.apache.hadoop.hbase.client.HConnection;
+-import org.apache.hadoop.hbase.client.HConnectionManager;
+ import org.apache.hadoop.hbase.client.MetaScanner;
+ import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+ import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
+@@ -137,13 +141,6 @@ import org.apache.hadoop.util.Tool;
+ import org.apache.hadoop.util.ToolRunner;
+ import org.apache.zookeeper.KeeperException;
+ 
+-import com.google.common.base.Joiner;
+-import com.google.common.base.Preconditions;
+-import com.google.common.collect.Lists;
+-import com.google.common.collect.Multimap;
+-import com.google.common.collect.TreeMultimap;
+-import com.google.protobuf.ServiceException;
+-
+ /**
+  * HBaseFsck (hbck) is a tool for checking and repairing region consistency and
+  * table integrity problems in a corrupted HBase.
+@@ -245,7 +242,8 @@ public class HBaseFsck extends Configured implements Closeable {
+   // hbase:meta are always checked
+   private Set<TableName> tablesIncluded = new HashSet<TableName>();
+   private int maxMerge = DEFAULT_MAX_MERGE; // maximum number of overlapping regions to merge
+-  private int maxOverlapsToSideline = DEFAULT_OVERLAPS_TO_SIDELINE; // maximum number of overlapping regions to sideline
++  // maximum number of overlapping regions to sideline
++  private int maxOverlapsToSideline = DEFAULT_OVERLAPS_TO_SIDELINE;
+   private boolean sidelineBigOverlaps = false; // sideline overlaps with >maxMerge regions
+   private Path sidelineDir = null;
+ 
+@@ -267,8 +265,6 @@ public class HBaseFsck extends Configured implements Closeable {
+    * to detect and correct consistency (hdfs/meta/deployment) problems.
+    */
+   private TreeMap<String, HbckInfo> regionInfoMap = new TreeMap<String, HbckInfo>();
+-  private TreeSet<TableName> disabledTables =
+-    new TreeSet<TableName>();
+   // Empty regioninfo qualifiers in hbase:meta
+   private Set<Result> emptyRegionInfoQualifiers = new HashSet<Result>();
+ 
+@@ -292,6 +288,8 @@ public class HBaseFsck extends Configured implements Closeable {
+ 
+   private Map<TableName, Set<String>> orphanTableDirs =
+       new HashMap<TableName, Set<String>>();
++  private Map<TableName, TableState> tableStates =
++      new HashMap<TableName, TableState>();
+ 
+   /**
+    * Constructor
+@@ -493,7 +491,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     fixes = 0;
+     regionInfoMap.clear();
+     emptyRegionInfoQualifiers.clear();
+-    disabledTables.clear();
++    tableStates.clear();
+     errors.clear();
+     tablesInfo.clear();
+     orphanHdfsDirs.clear();
+@@ -577,15 +575,15 @@ public class HBaseFsck extends Configured implements Closeable {
+       reportTablesInFlux();
+     }
+ 
++    // Get disabled tables states
++    loadTableStates();
++
+     // load regiondirs and regioninfos from HDFS
+     if (shouldCheckHdfs()) {
+       loadHdfsRegionDirs();
+       loadHdfsRegionInfos();
+     }
+ 
+-    // Get disabled tables from ZooKeeper
+-    loadDisabledTables();
+-
+     // fix the orphan tables
+     fixOrphanTables();
+ 
+@@ -1140,7 +1138,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     for (String columnfamimly : columns) {
+       htd.addFamily(new HColumnDescriptor(columnfamimly));
+     }
+-    fstd.createTableDescriptor(new TableDescriptor(htd, TableState.State.ENABLED), true);
++    fstd.createTableDescriptor(new TableDescriptor(htd), true);
+     return true;
+   }
+ 
+@@ -1188,7 +1186,7 @@ public class HBaseFsck extends Configured implements Closeable {
+           if (tableName.equals(htds[j].getTableName())) {
+             HTableDescriptor htd = htds[j];
+             LOG.info("fixing orphan table: " + tableName + " from cache");
+-            fstd.createTableDescriptor(new TableDescriptor(htd, TableState.State.ENABLED), true);
++            fstd.createTableDescriptor(new TableDescriptor(htd), true);
+             j++;
+             iter.remove();
+           }
+@@ -1265,6 +1263,8 @@ public class HBaseFsck extends Configured implements Closeable {
+       }
+ 
+       TableInfo ti = e.getValue();
++      puts.add(MetaTableAccessor
++          .makePutFromTableState(new TableState(ti.tableName, TableState.State.ENABLED)));
+       for (Entry<byte[], Collection<HbckInfo>> spl : ti.sc.getStarts().asMap()
+           .entrySet()) {
+         Collection<HbckInfo> his = spl.getValue();
+@@ -1524,28 +1524,19 @@ public class HBaseFsck extends Configured implements Closeable {
+    * @throws ZooKeeperConnectionException
+    * @throws IOException
+    */
+-  private void loadDisabledTables()
++  private void loadTableStates()
+   throws IOException {
+-    HConnectionManager.execute(new HConnectable<Void>(getConf()) {
+-      @Override
+-      public Void connect(HConnection connection) throws IOException {
+-        TableName[] tables = connection.listTableNames();
+-        for (TableName table : tables) {
+-          if (connection.getTableState(table)
+-              .inStates(TableState.State.DISABLED, TableState.State.DISABLING)) {
+-            disabledTables.add(table);
+-          }
+-        }
+-        return null;
+-      }
+-    });
++    tableStates = MetaTableAccessor.getTableStates(connection);
+   }
+ 
+   /**
+    * Check if the specified region's table is disabled.
++   * @param tableName table to check status of
+    */
+-  private boolean isTableDisabled(HRegionInfo regionInfo) {
+-    return disabledTables.contains(regionInfo.getTable());
++  private boolean isTableDisabled(TableName tableName) {
++    return tableStates.containsKey(tableName)
++        && tableStates.get(tableName)
++        .inStates(TableState.State.DISABLED, TableState.State.DISABLING);
+   }
+ 
+   /**
+@@ -1718,6 +1709,55 @@ public class HBaseFsck extends Configured implements Closeable {
+       }
+     }
+     setCheckHdfs(prevHdfsCheck);
++
++    if (shouldCheckHdfs()) {
++      checkAndFixTableStates();
++    }
++  }
++
++  /**
++   * Check and fix table states, assumes full info available:
++   * - tableInfos
++   * - empty tables loaded
++   */
++  private void checkAndFixTableStates() throws IOException {
++    // first check dangling states
++    for (Entry<TableName, TableState> entry : tableStates.entrySet()) {
++      TableName tableName = entry.getKey();
++      TableState tableState = entry.getValue();
++      TableInfo tableInfo = tablesInfo.get(tableName);
++      if (isTableIncluded(tableName)
++          && !tableName.isSystemTable()
++          && tableInfo == null) {
++        if (fixMeta) {
++          MetaTableAccessor.deleteTableState(connection, tableName);
++          TableState state = MetaTableAccessor.getTableState(connection, tableName);
++          if (state != null) {
++            errors.reportError(ERROR_CODE.ORPHAN_TABLE_STATE,
++                tableName + " unable to delete dangling table state " + tableState);
++          }
++        } else {
++          errors.reportError(ERROR_CODE.ORPHAN_TABLE_STATE,
++              tableName + " has dangling table state " + tableState);
++        }
++      }
++    }
++    // check that all tables have states
++    for (TableName tableName : tablesInfo.keySet()) {
++      if (isTableIncluded(tableName) && !tableStates.containsKey(tableName)) {
++        if (fixMeta) {
++          MetaTableAccessor.updateTableState(connection, tableName, TableState.State.ENABLED);
++          TableState newState = MetaTableAccessor.getTableState(connection, tableName);
++          if (newState == null) {
++            errors.reportError(ERROR_CODE.NO_TABLE_STATE,
++                "Unable to change state for table " + tableName + " in meta ");
++          }
++        } else {
++          errors.reportError(ERROR_CODE.NO_TABLE_STATE,
++              tableName + " has no state in meta ");
++        }
++      }
++    }
+   }
+ 
+   private void preCheckPermission() throws IOException, AccessDeniedException {
+@@ -1961,8 +2001,8 @@ public class HBaseFsck extends Configured implements Closeable {
+       hasMetaAssignment && isDeployed && !isMultiplyDeployed &&
+       hbi.metaEntry.regionServer.equals(hbi.deployedOn.get(0));
+     boolean splitParent =
+-      (hbi.metaEntry == null)? false: hbi.metaEntry.isSplit() && hbi.metaEntry.isOffline();
+-    boolean shouldBeDeployed = inMeta && !isTableDisabled(hbi.metaEntry);
++        inMeta && hbi.metaEntry.isSplit() && hbi.metaEntry.isOffline();
++    boolean shouldBeDeployed = inMeta && !isTableDisabled(hbi.metaEntry.getTable());
+     boolean recentlyModified = inHdfs &&
+       hbi.getModTime() + timelag > System.currentTimeMillis();
+ 
+@@ -2744,7 +2784,7 @@ public class HBaseFsck extends Configured implements Closeable {
+       // When table is disabled no need to check for the region chain. Some of the regions
+       // accidently if deployed, this below code might report some issues like missing start
+       // or end regions or region hole in chain and may try to fix which is unwanted.
+-      if (disabledTables.contains(this.tableName)) {
++      if (isTableDisabled(this.tableName)) {
+         return true;
+       }
+       int originalErrorsCount = errors.getErrorList().size();
+@@ -3534,12 +3574,14 @@ public class HBaseFsck extends Configured implements Closeable {
+   public interface ErrorReporter {
+     enum ERROR_CODE {
+       UNKNOWN, NO_META_REGION, NULL_META_REGION, NO_VERSION_FILE, NOT_IN_META_HDFS, NOT_IN_META,
+-      NOT_IN_META_OR_DEPLOYED, NOT_IN_HDFS_OR_DEPLOYED, NOT_IN_HDFS, SERVER_DOES_NOT_MATCH_META, NOT_DEPLOYED,
++      NOT_IN_META_OR_DEPLOYED, NOT_IN_HDFS_OR_DEPLOYED, NOT_IN_HDFS, SERVER_DOES_NOT_MATCH_META,
++      NOT_DEPLOYED,
+       MULTI_DEPLOYED, SHOULD_NOT_BE_DEPLOYED, MULTI_META_REGION, RS_CONNECT_FAILURE,
+       FIRST_REGION_STARTKEY_NOT_EMPTY, LAST_REGION_ENDKEY_NOT_EMPTY, DUPE_STARTKEYS,
+       HOLE_IN_REGION_CHAIN, OVERLAP_IN_REGION_CHAIN, REGION_CYCLE, DEGENERATE_REGION,
+       ORPHAN_HDFS_REGION, LINGERING_SPLIT_PARENT, NO_TABLEINFO_FILE, LINGERING_REFERENCE_HFILE,
+-      WRONG_USAGE, EMPTY_META_CELL, EXPIRED_TABLE_LOCK, BOUNDARIES_ERROR
++      WRONG_USAGE, EMPTY_META_CELL, EXPIRED_TABLE_LOCK, BOUNDARIES_ERROR, ORPHAN_TABLE_STATE,
++      NO_TABLE_STATE
+     }
+     void clear();
+     void report(String message);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+index 8613276..b0117e6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+@@ -17,10 +17,6 @@
+  */
+ package org.apache.hadoop.hbase;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+-
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.OutputStream;
+@@ -71,6 +67,7 @@ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.client.TableState;
+ import org.apache.hadoop.hbase.fs.HFileSystem;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+ import org.apache.hadoop.hbase.io.compress.Compression.Algorithm;
+@@ -122,6 +119,10 @@ import org.apache.zookeeper.WatchedEvent;
+ import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.ZooKeeper.States;
+ 
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
+ /**
+  * Facility for testing HBase. Replacement for
+  * old HBaseTestCase and HBaseClusterTestCase functionality.
+@@ -2288,6 +2289,8 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
+     Table meta = (HTable) getConnection().getTable(TableName.META_TABLE_NAME);
+     Arrays.sort(startKeys, Bytes.BYTES_COMPARATOR);
+     List<HRegionInfo> newRegions = new ArrayList<HRegionInfo>(startKeys.length);
++    MetaTableAccessor
++        .updateTableState(getConnection(), htd.getTableName(), TableState.State.ENABLED);
+     // add custom ones
+     for (int i = 0; i < startKeys.length; i++) {
+       int j = (i + 1) % startKeys.length;
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java
+index e637976..eefb974 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java
+@@ -228,7 +228,12 @@ public class TestMetaTableAccessor {
+     admin.deleteTable(name);
+     assertFalse(MetaTableAccessor.tableExists(connection, name));
+     assertTrue(MetaTableAccessor.tableExists(connection,
+-      TableName.META_TABLE_NAME));
++        TableName.META_TABLE_NAME));
++    UTIL.createTable(name, HConstants.CATALOG_FAMILY);
++    assertTrue(MetaTableAccessor.tableExists(connection, name));
++    admin.disableTable(name);
++    admin.deleteTable(name);
++    assertFalse(MetaTableAccessor.tableExists(connection, name));
+   }
+ 
+   @Test public void testGetRegion() throws IOException, InterruptedException {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
+index 85fbbc6..fc82a6f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
+@@ -18,11 +18,6 @@
+  */
+ package org.apache.hadoop.hbase.client;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+-
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -32,6 +27,7 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import com.google.protobuf.ServiceException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+@@ -67,7 +63,11 @@ import org.junit.BeforeClass;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+ 
+-import com.google.protobuf.ServiceException;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ /**
+  * Class to test HBaseAdmin.
+@@ -248,7 +248,8 @@ public class TestAdmin1 {
+     this.admin.disableTable(ht.getName());
+     assertTrue("Table must be disabled.", TEST_UTIL.getHBaseCluster()
+         .getMaster().getAssignmentManager().getTableStateManager().isTableState(
+-        ht.getName(), TableState.State.DISABLED));
++            ht.getName(), TableState.State.DISABLED));
++    assertEquals(TableState.State.DISABLED, getStateFromMeta(table));
+ 
+     // Test that table is disabled
+     get = new Get(row);
+@@ -275,7 +276,8 @@ public class TestAdmin1 {
+     this.admin.enableTable(table);
+     assertTrue("Table must be enabled.", TEST_UTIL.getHBaseCluster()
+         .getMaster().getAssignmentManager().getTableStateManager().isTableState(
+-        ht.getName(), TableState.State.ENABLED));
++            ht.getName(), TableState.State.ENABLED));
++    assertEquals(TableState.State.ENABLED, getStateFromMeta(table));
+ 
+     // Test that table is enabled
+     try {
+@@ -287,6 +289,13 @@ public class TestAdmin1 {
+     ht.close();
+   }
+ 
++  private TableState.State getStateFromMeta(TableName table) throws IOException {
++    TableState state =
++        MetaTableAccessor.getTableState(TEST_UTIL.getConnection(), table);
++    assertNotNull(state);
++    return state.getState();
++  }
++
+   @Test (timeout=300000)
+   public void testDisableAndEnableTables() throws IOException {
+     final byte [] row = Bytes.toBytes("row");
+@@ -318,6 +327,10 @@ public class TestAdmin1 {
+       ok = true;
+     }
+ 
++    assertEquals(TableState.State.DISABLED, getStateFromMeta(table1));
++    assertEquals(TableState.State.DISABLED, getStateFromMeta(table2));
++
++
+     assertTrue(ok);
+     this.admin.enableTables("testDisableAndEnableTable.*");
+ 
+@@ -336,18 +349,23 @@ public class TestAdmin1 {
+ 
+     ht1.close();
+     ht2.close();
++
++    assertEquals(TableState.State.ENABLED, getStateFromMeta(table1));
++    assertEquals(TableState.State.ENABLED, getStateFromMeta(table2));
+   }
+ 
+   @Test (timeout=300000)
+   public void testCreateTable() throws IOException {
+     HTableDescriptor [] tables = admin.listTables();
+     int numTables = tables.length;
+-    TEST_UTIL.createTable(TableName.valueOf("testCreateTable"), HConstants.CATALOG_FAMILY).close();
++    TableName tableName = TableName.valueOf("testCreateTable");
++    TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY).close();
+     tables = this.admin.listTables();
+     assertEquals(numTables + 1, tables.length);
+     assertTrue("Table must be enabled.", TEST_UTIL.getHBaseCluster()
+         .getMaster().getAssignmentManager().getTableStateManager().isTableState(
+-        TableName.valueOf("testCreateTable"), TableState.State.ENABLED));
++            tableName, TableState.State.ENABLED));
++    assertEquals(TableState.State.ENABLED, getStateFromMeta(tableName));
+   }
+ 
+   @Test (timeout=300000)
+@@ -405,6 +423,7 @@ public class TestAdmin1 {
+     Table table = TEST_UTIL.getConnection().getTable(htd.getTableName());
+     HTableDescriptor confirmedHtd = table.getTableDescriptor();
+     assertEquals(htd.compareTo(confirmedHtd), 0);
++    MetaTableAccessor.fullScanMetaAndPrint(TEST_UTIL.getConnection());
+     table.close();
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestReplicaWithCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestReplicaWithCluster.java
+index 6d98c52..b0bd6f6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestReplicaWithCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestReplicaWithCluster.java
+@@ -42,6 +42,7 @@ import org.apache.hadoop.hbase.regionserver.TestHRegionServerBulkLoad;
+ import org.apache.hadoop.hbase.testclassification.ClientTests;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.FSTableDescriptors;
+ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.zookeeper.MiniZooKeeperCluster;
+ import org.junit.AfterClass;
+@@ -130,7 +131,8 @@ public class TestReplicaWithCluster {
+ 
+   @AfterClass
+   public static void afterClass() throws Exception {
+-    HTU2.shutdownMiniCluster();
++    if (HTU2 != null)
++      HTU2.shutdownMiniCluster();
+     HTU.shutdownMiniCluster();
+   }
+ 
+@@ -213,7 +215,6 @@ public class TestReplicaWithCluster {
+       SlowMeCopro.sleepTime.set(0);
+     }
+ 
+-    HTU.getHBaseCluster().stopMaster(0);
+     Admin admin = HTU.getHBaseAdmin();
+     nHdt =admin.getTableDescriptor(hdt.getTableName());
+     Assert.assertEquals("fams=" + Arrays.toString(nHdt.getColumnFamilies()),
+@@ -221,7 +222,6 @@ public class TestReplicaWithCluster {
+ 
+     admin.disableTable(hdt.getTableName());
+     admin.deleteTable(hdt.getTableName());
+-    HTU.getHBaseCluster().startMaster();
+     admin.close();
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+index 5a0dffa..7c8b08a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+@@ -1164,7 +1164,7 @@ public class TestAssignmentManagerOnCluster {
+         tableNameList.add(TableName.valueOf(name + "_" + i));
+       }
+     }
+-    List<Result> metaRows = MetaTableAccessor.fullScanOfMeta(admin.getConnection());
++    List<Result> metaRows = MetaTableAccessor.fullScanRegions(admin.getConnection());
+     int count = 0;
+     // Check all 100 rows are in meta
+     for (Result result : metaRows) {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+index e09583a..8ed49ff 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+@@ -1043,8 +1043,7 @@ public class TestCatalogJanitor {
+   }
+ 
+   private TableDescriptor createTableDescriptor() {
+-    TableDescriptor htd = new TableDescriptor(createHTableDescriptor(), TableState.State.ENABLED);
+-    return htd;
++    return new TableDescriptor(createHTableDescriptor());
+   }
+ 
+   private MultiResponse buildMultiResponse(MultiRequest req) {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java
+index 6307c4c..ca9bc9c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java
+@@ -47,8 +47,6 @@ import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.Connection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Delete;
+-import org.apache.hadoop.hbase.client.HBaseAdmin;
+-import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Table;
+@@ -134,7 +132,7 @@ public class TestMasterOperationsForRegionReplicas {
+         }
+       }
+ 
+-      List<Result> metaRows = MetaTableAccessor.fullScanOfMeta(ADMIN.getConnection());
++      List<Result> metaRows = MetaTableAccessor.fullScanRegions(ADMIN.getConnection());
+       int numRows = 0;
+       for (Result result : metaRows) {
+         RegionLocations locations = MetaTableAccessor.getRegionLocations(result);
+@@ -297,7 +295,7 @@ public class TestMasterOperationsForRegionReplicas {
+         return true;
+       }
+     };
+-    MetaTableAccessor.fullScan(connection, visitor);
++    MetaTableAccessor.fullScanRegions(connection, visitor);
+     assert(count.get() == numRegions);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionStates.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionStates.java
+index c16ac02..d98ae52 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionStates.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionStates.java
+@@ -43,7 +43,7 @@ public class TestRegionStates {
+ 
+   @Test
+   public void testWeDontReturnDrainingServersForOurBalancePlans() throws Exception {
+-    Server server = mock(Server.class);
++    MasterServices server = mock(MasterServices.class);
+     when(server.getServerName()).thenReturn(ServerName.valueOf("master,1,1"));
+     Configuration configuration = mock(Configuration.class);
+     when(server.getConfiguration()).thenReturn(configuration);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+index 3c8fea5..6772e2b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+@@ -2522,6 +2522,7 @@ public class TestAccessController extends SecureTestUtil {
+       assertTrue(existingPerms.size() > 1);
+       TEST_UTIL.getHBaseAdmin().disableTable(TEST_TABLE.getTableName());
+       TEST_UTIL.truncateTable(TEST_TABLE.getTableName());
++      TEST_UTIL.waitTableAvailable(TEST_TABLE.getTableName());
+       List<UserPermission> perms = AccessControlClient.getUserPermissions(conf,
+         TEST_TABLE.getTableName().getNameAsString());
+       assertTrue(perms != null);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestCoprocessorScanPolicy.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestCoprocessorScanPolicy.java
+index 9a7db90..7600388 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestCoprocessorScanPolicy.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestCoprocessorScanPolicy.java
+@@ -212,6 +212,7 @@ public class TestCoprocessorScanPolicy {
+     // should be gone now
+     assertEquals(0, r.size());
+     t.close();
++    EnvironmentEdgeManager.reset();
+   }
+ 
+   public static class ScanObserver extends BaseRegionObserver {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestFSTableDescriptors.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestFSTableDescriptors.java
+index a99daf2..c09982e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestFSTableDescriptors.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestFSTableDescriptors.java
+@@ -76,7 +76,7 @@ public class TestFSTableDescriptors {
+   public void testCreateAndUpdate() throws IOException {
+     Path testdir = UTIL.getDataTestDir("testCreateAndUpdate");
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("testCreate"));
+-    TableDescriptor td = new TableDescriptor(htd, TableState.State.ENABLED);
++    TableDescriptor td = new TableDescriptor(htd);
+     FileSystem fs = FileSystem.get(UTIL.getConfiguration());
+     FSTableDescriptors fstd = new FSTableDescriptors(UTIL.getConfiguration(), fs, testdir);
+     assertTrue(fstd.createTableDescriptor(td));
+@@ -113,7 +113,7 @@ public class TestFSTableDescriptors {
+     assertTrue(!fs.exists(p1));
+     int i2 = FSTableDescriptors.getTableInfoSequenceId(p2);
+     assertTrue(i2 == i1 + 1);
+-    td = new TableDescriptor(htd, TableState.State.DISABLED);
++    td = new TableDescriptor(htd);
+     Path p3 = fstd.updateTableDescriptor(td);
+     // Assert we cleaned up the old file.
+     assertTrue(!fs.exists(p2));
+@@ -172,7 +172,7 @@ public class TestFSTableDescriptors {
+     final String name = "testReadingHTDFromFS";
+     FileSystem fs = FileSystem.get(UTIL.getConfiguration());
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name));
+-    TableDescriptor td = new TableDescriptor(htd, TableState.State.ENABLED);
++    TableDescriptor td = new TableDescriptor(htd);
+     Path rootdir = UTIL.getDataTestDir(name);
+     FSTableDescriptors fstd = new FSTableDescriptors(UTIL.getConfiguration(), fs, rootdir);
+     fstd.createTableDescriptor(td);
+@@ -187,7 +187,7 @@ public class TestFSTableDescriptors {
+     Path rootdir = UTIL.getDataTestDir(name);
+     FSTableDescriptors fstd = new FSTableDescriptors(UTIL.getConfiguration(), fs, rootdir);
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name));
+-    TableDescriptor td = new TableDescriptor(htd, TableState.State.ENABLED);
++    TableDescriptor td = new TableDescriptor(htd);
+     Path descriptorFile = fstd.updateTableDescriptor(td);
+     try (FSDataOutputStream out = fs.create(descriptorFile, true)) {
+       out.write(htd.toByteArray());
+@@ -222,8 +222,8 @@ public class TestFSTableDescriptors {
+     final int count = 10;
+     // Write out table infos.
+     for (int i = 0; i < count; i++) {
+-      TableDescriptor htd = new TableDescriptor(new HTableDescriptor(name + i),
+-          TableState.State.ENABLED);
++      TableDescriptor htd = new TableDescriptor(
++          new HTableDescriptor(TableName.valueOf(name + i)));
+       htds.createTableDescriptor(htd);
+     }
+ 
+@@ -420,7 +420,7 @@ public class TestFSTableDescriptors {
+     Path testdir = UTIL.getDataTestDir("testCreateTableDescriptorUpdatesIfThereExistsAlready");
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(
+         "testCreateTableDescriptorUpdatesIfThereExistsAlready"));
+-    TableDescriptor td = new TableDescriptor(htd, TableState.State.ENABLED);
++    TableDescriptor td = new TableDescriptor(htd);
+     FileSystem fs = FileSystem.get(UTIL.getConfiguration());
+     FSTableDescriptors fstd = new FSTableDescriptors(UTIL.getConfiguration(), fs, testdir);
+     assertTrue(fstd.createTableDescriptor(td));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+index 33bd337..0d3a94e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+@@ -157,6 +157,7 @@ public class TestHBaseFsck {
+     conf.setInt("hbase.hconnection.threads.max", 2 * POOL_SIZE);
+     conf.setInt("hbase.hconnection.threads.core", POOL_SIZE);
+     conf.setInt("hbase.hbck.close.timeout", 2 * REGION_ONLINE_TIMEOUT);
++    conf.setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, 2 * REGION_ONLINE_TIMEOUT);
+     TEST_UTIL.startMiniCluster(3);
+ 
+     tableExecutorService = new ThreadPoolExecutor(1, POOL_SIZE, 60, TimeUnit.SECONDS,
+@@ -1402,7 +1403,7 @@ public class TestHBaseFsck {
+     HBaseFsck hbck = doFsck(conf, false);
+     assertErrors(hbck, new ERROR_CODE[] {ERROR_CODE.NOT_IN_HDFS,
+         ERROR_CODE.NOT_IN_HDFS, ERROR_CODE.NOT_IN_HDFS,
+-        ERROR_CODE.NOT_IN_HDFS,});
++        ERROR_CODE.NOT_IN_HDFS, ERROR_CODE.ORPHAN_TABLE_STATE, });
+     // holes are separate from overlap groups
+     assertEquals(0, hbck.getOverlapGroups(table).size());
+ 
+@@ -1445,6 +1446,34 @@ public class TestHBaseFsck {
+   }
+ 
+   /**
++   * when the hbase.version file missing, It is fix the fault.
++   */
++  @Test (timeout=180000)
++  public void testNoTableState() throws Exception {
++    // delete the hbase.version file
++    TableName table =
++        TableName.valueOf("testNoTableState");
++    try {
++      setupTable(table);
++      // make sure data in regions, if in wal only there is no data loss
++      admin.flush(table);
++
++      MetaTableAccessor.deleteTableState(TEST_UTIL.getConnection(), table);
++
++      // test
++      HBaseFsck hbck = doFsck(conf, false);
++      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.NO_TABLE_STATE });
++      // fix table state missing
++      doFsck(conf, true);
++
++      assertNoErrors(doFsck(conf, false));
++      assertTrue(TEST_UTIL.getHBaseAdmin().isTableEnabled(table));
++    } finally {
++      cleanupTable(table);
++    }
++  }
++
++  /**
+    * The region is not deployed when the table is disabled.
+    */
+   @Test (timeout=180000)
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java
+index 349bf56..e940425 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java
+@@ -285,16 +285,9 @@ public class OfflineMetaRebuildTestCore {
+    * @return # of entries in meta.
+    */
+   protected int scanMeta() throws IOException {
+-    int count = 0;
+-    Table meta = TEST_UTIL.getConnection().getTable(TableName.META_TABLE_NAME);
+-    ResultScanner scanner = meta.getScanner(new Scan());
+-    LOG.info("Table: " + meta.getName());
+-    for (Result res : scanner) {
+-      LOG.info(Bytes.toString(res.getRow()));
+-      count++;
+-    }
+-    meta.close();
+-    return count;
++    LOG.info("Scanning META");
++    MetaTableAccessor.fullScanMetaAndPrint(TEST_UTIL.getConnection());
++    return MetaTableAccessor.fullScanRegions(TEST_UTIL.getConnection()).size();
+   }
+ 
+   protected HTableDescriptor[] getTables(final Configuration configuration) throws IOException {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/TestOfflineMetaRebuildBase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/TestOfflineMetaRebuildBase.java
+index a3d323c..fc22292 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/TestOfflineMetaRebuildBase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/TestOfflineMetaRebuildBase.java
+@@ -20,11 +20,13 @@ package org.apache.hadoop.hbase.util.hbck;
+ import static org.apache.hadoop.hbase.util.hbck.HbckTestingUtil.assertErrors;
+ import static org.apache.hadoop.hbase.util.hbck.HbckTestingUtil.doFsck;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.util.Arrays;
+ 
+ import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.client.Connection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+@@ -70,13 +72,20 @@ public class TestOfflineMetaRebuildBase extends OfflineMetaRebuildTestCore {
+     TEST_UTIL.restartHBaseCluster(3);
+     try (Connection connection = ConnectionFactory.createConnection(TEST_UTIL.getConfiguration())) {
+       Admin admin = connection.getAdmin();
+-      admin.enableTable(table);
++      if (admin.isTableDisabled(table))
++        admin.enableTable(table);
+       LOG.info("Waiting for no more RIT");
+       TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+       LOG.info("No more RIT in ZK, now doing final test verification");
+ 
+       // everything is good again.
+-      assertEquals(5, scanMeta());
++      assertEquals(5, scanMeta()); // including table state rows
++      TableName[] tableNames = TEST_UTIL.getHBaseAdmin().listTableNames();
++      for (TableName tableName : tableNames) {
++        HTableDescriptor tableDescriptor = TEST_UTIL.getHBaseAdmin().getTableDescriptor(tableName);
++        assertNotNull(tableDescriptor);
++        assertTrue(TEST_UTIL.getHBaseAdmin().isTableEnabled(tableName));
++      }
+       HTableDescriptor[] htbls = admin.listTables();
+       LOG.info("Tables present after restart: " + Arrays.toString(htbls));
+       assertEquals(1, htbls.length);

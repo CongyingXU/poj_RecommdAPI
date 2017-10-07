@@ -1,0 +1,658 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/WALPlayer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/WALPlayer.java
+index 6a937e8..cb055ef 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/WALPlayer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/WALPlayer.java
+@@ -30,10 +30,9 @@ import org.apache.hadoop.conf.Configured;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellUtil;
+-import org.apache.hadoop.hbase.KeyValueUtil;
+-import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Delete;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Mutation;
+@@ -84,10 +83,9 @@ public class WALPlayer extends Configured implements Tool {
+       try {
+         // skip all other tables
+         if (Bytes.equals(table, key.getTablename().getName())) {
+-          for (Cell cell : value.getCells()) {
+-            if (WALEdit.isMetaEditFamily(cell.getFamily())) continue;
+-            context.write(new ImmutableBytesWritable(cell.getRow()),
+-                KeyValueUtil.ensureKeyValue(cell));
++          for (KeyValue kv : value.getKeyValues()) {
++            if (WALEdit.isMetaEditFamily(kv.getFamily())) continue;
++            context.write(new ImmutableBytesWritable(kv.getRow()), kv);
+           }
+         }
+       } catch (InterruptedException e) {
+@@ -128,33 +126,33 @@ public class WALPlayer extends Configured implements Tool {
+           ImmutableBytesWritable tableOut = new ImmutableBytesWritable(targetTable.getName());
+           Put put = null;
+           Delete del = null;
+-          Cell lastCell = null;
+-          for (Cell cell : value.getCells()) {
++          KeyValue lastKV = null;
++          for (KeyValue kv : value.getKeyValues()) {
+             // filtering HLog meta entries
+-            if (WALEdit.isMetaEditFamily(cell.getFamily())) continue;
++            if (WALEdit.isMetaEditFamily(kv.getFamily())) continue;
+ 
+             // A WALEdit may contain multiple operations (HBASE-3584) and/or
+             // multiple rows (HBASE-5229).
+             // Aggregate as much as possible into a single Put/Delete
+             // operation before writing to the context.
+-            if (lastCell == null || lastCell.getTypeByte() != cell.getTypeByte()
+-                || !(CellUtil.matchingRow(lastCell, cell))) {
++            if (lastKV == null || lastKV.getTypeByte() != kv.getTypeByte()
++                || !(CellUtil.matchingRow(lastKV, kv))) {
+               // row or type changed, write out aggregate KVs.
+               if (put != null) context.write(tableOut, put);
+               if (del != null) context.write(tableOut, del);
+ 
+-              if (CellUtil.isDelete(cell)) {
+-                del = new Delete(cell.getRow());
++              if (CellUtil.isDelete(kv)) {
++                del = new Delete(kv.getRow());
+               } else {
+-                put = new Put(cell.getRow());
++                put = new Put(kv.getRow());
+               }
+             }
+-            if (CellUtil.isDelete(cell)) {
+-              del.addDeleteMarker(cell);
++            if (CellUtil.isDelete(kv)) {
++              del.addDeleteMarker(kv);
+             } else {
+-              put.add(cell);
++              put.add(kv);
+             }
+-            lastCell = cell;
++            lastKV = kv;
+           }
+           // write residual KVs
+           if (put != null) context.write(tableOut, put);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
+index 157ce4f..206bb39 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
+@@ -33,6 +33,7 @@ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellScanner;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.io.SizedCellScanner;
+ import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
+ import org.apache.hadoop.hbase.protobuf.generated.AdminProtos;
+@@ -117,15 +118,15 @@ public class ReplicationProtbufUtil {
+           keyBuilder.addScopes(scopeBuilder.build());
+         }
+       }
+-      List<Cell> cells = edit.getCells();
++      List<KeyValue> kvs = edit.getKeyValues();
+       // Add up the size.  It is used later serializing out the cells.
+-      for (Cell cell: cells) {
+-        size += CellUtil.estimatedLengthOf(cell);
++      for (KeyValue kv: kvs) {
++        size += kv.getLength();
+       }
+       // Collect up the kvs
+-      allkvs.add(cells);
++      allkvs.add(kvs);
+       // Write out how many kvs associated with this entry.
+-      entryBuilder.setAssociatedCellCount(cells.size());
++      entryBuilder.setAssociatedCellCount(kvs.size());
+       builder.addEntry(entryBuilder.build());
+     }
+     return new Pair<AdminProtos.ReplicateWALEntryRequest, CellScanner>(builder.build(),
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 35e7466..30716bd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -2538,8 +2538,8 @@ public class HRegion implements HeapSize { // , Writable{
+         // Add WAL edits by CP
+         WALEdit fromCP = batchOp.walEditsFromCoprocessors[i];
+         if (fromCP != null) {
+-          for (Cell cell : fromCP.getCells()) {
+-            walEdit.add(cell);
++          for (KeyValue kv : fromCP.getKeyValues()) {
++            walEdit.add(kv);
+           }
+         }
+         addFamilyMapToWALEdit(familyMaps[i], walEdit);
+@@ -3023,7 +3023,7 @@ public class HRegion implements HeapSize { // , Writable{
+       WALEdit walEdit) {
+     for (List<Cell> edits : familyMap.values()) {
+       for (Cell cell : edits) {
+-        walEdit.add(cell);
++        walEdit.add(KeyValueUtil.ensureKeyValue(cell));
+       }
+     }
+   }
+@@ -3261,14 +3261,14 @@ public class HRegion implements HeapSize { // , Writable{
+           }
+           currentEditSeqId = key.getLogSeqNum();
+           boolean flush = false;
+-          for (Cell cell: val.getCells()) {
++          for (KeyValue kv: val.getKeyValues()) {
+             // Check this edit is for me. Also, guard against writing the special
+             // METACOLUMN info such as HBASE::CACHEFLUSH entries
+-            if (CellUtil.matchingFamily(cell, WALEdit.METAFAMILY) ||
++            if (CellUtil.matchingFamily(kv, WALEdit.METAFAMILY) ||
+                 !Bytes.equals(key.getEncodedRegionName(),
+                   this.getRegionInfo().getEncodedNameAsBytes())) {
+               //this is a special edit, we should handle it
+-              CompactionDescriptor compaction = WALEdit.getCompaction(cell);
++              CompactionDescriptor compaction = WALEdit.getCompaction(kv);
+               if (compaction != null) {
+                 //replay the compaction
+                 completeCompactionMarker(compaction);
+@@ -3278,13 +3278,13 @@ public class HRegion implements HeapSize { // , Writable{
+               continue;
+             }
+             // Figure which store the edit is meant for.
+-            if (store == null || !(CellUtil.matchingFamily(cell, store.getFamily().getName()))) {
+-              store = this.stores.get(cell.getFamily());
++            if (store == null || !(CellUtil.matchingFamily(kv, store.getFamily().getName()))) {
++              store = this.stores.get(kv.getFamily());
+             }
+             if (store == null) {
+               // This should never happen.  Perhaps schema was changed between
+               // crash and redeploy?
+-              LOG.warn("No family for " + cell);
++              LOG.warn("No family for " + kv);
+               skippedEdits++;
+               continue;
+             }
+@@ -3297,7 +3297,7 @@ public class HRegion implements HeapSize { // , Writable{
+             // Once we are over the limit, restoreEdit will keep returning true to
+             // flush -- but don't flush until we've played all the kvs that make up
+             // the WALEdit.
+-            flush = restoreEdit(store, KeyValueUtil.ensureKeyValue(cell));
++            flush = restoreEdit(store, kv);
+             editsCount++;
+           }
+           if (flush) internalFlushcache(null, currentEditSeqId, status);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MultiRowMutationProcessor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MultiRowMutationProcessor.java
+index 11fe428..06c3a2b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MultiRowMutationProcessor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MultiRowMutationProcessor.java
+@@ -146,8 +146,8 @@ MultiRowMutationProcessorResponse> {
+         // itself. No need to apply again to region
+         if (walEditsFromCP[i] != null) {
+           // Add the WALEdit created by CP hook
+-          for (Cell walCell : walEditsFromCP[i].getCells()) {
+-            walEdit.add(walCell);
++          for (KeyValue walKv : walEditsFromCP[i].getKeyValues()) {
++            walEdit.add(walKv);
+           }
+         }
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index 988a3c0..3bd0ee1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -55,6 +55,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.ClassSize;
+@@ -1500,8 +1501,8 @@ class FSHLog implements HLog, Syncable {
+       long took = EnvironmentEdgeManager.currentTimeMillis() - now;
+       coprocessorHost.postWALWrite(info, logKey, logEdit);
+       long len = 0;
+-      for (Cell cell : logEdit.getCells()) {
+-        len += CellUtil.estimatedLengthOf(cell);
++      for (KeyValue kv : logEdit.getKeyValues()) {
++        len += kv.getLength();
+       }
+       this.metrics.finishAppend(took, len);
+     } catch (IOException e) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogPrettyPrinter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogPrettyPrinter.java
+index 0d6557f..37024b5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogPrettyPrinter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogPrettyPrinter.java
+@@ -23,7 +23,6 @@ import java.io.PrintStream;
+ import java.util.ArrayList;
+ import java.util.Date;
+ import java.util.HashMap;
+-import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -38,10 +37,8 @@ import org.apache.hadoop.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hbase.Cell;
+-import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+-import org.apache.hadoop.hbase.Tag;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.FSUtils;
+@@ -259,11 +256,11 @@ public class HLogPrettyPrinter {
+           continue;
+         // initialize list into which we will store atomic actions
+         List<Map> actions = new ArrayList<Map>();
+-        for (Cell cell : edit.getCells()) {
++        for (KeyValue kv : edit.getKeyValues()) {
+           // add atomic operation to txn
+-          Map<String, Object> op = new HashMap<String, Object>(toStringMap(cell));
++          Map<String, Object> op = new HashMap<String, Object>(kv.toStringMap());
+           if (outputValues)
+-            op.put("value", Bytes.toStringBinary(cell.getValue()));
++            op.put("value", Bytes.toStringBinary(kv.getValue()));
+           // check row output filter
+           if (row == null || ((String) op.get("row")).equals(row))
+             actions.add(op);
+@@ -308,31 +305,6 @@ public class HLogPrettyPrinter {
+     }
+   }
+ 
+-  private static Map<String, Object> toStringMap(Cell cell) {
+-    Map<String, Object> stringMap = new HashMap<String, Object>();
+-    stringMap.put("row",
+-        Bytes.toStringBinary(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength()));
+-    stringMap.put("family", Bytes.toStringBinary(cell.getFamilyArray(), cell.getFamilyOffset(),
+-                cell.getFamilyLength()));
+-    stringMap.put("qualifier",
+-        Bytes.toStringBinary(cell.getQualifierArray(), cell.getQualifierOffset(),
+-            cell.getQualifierLength()));
+-    stringMap.put("timestamp", cell.getTimestamp());
+-    stringMap.put("vlen", cell.getValueLength());
+-    if (cell.getTagsLengthUnsigned() > 0) {
+-      List<String> tagsString = new ArrayList<String>();
+-      Iterator<Tag> tagsIterator = CellUtil.tagsIterator(cell.getTagsArray(), cell.getTagsOffset(),
+-          cell.getTagsLengthUnsigned());
+-      while (tagsIterator.hasNext()) {
+-        Tag tag = tagsIterator.next();
+-        tagsString.add((tag.getType()) + ":"
+-            + Bytes.toStringBinary(tag.getBuffer(), tag.getTagOffset(), tag.getTagLength()));
+-      }
+-      stringMap.put("tag", tagsString);
+-    }
+-    return stringMap;
+-  }
+-
+   public static void main(String[] args) throws IOException {
+     run(args);
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+index 7be0363..1a5de5e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+@@ -61,6 +61,7 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HRegionLocation;
+ import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.KeyValueUtil;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+@@ -1435,17 +1436,17 @@ public class HLogSplitter {
+         boolean needSkip = false;
+         HRegionLocation loc = null;
+         String locKey = null;
+-        List<Cell> cells = edit.getCells();
+-        List<Cell> skippedCells = new ArrayList<Cell>();
++        List<KeyValue> kvs = edit.getKeyValues();
++        List<KeyValue> skippedKvs = new ArrayList<KeyValue>();
+         HConnection hconn = this.getConnectionByTableName(table);
+ 
+-        for (Cell cell : cells) {
+-          byte[] row = cell.getRow();
+-          byte[] family = cell.getFamily();
++        for (KeyValue kv : kvs) {
++          byte[] row = kv.getRow();
++          byte[] family = kv.getFamily();
+           boolean isCompactionEntry = false;
+ 	
+-          if (CellUtil.matchingFamily(cell, WALEdit.METAFAMILY)) {
+-            CompactionDescriptor compaction = WALEdit.getCompaction(cell);
++          if (CellUtil.matchingFamily(kv, WALEdit.METAFAMILY)) {
++            CompactionDescriptor compaction = WALEdit.getCompaction(kv);
+             if (compaction != null && compaction.hasRegionName()) {
+               try {
+                 byte[][] regionName = HRegionInfo.parseRegionName(compaction.getRegionName()
+@@ -1455,11 +1456,11 @@ public class HLogSplitter {
+                 isCompactionEntry = true;
+               } catch (Exception ex) {
+                 LOG.warn("Unexpected exception received, ignoring " + ex);
+-                skippedCells.add(cell);
++                skippedKvs.add(kv);
+                 continue;
+               }
+             } else {
+-              skippedCells.add(cell);
++              skippedKvs.add(kv);
+               continue;
+             }
+           }
+@@ -1506,7 +1507,7 @@ public class HLogSplitter {
+               Long maxStoreSeqId = maxStoreSequenceIds.get(family);
+               if (maxStoreSeqId == null || maxStoreSeqId >= entry.getKey().getLogSeqNum()) {
+                 // skip current kv if column family doesn't exist anymore or already flushed
+-                skippedCells.add(cell);
++                skippedKvs.add(kv);
+                 continue;
+               }
+             }
+@@ -1516,8 +1517,8 @@ public class HLogSplitter {
+         // skip the edit
+         if (loc == null || needSkip) continue;
+ 
+-        if (!skippedCells.isEmpty()) {
+-          cells.removeAll(skippedCells);
++        if (!skippedKvs.isEmpty()) {
++          kvs.removeAll(skippedKvs);
+         }
+ 
+         synchronized (serverToBufferQueueMap) {
+@@ -1947,7 +1948,7 @@ public class HLogSplitter {
+         throw new ArrayIndexOutOfBoundsException("Expected=" + count + ", index=" + i);
+       }
+       Cell cell = cells.current();
+-      if (val != null) val.add(cell);
++      if (val != null) val.add(KeyValueUtil.ensureKeyValue(cell));
+ 
+       boolean isNewRowOrType =
+           previousCell == null || previousCell.getTypeByte() != cell.getTypeByte()
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
+index 621047c..c3002d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
+@@ -30,6 +30,7 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.codec.Codec;
+ import org.apache.hadoop.hbase.protobuf.generated.WALProtos.WALHeader;
+ import org.apache.hadoop.hbase.protobuf.generated.WALProtos.WALTrailer;
+@@ -113,9 +114,9 @@ public class ProtobufLogWriter extends WriterBase {
+     entry.setCompressionContext(compressionContext);
+     entry.getKey().getBuilder(compressor).setFollowingKvCount(entry.getEdit().size())
+       .build().writeDelimitedTo(output);
+-    for (Cell cell : entry.getEdit().getCells()) {
++    for (KeyValue kv : entry.getEdit().getKeyValues()) {
+       // cellEncoder must assume little about the stream, since we write PB and cells in turn.
+-      cellEncoder.write(cell);
++      cellEncoder.write(kv);
+     }
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEdit.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEdit.java
+index 34140a1..9e7841b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEdit.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEdit.java
+@@ -88,7 +88,7 @@ public class WALEdit implements Writable, HeapSize {
+   private final int VERSION_2 = -1;
+   private final boolean isReplay;
+ 
+-  private final ArrayList<Cell> cells = new ArrayList<Cell>(1);
++  private final ArrayList<KeyValue> kvs = new ArrayList<KeyValue>(1);
+ 
+   // Only here for legacy writable deserialization
+   @Deprecated
+@@ -125,8 +125,7 @@ public class WALEdit implements Writable, HeapSize {
+   }
+ 
+   public WALEdit add(Cell cell) {
+-    this.cells.add(cell);
+-    return this;
++    return add(KeyValueUtil.ensureKeyValue(cell));
+   }
+ 
+   /**
+@@ -136,18 +135,21 @@ public class WALEdit implements Writable, HeapSize {
+    */
+   @Deprecated
+   public WALEdit add(KeyValue kv) {
+-    return add((Cell) kv);
++    this.kvs.add(kv);
++    return this;
+   }
+ 
+   public boolean isEmpty() {
+-    return cells.isEmpty();
++    return kvs.isEmpty();
+   }
+ 
+   public int size() {
+-    return cells.size();
++    return kvs.size();
+   }
+ 
+   public ArrayList<Cell> getCells() {
++    ArrayList<Cell> cells = new ArrayList<Cell>(kvs.size());
++    cells.addAll(kvs);
+     return cells;
+   }
+ 
+@@ -157,9 +159,7 @@ public class WALEdit implements Writable, HeapSize {
+    */
+   @Deprecated
+   public ArrayList<KeyValue> getKeyValues() {
+-    ArrayList<KeyValue> kvs = new ArrayList<KeyValue>(cells.size());
+-    kvs.addAll(KeyValueUtil.ensureKeyValues(cells));
+-    return kvs;
++    return this.kvs;
+   }
+ 
+   public NavigableMap<byte[], Integer> getAndRemoveScopes() {
+@@ -170,7 +170,7 @@ public class WALEdit implements Writable, HeapSize {
+ 
+   @Override
+   public void readFields(DataInput in) throws IOException {
+-    cells.clear();
++    kvs.clear();
+     if (scopes != null) {
+       scopes.clear();
+     }
+@@ -208,11 +208,9 @@ public class WALEdit implements Writable, HeapSize {
+   public void write(DataOutput out) throws IOException {
+     LOG.warn("WALEdit is being serialized to writable - only expected in test code");
+     out.writeInt(VERSION_2);
+-    out.writeInt(cells.size());
++    out.writeInt(kvs.size());
+     // We interleave the two lists for code simplicity
+-    for (Cell cell : cells) {
+-      // This is not used in any of the core code flows so it is just fine to convert to KV
+-      KeyValue kv = KeyValueUtil.ensureKeyValue(cell);
++    for (KeyValue kv : kvs) {
+       if (compressionContext != null) {
+         KeyValueCompression.writeKV(out, kv, compressionContext);
+       } else{
+@@ -237,19 +235,23 @@ public class WALEdit implements Writable, HeapSize {
+    * @return Number of KVs read.
+    */
+   public int readFromCells(Codec.Decoder cellDecoder, int expectedCount) throws IOException {
+-    cells.clear();
+-    cells.ensureCapacity(expectedCount);
+-    while (cells.size() < expectedCount && cellDecoder.advance()) {
+-      cells.add(cellDecoder.current());
++    kvs.clear();
++    kvs.ensureCapacity(expectedCount);
++    while (kvs.size() < expectedCount && cellDecoder.advance()) {
++      Cell cell = cellDecoder.current();
++      if (!(cell instanceof KeyValue)) {
++        throw new IOException("WAL edit only supports KVs as cells");
++      }
++      kvs.add((KeyValue) cell);
+     }
+-    return cells.size();
++    return kvs.size();
+   }
+ 
+   @Override
+   public long heapSize() {
+     long ret = ClassSize.ARRAYLIST;
+-    for (Cell cell : cells) {
+-      ret += CellUtil.estimatedHeapSizeOf(cell);
++    for (KeyValue kv : kvs) {
++      ret += kv.heapSize();
+     }
+     if (scopes != null) {
+       ret += ClassSize.TREEMAP;
+@@ -263,9 +265,9 @@ public class WALEdit implements Writable, HeapSize {
+   public String toString() {
+     StringBuilder sb = new StringBuilder();
+ 
+-    sb.append("[#edits: " + cells.size() + " = <");
+-    for (Cell cell : cells) {
+-      sb.append(cell);
++    sb.append("[#edits: " + kvs.size() + " = <");
++    for (KeyValue kv : kvs) {
++      sb.append(kv);
+       sb.append("; ");
+     }
+     if (scopes != null) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEditsReplaySink.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEditsReplaySink.java
+index 49e81f2..966e1ee 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEditsReplaySink.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALEditsReplaySink.java
+@@ -29,11 +29,11 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellScanner;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HRegionLocation;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.HConnection;
+ import org.apache.hadoop.hbase.client.RegionServerCallable;
+@@ -230,10 +230,10 @@ public class WALEditsReplaySink {
+       boolean skip = false;
+       for (HLog.Entry entry : this.entries) {
+         WALEdit edit = entry.getEdit();
+-        List<Cell> cells = edit.getCells();
+-        for (Cell cell : cells) {
++        List<KeyValue> kvs = edit.getKeyValues();
++        for (KeyValue kv : kvs) {
+           // filtering HLog meta entries
+-          setLocation(conn.locateRegion(tableName, cell.getRow()));
++          setLocation(conn.locateRegion(tableName, kv.getRow()));
+           skip = true;
+           break;
+         }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/Replication.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/Replication.java
+index 180ac44..f06ddef 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/Replication.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/Replication.java
+@@ -37,12 +37,12 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellScanner;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.WALEntry;
+ import org.apache.hadoop.hbase.regionserver.ReplicationSinkService;
+@@ -245,10 +245,10 @@ public class Replication implements WALActionsListener,
+     NavigableMap<byte[], Integer> scopes =
+         new TreeMap<byte[], Integer>(Bytes.BYTES_COMPARATOR);
+     byte[] family;
+-    for (Cell cell : logEdit.getCells()) {
+-      family = cell.getFamily();
++    for (KeyValue kv : logEdit.getKeyValues()) {
++      family = kv.getFamily();
+       // This is expected and the KV should not be replicated
+-      if (CellUtil.matchingFamily(cell, WALEdit.METAFAMILY)) continue;
++      if (CellUtil.matchingFamily(kv, WALEdit.METAFAMILY)) continue;
+       // Unexpected, has a tendency to happen in unit tests
+       assert htd.getFamily(family) != null;
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSource.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSource.java
+index d848364..3f3ff0d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSource.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSource.java
+@@ -40,10 +40,10 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.Stoppable;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.TableNotFoundException;
+@@ -630,7 +630,7 @@ public class ReplicationSource extends Thread
+    */
+   protected void removeNonReplicableEdits(HLog.Entry entry) {
+     String tabName = entry.getKey().getTablename().getNameAsString();
+-    ArrayList<Cell> cells = entry.getEdit().getCells();
++    ArrayList<KeyValue> kvs = entry.getEdit().getKeyValues();
+     Map<String, List<String>> tableCFs = null;
+     try {
+       tableCFs = this.replicationPeers.getTableCFs(peerId);
+@@ -638,30 +638,30 @@ public class ReplicationSource extends Thread
+       LOG.error("should not happen: can't get tableCFs for peer " + peerId +
+           ", degenerate as if it's not configured by keeping tableCFs==null");
+     }
+-    int size = cells.size();
++    int size = kvs.size();
+ 
+     // clear kvs(prevent replicating) if logKey's table isn't in this peer's
+     // replicable table list (empty tableCFs means all table are replicable)
+     if (tableCFs != null && !tableCFs.containsKey(tabName)) {
+-      cells.clear();
++      kvs.clear();
+     } else {
+       NavigableMap<byte[], Integer> scopes = entry.getKey().getScopes();
+       List<String> cfs = (tableCFs == null) ? null : tableCFs.get(tabName);
+       for (int i = size - 1; i >= 0; i--) {
+-        Cell cell = cells.get(i);
++        KeyValue kv = kvs.get(i);
+         // The scope will be null or empty if
+         // there's nothing to replicate in that WALEdit
+         // ignore(remove) kv if its cf isn't in the replicable cf list
+         // (empty cfs means all cfs of this table are replicable)
+-        if (scopes == null || !scopes.containsKey(cell.getFamily()) ||
+-            (cfs != null && !cfs.contains(Bytes.toString(cell.getFamily())))) {
+-          cells.remove(i);
++        if (scopes == null || !scopes.containsKey(kv.getFamily()) ||
++            (cfs != null && !cfs.contains(Bytes.toString(kv.getFamily())))) {
++          kvs.remove(i);
+         }
+       }
+     }
+ 
+-    if (cells.size() < size/2) {
+-      cells.trimToSize();
++    if (kvs.size() < size/2) {
++      kvs.trimToSize();
+     }
+   }
+ 
+@@ -672,11 +672,11 @@ public class ReplicationSource extends Thread
+    * @return number of different row keys
+    */
+   private int countDistinctRowKeys(WALEdit edit) {
+-    List<Cell> cells = edit.getCells();
++    List<KeyValue> kvs = edit.getKeyValues();
+     int distinctRowKeys = 1;
+-    Cell lastCell = cells.get(0);
++    KeyValue lastKV = kvs.get(0);
+     for (int i = 0; i < edit.size(); i++) {
+-      if (!(CellUtil.matchingRow(cells.get(i), lastCell))) {
++      if (!(CellUtil.matchingRow(kvs.get(i), lastKV))) {
+         distinctRowKeys++;
+       }
+     }

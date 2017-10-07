@@ -1,0 +1,163 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index d2423b3..923828f 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -616,12 +616,12 @@ public class HTable implements Table {
+         new NoncedRegionServerCallable<Result>(this.connection,
+         this.rpcControllerFactory, getName(), append.getRow()) {
+       @Override
+-      protected Result call(PayloadCarryingRpcController controller) throws Exception {
++      protected Result rpcCall() throws Exception {
+         MutateRequest request = RequestConverter.buildMutateRequest(
+           getLocation().getRegionInfo().getRegionName(), append, getNonceGroup(), getNonce());
+-        MutateResponse response = getStub().mutate(controller, request);
++        MutateResponse response = getStub().mutate(getRpcController(), request);
+         if (!response.hasResult()) return null;
+-        return ProtobufUtil.toResult(response.getResult(), controller.cellScanner());
++        return ProtobufUtil.toResult(response.getResult(), getRpcControllerCellScanner());
+       }
+     };
+     return rpcCallerFactory.<Result> newCaller(this.writeRpcTimeout).
+@@ -638,12 +638,12 @@ public class HTable implements Table {
+         new NoncedRegionServerCallable<Result>(this.connection,
+         this.rpcControllerFactory, getName(), increment.getRow()) {
+       @Override
+-      protected Result call(PayloadCarryingRpcController controller) throws Exception {
++      protected Result rpcCall() throws Exception {
+         MutateRequest request = RequestConverter.buildMutateRequest(
+           getLocation().getRegionInfo().getRegionName(), increment, getNonceGroup(), getNonce());
+-        MutateResponse response = getStub().mutate(controller, request);
++        MutateResponse response = getStub().mutate(getRpcController(), request);
+         // Should this check for null like append does?
+-        return ProtobufUtil.toResult(response.getResult(), controller.cellScanner());
++        return ProtobufUtil.toResult(response.getResult(), getRpcControllerCellScanner());
+       }
+     };
+     return rpcCallerFactory.<Result> newCaller(writeRpcTimeout).callWithRetries(callable,
+@@ -680,16 +680,15 @@ public class HTable implements Table {
+           "Invalid arguments to incrementColumnValue", npe);
+     }
+ 
+-    NoncedRegionServerCallable<Long> callable =
+-        new NoncedRegionServerCallable<Long>(this.connection, this.rpcControllerFactory, getName(),
+-            row) {
++    NoncedRegionServerCallable<Long> callable = new NoncedRegionServerCallable<Long>(
++        this.connection, this.rpcControllerFactory, getName(), row) {
+       @Override
+-      protected Long call(PayloadCarryingRpcController controller) throws Exception {
++      protected Long rpcCall() throws Exception {
+         MutateRequest request = RequestConverter.buildIncrementRequest(
+           getLocation().getRegionInfo().getRegionName(), row, family,
+           qualifier, amount, durability, getNonceGroup(), getNonce());
+-        MutateResponse response = getStub().mutate(controller, request);
+-        Result result = ProtobufUtil.toResult(response.getResult(), controller.cellScanner());
++        MutateResponse response = getStub().mutate(getRpcController(), request);
++        Result result = ProtobufUtil.toResult(response.getResult(), getRpcControllerCellScanner());
+         return Long.valueOf(Bytes.toLong(result.getValue(family, qualifier)));
+       }
+     };
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/NoncedRegionServerCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/NoncedRegionServerCallable.java
+index 21e77bd..222bdf7 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/NoncedRegionServerCallable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/NoncedRegionServerCallable.java
+@@ -25,8 +25,6 @@ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
+ import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
+-import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ClientService;
+ 
+ /**
+  * Implementations make an rpc call against a RegionService via a protobuf Service.
+@@ -44,9 +42,8 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ClientService;
+  * @param <T> the class that the ServerCallable handles
+  */
+ @InterfaceAudience.Private
+-public abstract class NoncedRegionServerCallable<T> extends AbstractRegionServerCallable<T> {
+-  private ClientService.BlockingInterface stub;
+-  private final PayloadCarryingRpcController rpcController;
++public abstract class NoncedRegionServerCallable<T> extends RegionServerCallable<T> {
++
+   private final long nonce;
+ 
+   /**
+@@ -61,11 +58,7 @@ public abstract class NoncedRegionServerCallable<T> extends AbstractRegionServer
+ 
+   public NoncedRegionServerCallable(Connection connection, PayloadCarryingRpcController rpcController,
+       TableName tableName, byte [] row) {
+-    super(connection, tableName, row);
+-    this.rpcController = rpcController;
+-    if (this.rpcController != null) {
+-      this.rpcController.setPriority(tableName);
+-    }
++    super(connection, rpcController, tableName, row);
+     this.nonce = getConnection().getNonceGenerator().newNonce();
+   }
+ 
+@@ -73,51 +66,6 @@ public abstract class NoncedRegionServerCallable<T> extends AbstractRegionServer
+     this.setStub(getConnection().getClient(service));
+   }
+ 
+-  /**
+-   * @return Client Rpc protobuf communication stub
+-   */
+-  protected ClientService.BlockingInterface getStub() {
+-    return this.stub;
+-  }
+-
+-  /**
+-   * Set the client protobuf communication stub
+-   * @param stub to set
+-   */
+-  void setStub(final ClientService.BlockingInterface stub) {
+-    this.stub = stub;
+-  }
+-
+-  /**
+-   * Override that changes Exception from {@link Exception} to {@link IOException}. It also does
+-   * setup of an rpcController and calls through to the unimplemented
+-   * call(PayloadCarryingRpcController) method; implement this method to add your rpc invocation.
+-   */
+-  @Override
+-  public T call(int callTimeout) throws IOException {
+-    if (this.rpcController != null) {
+-      this.rpcController.setCallTimeout(callTimeout);
+-    }
+-    try {
+-      return call(this.rpcController);
+-    } catch (Exception e) {
+-      throw ProtobufUtil.handleRemoteException(e);
+-    }
+-  }
+-
+-  /**
+-   * Run RPC call.
+-   * @param rpcController PayloadCarryingRpcController is a mouthful but it at a minimum is a
+-   * facade on protobuf so we don't have to put protobuf everywhere; we can keep it behind this
+-   * class.
+-   * @throws Exception
+-   */
+-  protected abstract T call(PayloadCarryingRpcController rpcController) throws Exception;
+-
+-  public PayloadCarryingRpcController getRpcController() {
+-    return this.rpcController;
+-  }
+-
+   long getNonceGroup() {
+     return getConnection().getNonceGenerator().getNonceGroup();
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 3859d18..6350b15 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -206,7 +206,9 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+     ConfigurationObserver {
+   protected static final Log LOG = LogFactory.getLog(RSRpcServices.class);
+ 
+-  /** RPC scheduler to use for the region server. */
++  /**
++   * RPC scheduler to use for the region server.
++   */
+   public static final String REGION_SERVER_RPC_SCHEDULER_FACTORY_CLASS =
+     "hbase.region.server.rpc.scheduler.factory.class";
+ 

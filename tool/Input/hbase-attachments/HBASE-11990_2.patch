@@ -1,0 +1,152 @@
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+index bf968df..b8d2212 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+@@ -30,13 +30,7 @@ import org.apache.hadoop.hbase.io.TimeRange;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.NavigableSet;
+-import java.util.TreeMap;
+-import java.util.TreeSet;
++import java.util.*;
+ 
+ /**
+  * Used to perform Scan operations.
+@@ -294,7 +288,7 @@ public class Scan extends Query {
+    * Get versions of columns only within the specified timestamp range,
+    * [minStamp, maxStamp).  Note, default maximum versions to return is 1.  If
+    * your time range spans more than one version and you want all versions
+-   * returned, up the number of versions beyond the defaut.
++   * returned, up the number of versions beyond the default.
+    * @param minStamp minimum timestamp value, inclusive
+    * @param maxStamp maximum timestamp value, exclusive
+    * @throws IOException if invalid time range
+@@ -344,7 +338,7 @@ public class Scan extends Query {
+   /**
+    * Set the stop row.
+    * @param stopRow row to end at (exclusive)
+-   * Note: In order to make stopRow inclusive add a trailing 0 byte
++   * Note: In order to make stopRow inclusive use {@link #setStopRowInclusive(byte[])}
+    * @return this
+    */
+   public Scan setStopRow(byte [] stopRow) {
+@@ -353,6 +347,57 @@ public class Scan extends Query {
+   }
+ 
+   /**
++   * <p>If you want to set a scan where you need the last rowkey prefix to be inclusive
++   * then stopRow should be set to <u>the first prefix AFTER the scan range you need</u>.</p>
++   * If the prefix is an 'ASCII' string put into a byte[] then this is easy because you can simply
++   * increment the last byte of the array. But if your application uses real binary rowids you may
++   * run into the scenario that your stoprow prefix is something like<br/>
++   *    <b>{ 0x12, 0x23, 0xFF, 0xFF }</b><br/>
++   * Then this stopRow needs to be fed into the actual scan<br/>
++   *    <b>{ 0x12, 0x24 }</b> (Notice that it is shorter now)<br/>
++   * This method calculates the correct stop row value to be inclusive.
++   * @param stopRow row to end at (inclusive)
++   * @return this
++   */
++  public Scan setStopRowInclusive(byte [] stopRow) {
++    this.stopRow = stopRow.clone();
++    // Essentially we are treating it like an 'unsigned very very long' and doing +1 manually.
++    int offset = stopRow.length-1;
++    while(offset >= 0) {
++      if (this.stopRow[offset] == (byte)0xFF) {
++        offset--;
++      } else {
++        this.stopRow[offset]++;
++        break;
++      }
++    }
++    if (offset == -1) {
++      // We got an 0xFFFF... (only FFs) stopRow value which is
++      // the last possible prefix before the end of the table.
++      // So set it to stop at the 'end of the table'
++      this.stopRow = HConstants.EMPTY_END_ROW;
++    } else {
++      if (offset < stopRow.length-1) { // Did the offset change?
++        // Need to reallocate the byte[] shorter
++        this.stopRow = Arrays.copyOfRange(this.stopRow, 0, offset+1);
++      }
++    }
++
++    return this;
++  }
++
++  /**
++   * Set the start and stop row to only retrieve rows with the specified row prefix.
++   * @param rowPrefix Only scan the rows where the rowkey starts with this prefix
++   * @return this
++   */
++  public Scan setRowPrefix(byte [] rowPrefix) {
++    this.setStartRow(rowPrefix);
++    this.setStopRowInclusive(rowPrefix);
++    return this;
++  }
++
++  /**
+    * Get all available versions.
+    * @return this
+    */
+diff --git hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestScan.java hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestScan.java
+index 9565764..2fa04ab 100644
+--- hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestScan.java
++++ hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestScan.java
+@@ -23,6 +23,7 @@ import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.Set;
+ 
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.SmallTests;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
+@@ -107,5 +108,44 @@ public class TestScan {
+     Set<byte[]> qualifiers = scan.getFamilyMap().get(family);
+     Assert.assertEquals(1, qualifiers.size());
+   }
++
++  @Test
++  public void testStopRowInclusive() {
++    Scan scan = new Scan();
++
++    // Normal case
++    byte[] testRow0    = {0x00,0x00,0x00};
++    byte[] testRow0Inc = {0x00,0x00,0x01};
++    scan.setStopRowInclusive(testRow0);
++    Assert.assertArrayEquals("Failed handling stopRowInclusive increment",
++            testRow0Inc, scan.getStopRow());
++
++    // Normal case
++    byte[] testRow1    = {0x12,0x23};
++    byte[] testRow1Inc = {0x12,0x24};
++    scan.setStopRowInclusive(testRow1);
++    Assert.assertArrayEquals("Failed handling stopRowInclusive increment",
++            testRow1Inc, scan.getStopRow());
++
++    // Normal case with overflow to earlier bytes
++    byte[] testRow2    = {0x12,(byte)0xFF,(byte)0xFF};
++    byte[] testRow2Inc = {0x13};
++    scan.setStopRowInclusive(testRow2);
++    Assert.assertArrayEquals("Failed handling stopRowInclusive overflow",
++            testRow2Inc, scan.getStopRow());
++
++    // Special case: Empty stop row --> Should end at the end of the table
++    byte[] testEmptyRow    = {};
++    scan.setStopRowInclusive(testEmptyRow);
++    Assert.assertArrayEquals("Failed handling stopRowInclusive empty byte[]",
++            HConstants.EMPTY_END_ROW, scan.getStopRow());
++
++    // Edge case: All 0xFFFF ... --> Should end at the end of the table
++    byte[] testRow3    = {(byte)0xFF,(byte)0xFF,(byte)0xFF};
++    scan.setStopRowInclusive(testRow3);
++    Assert.assertArrayEquals("Failed handling stopRowInclusive complete overflow",
++            HConstants.EMPTY_END_ROW, scan.getStopRow());
++  }
++
+ }
+ 

@@ -1,0 +1,371 @@
+From c680a5dafab6f168d6f8a75a5e3a00267caafa42 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh Chouhan <abhishekchouhan121@gmail.com>
+Date: Fri, 16 Sep 2016 16:12:38 +0530
+Subject: [PATCH] HBASE-15134 Add visibility into Flush and Compaction queues
+
+---
+ .../hbase/regionserver/MetricsRegionSource.java    |    8 +++++
+ .../hbase/regionserver/MetricsRegionWrapper.java   |   24 +++++++++++++++
+ .../regionserver/MetricsRegionSourceImpl.java      |   19 +++++++++++-
+ .../regionserver/TestMetricsRegionSourceImpl.java  |   20 ++++++++++++
+ .../hbase/regionserver/CompactSplitThread.java     |    9 +++++-
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |   20 +++++++++++-
+ .../hadoop/hbase/regionserver/MemStoreFlusher.java |    2 ++
+ .../regionserver/MetricsRegionWrapperImpl.java     |   32 ++++++++++++++++++++
+ .../regionserver/MetricsRegionWrapperStub.java     |   20 ++++++++++++
+ .../hbase/regionserver/TestMetricsRegion.java      |   12 ++++++++
+ 10 files changed, 163 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSource.java
+index 911c757..62cfa8b 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSource.java
+@@ -29,10 +29,18 @@ public interface MetricsRegionSource extends Comparable<MetricsRegionSource> {
+   String SIZE_VALUE_NAME = "size";
+   String COMPACTIONS_COMPLETED_COUNT = "compactionsCompletedCount";
+   String COMPACTIONS_FAILED_COUNT = "compactionsFailedCount";
++  String COMPACTIONS_QUEUED_COUNT = "compactionsQueuedCount";
++  String MAX_COMPACTION_QUEUE_SIZE = "maxCompactionQueueSize";
+   String NUM_BYTES_COMPACTED_COUNT = "numBytesCompactedCount";
+   String NUM_FILES_COMPACTED_COUNT = "numFilesCompactedCount";
++  String FLUSHES_QUEUED_COUNT = "flushesQueuedCount";
++  String MAX_FLUSH_QUEUE_SIZE = "maxFlushQueueSize";
+   String COMPACTIONS_COMPLETED_DESC = "Number of compactions that have completed.";
+   String COMPACTIONS_FAILED_DESC = "Number of compactions that have failed.";
++  String COMPACTIONS_QUEUED_DESC = "Number of compactions that are queued/running for this region";
++  String MAX_COMPACTION_QUEUE_DESC = "Max number of compactions queued for this region";
++  String FLUSHES_QUEUED_DESC = "Number flushes requested/queued for this region";
++  String MAX_FLUSH_QUEUE_DESC = "Max number of flushes queued for this region";
+   String  NUM_BYTES_COMPACTED_DESC =
+       "Sum of filesize on all files entering a finished, successful or aborted, compaction";
+   String NUM_FILES_COMPACTED_DESC =
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapper.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapper.java
+index e3fd5c3..09a25f7 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapper.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapper.java
+@@ -112,6 +112,30 @@ public interface MetricsRegionWrapper {
+    */
+   long getNumCompactionsFailed();
+ 
++  /**
++   * @return the total number of compactions that are currently queued(or being executed) at point in
++   *  time
++   */
++  long getNumCompactionsQueued();
++
++  /**
++   * @return the total number of flushes currently queued(being executed) for this region at point in
++   *  time
++   */
++  long getNumFlushesQueued();
++  
++  /**
++   * @return the max number of compactions queued for this region
++   * Note that this metric is updated periodically and hence might miss some data points
++   */
++  long getMaxCompactionQueueSize();
++  
++  /**
++   * @return the max number of flushes queued for this region
++   * Note that this metric is updated periodically and hence might miss some data points
++   */
++  long getMaxFlushQueueSize();
++
+   int getRegionHashCode();
+ 
+   /**
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSourceImpl.java
+index c0d71d5..2475689 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionSourceImpl.java
+@@ -288,9 +288,26 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
+               regionNamePrefix + MetricsRegionServerSource.WRITE_REQUEST_COUNT,
+               MetricsRegionServerSource.WRITE_REQUEST_COUNT_DESC),
+           this.regionWrapper.getWriteRequestCount());
+-      mrb.addCounter(Interns.info(regionNamePrefix + MetricsRegionSource.REPLICA_ID,
++      mrb.addCounter(Interns.info(
++              regionNamePrefix + MetricsRegionSource.REPLICA_ID,
+               MetricsRegionSource.REPLICA_ID_DESC),
+           this.regionWrapper.getReplicaId());
++      mrb.addCounter(Interns.info(
++              regionNamePrefix + MetricsRegionSource.COMPACTIONS_QUEUED_COUNT,
++              MetricsRegionSource.COMPACTIONS_QUEUED_DESC),
++          this.regionWrapper.getNumCompactionsQueued());
++      mrb.addCounter(Interns.info(
++              regionNamePrefix + MetricsRegionSource.FLUSHES_QUEUED_COUNT,
++              MetricsRegionSource.FLUSHES_QUEUED_DESC),
++          this.regionWrapper.getNumFlushesQueued());
++      mrb.addCounter(Interns.info(
++              regionNamePrefix + MetricsRegionSource.MAX_COMPACTION_QUEUE_SIZE,
++              MetricsRegionSource.MAX_COMPACTION_QUEUE_DESC),
++          this.regionWrapper.getMaxCompactionQueueSize());
++      mrb.addCounter(Interns.info(
++              regionNamePrefix + MetricsRegionSource.MAX_FLUSH_QUEUE_SIZE,
++              MetricsRegionSource.MAX_FLUSH_QUEUE_DESC),
++          this.regionWrapper.getMaxFlushQueueSize());
+     }
+   }
+ 
+diff --git a/hbase-hadoop2-compat/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegionSourceImpl.java b/hbase-hadoop2-compat/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegionSourceImpl.java
+index cb97570..aaeaeeb 100644
+--- a/hbase-hadoop2-compat/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegionSourceImpl.java
++++ b/hbase-hadoop2-compat/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegionSourceImpl.java
+@@ -168,5 +168,25 @@ public class TestMetricsRegionSourceImpl {
+     public int getReplicaId() {
+       return 0;
+     }
++
++    @Override
++    public long getNumCompactionsQueued() {
++      return 0;
++    }
++
++    @Override
++    public long getNumFlushesQueued() {
++      return 0;
++    }
++
++    @Override
++    public long getMaxCompactionQueueSize() {
++      return 0;
++    }
++
++    @Override
++    public long getMaxFlushQueueSize() {
++      return 0;
++    }
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+index c1f82b9..d39abc8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+@@ -360,6 +360,7 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+     ThreadPoolExecutor pool = (selectNow && s.throttleCompaction(compaction.getRequest().getSize()))
+       ? longCompactions : shortCompactions;
+     pool.execute(new CompactionRunner(s, r, compaction, pool, user));
++    ((HRegion)r).incrementCompactionsQueuedCount();
+     if (LOG.isDebugEnabled()) {
+       String type = (pool == shortCompactions) ? "Small " : "Large ";
+       LOG.debug(type + "Compaction requested: " + (selectNow ? compaction.toString() : "system")
+@@ -499,9 +500,13 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+         } catch (IOException ex) {
+           LOG.error("Compaction selection failed " + this, ex);
+           server.checkFileSystem();
++          region.decrementCompactionsQueuedCount();
+           return;
+         }
+-        if (this.compaction == null) return; // nothing to do
++        if (this.compaction == null) {
++          region.decrementCompactionsQueuedCount();
++          return; // nothing to do
++        }
+         // Now see if we are in correct pool for the size; if not, go to the correct one.
+         // We might end up waiting for a while, so cancel the selection.
+         assert this.compaction.hasSelection();
+@@ -554,6 +559,7 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+         region.reportCompactionRequestFailure();
+         server.checkFileSystem();
+       } finally {
++        region.decrementCompactionsQueuedCount();
+         LOG.debug("CompactSplitThread Status: " + CompactSplitThread.this);
+       }
+       this.compaction.getRequest().afterExecute();
+@@ -564,6 +570,7 @@ public class CompactSplitThread implements CompactionRequestor, PropagatingConfi
+       Preconditions.checkNotNull(server);
+       if (server.isStopped()
+           || (region.getTableDesc() != null && !region.getTableDesc().isCompactionEnabled())) {
++        region.decrementCompactionsQueuedCount();
+         return;
+       }
+       doCompaction(user);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index f97f6b2..ab5605f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -284,6 +284,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   final AtomicLong compactionsFailed = new AtomicLong(0L);
+   final AtomicLong compactionNumFilesCompacted = new AtomicLong(0L);
+   final AtomicLong compactionNumBytesCompacted = new AtomicLong(0L);
++  final AtomicLong compactionsQueued = new AtomicLong(0L);
++  final AtomicLong flushesQueued = new AtomicLong(0L);
+ 
+   private final WAL wal;
+   private final HRegionFileSystem fs;
+@@ -2087,6 +2089,10 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+           coprocessorHost.postFlush();
+         }
+ 
++        if(fs.isFlushSucceeded()) {
++          flushesQueued.set(0L);
++        }
++
+         status.markComplete("Flush successful");
+         return fs;
+       } finally {
+@@ -7588,7 +7594,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   public static final long FIXED_OVERHEAD = ClassSize.align(
+       ClassSize.OBJECT +
+       ClassSize.ARRAY +
+-      49 * ClassSize.REFERENCE + 2 * Bytes.SIZEOF_INT +
++      51 * ClassSize.REFERENCE + 2 * Bytes.SIZEOF_INT +
+       (14 * Bytes.SIZEOF_LONG) +
+       5 * Bytes.SIZEOF_BOOLEAN);
+ 
+@@ -8059,6 +8065,18 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     compactionsFailed.incrementAndGet();
+   }
+ 
++  public void incrementCompactionsQueuedCount() {
++    compactionsQueued.incrementAndGet();
++  }
++
++  public void decrementCompactionsQueuedCount() {
++    compactionsQueued.decrementAndGet();
++  }
++
++  public void incrementFlushesQueuedCount() {
++    flushesQueued.incrementAndGet();
++  }
++
+   @VisibleForTesting
+   public long getReadPoint() {
+     return getReadPoint(IsolationLevel.READ_COMMITTED);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+index 09b3738..3bc3d9e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+@@ -357,6 +357,7 @@ class MemStoreFlusher implements FlushRequester {
+ 
+   @Override
+   public void requestFlush(Region r, boolean forceFlushAllStores) {
++    ((HRegion)r).incrementFlushesQueuedCount();
+     synchronized (regionsInQueue) {
+       if (!regionsInQueue.containsKey(r)) {
+         // This entry has no delay so it will be added at the top of the flush
+@@ -370,6 +371,7 @@ class MemStoreFlusher implements FlushRequester {
+ 
+   @Override
+   public void requestDelayedFlush(Region r, long delay, boolean forceFlushAllStores) {
++    ((HRegion)r).incrementFlushesQueuedCount();
+     synchronized (regionsInQueue) {
+       if (!regionsInQueue.containsKey(r)) {
+         // This entry has some delay
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperImpl.java
+index 01e6d06..9fe9369 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperImpl.java
+@@ -47,6 +47,8 @@ public class MetricsRegionWrapperImpl implements MetricsRegionWrapper, Closeable
+   private long minStoreFileAge;
+   private long avgStoreFileAge;
+   private long numReferenceFiles;
++  private long maxFlushQueueSize;
++  private long maxCompactionQueueSize;
+ 
+   private ScheduledFuture<?> regionMetricsUpdateTask;
+ 
+@@ -146,6 +148,26 @@ public class MetricsRegionWrapperImpl implements MetricsRegionWrapper, Closeable
+   }
+ 
+   @Override
++  public long getNumCompactionsQueued() {
++    return this.region.compactionsQueued.get();
++  }
++
++  @Override
++  public long getNumFlushesQueued() {
++    return this.region.flushesQueued.get();
++  }
++  
++  @Override
++  public long getMaxCompactionQueueSize() {
++    return maxCompactionQueueSize;
++  }
++
++  @Override
++  public long getMaxFlushQueueSize() {
++    return maxFlushQueueSize;
++  }
++
++  @Override
+   public long getMaxStoreFileAge() {
+     return maxStoreFileAge;
+   }
+@@ -180,6 +202,8 @@ public class MetricsRegionWrapperImpl implements MetricsRegionWrapper, Closeable
+       long tempMaxStoreFileAge = 0;
+       long tempMinStoreFileAge = Long.MAX_VALUE;
+       long tempNumReferenceFiles = 0;
++      long tempMaxCompactionQueueSize = 0;
++      long tempMaxFlushQueueSize = 0;
+ 
+       long avgAgeNumerator = 0;
+       long numHFiles = 0;
+@@ -217,6 +241,14 @@ public class MetricsRegionWrapperImpl implements MetricsRegionWrapper, Closeable
+       }
+ 
+       numReferenceFiles = tempNumReferenceFiles;
++      tempMaxCompactionQueueSize = getNumCompactionsQueued();
++      tempMaxFlushQueueSize = getNumFlushesQueued();
++      if (tempMaxCompactionQueueSize > maxCompactionQueueSize) {
++        maxCompactionQueueSize = tempMaxCompactionQueueSize;
++      }
++      if (tempMaxFlushQueueSize > maxFlushQueueSize) {
++        maxFlushQueueSize = tempMaxFlushQueueSize;
++      }
+     }
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperStub.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperStub.java
+index 72b8b64..1452f20 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperStub.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/MetricsRegionWrapperStub.java
+@@ -137,4 +137,24 @@ public class MetricsRegionWrapperStub implements MetricsRegionWrapper {
+   public int getReplicaId() {
+     return replicaid;
+   }
++
++  @Override
++  public long getNumCompactionsQueued() {
++    return 4;
++  }
++
++  @Override
++  public long getNumFlushesQueued() {
++    return 6;
++  }
++
++  @Override
++  public long getMaxCompactionQueueSize() {
++    return 4;
++  }
++
++  @Override
++  public long getMaxFlushQueueSize() {
++    return 6;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegion.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegion.java
+index 12fee85..6552808 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegion.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMetricsRegion.java
+@@ -85,6 +85,18 @@ public class TestMetricsRegion {
+     HELPER.assertCounter(
+       "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_replicaid", 
+       1, agg);
++    HELPER.assertCounter(
++      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_compactionsQueuedCount",
++      4, agg);
++    HELPER.assertCounter(
++      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_flushesQueuedCount",
++      6, agg);
++    HELPER.assertCounter(
++      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_maxCompactionQueueSize",
++      4, agg);
++    HELPER.assertCounter(
++      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_maxFlushQueueSize",
++      6, agg);
+     mr.close();
+   }
+ }
+-- 
+1.7.9.5

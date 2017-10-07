@@ -1,0 +1,1634 @@
+From 0c16e81d0412511e788ec63a918d0837aa1f0a28 Mon Sep 17 00:00:00 2001
+From: Umesh Agashe <uagashe@cloudera.com>
+Date: Mon, 10 Apr 2017 15:32:43 -0700
+Subject: [PATCH] HBASE-17888: Added generic methods for updating metrics on
+ submit and finish of a procedure execution
+
+---
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java |   2 +-
+ .../org/apache/hadoop/hbase/ProcedureInfo.java     |  20 +-
+ .../master/MetricsAssignmentManagerSource.java     |   9 +-
+ .../master/MetricsAssignmentManagerSourceImpl.java |   9 +-
+ .../apache/hadoop/hbase/procedure2/Procedure.java  |  41 +-
+ .../hadoop/hbase/procedure2/ProcedureExecutor.java |  11 +
+ .../hadoop/hbase/procedure2/ProcedureUtil.java     |  10 +-
+ .../hbase/procedure2/TestProcedureMetrics.java     | 254 +++++++++++
+ .../procedure2/TestStateMachineProcedure.java      |   1 -
+ .../shaded/protobuf/generated/MasterProtos.java    | 490 ++++++++++-----------
+ .../shaded/protobuf/generated/ProcedureProtos.java | 146 +++---
+ .../src/main/protobuf/Master.proto                 |   2 +-
+ .../src/main/protobuf/Procedure.proto              |   2 +-
+ .../hadoop/hbase/master/MasterRpcServices.java     |   4 +-
+ .../master/procedure/ServerCrashProcedure.java     |   2 +-
+ .../resources/hbase-webapps/master/procedures.jsp  |   2 +-
+ .../main/ruby/shell/commands/list_procedures.rb    |   6 +-
+ 17 files changed, 652 insertions(+), 359 deletions(-)
+ create mode 100644 hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestProcedureMetrics.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index 155a272..cadd6cc 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -2114,7 +2114,7 @@ public class HBaseAdmin implements Admin {
+         procedureState, procProto.hasParentId() ? procProto.getParentId() : -1, nonceKey,
+             procProto.hasException()?
+                 ForeignExceptionUtil.toIOException(procProto.getException()): null,
+-            procProto.getLastUpdate(), procProto.getStartTime(),
++            procProto.getLastUpdate(), procProto.getSubmittedTime(),
+             procProto.hasResult()? procProto.getResult().toByteArray() : null);
+   }
+ 
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/ProcedureInfo.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/ProcedureInfo.java
+index bb8bb08..6104c22 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/ProcedureInfo.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/ProcedureInfo.java
+@@ -39,7 +39,7 @@ public class ProcedureInfo implements Cloneable {
+   private final NonceKey nonceKey;
+   private final IOException exception;
+   private final long lastUpdate;
+-  private final long startTime;
++  private final long submittedTime;
+   private final byte[] result;
+ 
+   private long clientAckTime = -1;
+@@ -54,7 +54,7 @@ public class ProcedureInfo implements Cloneable {
+       final NonceKey nonceKey,
+       final IOException exception,
+       final long lastUpdate,
+-      final long startTime,
++      final long submittedTime,
+       final byte[] result) {
+     this.procId = procId;
+     this.procName = procName;
+@@ -63,7 +63,7 @@ public class ProcedureInfo implements Cloneable {
+     this.parentId = parentId;
+     this.nonceKey = nonceKey;
+     this.lastUpdate = lastUpdate;
+-    this.startTime = startTime;
++    this.submittedTime = submittedTime;
+ 
+     // If the procedure is completed, we should treat exception and result differently
+     this.exception = exception;
+@@ -74,7 +74,7 @@ public class ProcedureInfo implements Cloneable {
+       justification="Intentional; calling super class clone doesn't make sense here.")
+   public ProcedureInfo clone() {
+     return new ProcedureInfo(procId, procName, procOwner, procState, parentId, nonceKey,
+-      exception, lastUpdate, startTime, result);
++      exception, lastUpdate, submittedTime, result);
+   }
+ 
+   @Override
+@@ -96,10 +96,10 @@ public class ProcedureInfo implements Cloneable {
+     sb.append(procState);
+ 
+     long now = EnvironmentEdgeManager.currentTime();
+-    sb.append(", startTime=");
+-    sb.append(StringUtils.formatTime(now - startTime));
++    sb.append(", submittedTime=");
++    sb.append(StringUtils.formatTime(now - submittedTime));
+     sb.append(" ago, lastUpdate=");
+-    sb.append(StringUtils.formatTime(now - startTime));
++    sb.append(StringUtils.formatTime(now - submittedTime));
+     sb.append(" ago");
+ 
+     if (isFailed()) {
+@@ -168,8 +168,8 @@ public class ProcedureInfo implements Cloneable {
+     return result;
+   }
+ 
+-  public long getStartTime() {
+-    return startTime;
++  public long getSubmittedTime() {
++    return submittedTime;
+   }
+ 
+   public long getLastUpdate() {
+@@ -177,7 +177,7 @@ public class ProcedureInfo implements Cloneable {
+   }
+ 
+   public long executionTime() {
+-    return lastUpdate - startTime;
++    return lastUpdate - submittedTime;
+   }
+ 
+   @InterfaceAudience.Private
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
+index f6c9cb8..fa7bbec 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSource.java
+@@ -40,7 +40,7 @@ public interface MetricsAssignmentManagerSource extends BaseSource {
+   /**
+    * Description
+    */
+-  String METRICS_DESCRIPTION = "Metrics about HBase master assingment manager.";
++  String METRICS_DESCRIPTION = "Metrics about HBase master assignment manager.";
+ 
+   String RIT_COUNT_NAME = "ritCount";
+   String RIT_COUNT_OVER_THRESHOLD_NAME = "ritCountOverThreshold";
+@@ -49,6 +49,13 @@ public interface MetricsAssignmentManagerSource extends BaseSource {
+   String ASSIGN_TIME_NAME = "assign";
+   String BULK_ASSIGN_TIME_NAME = "bulkAssign";
+ 
++  String RIT_COUNT_DESC = "Current number of Regions In Transition (Gauge).";
++  String RIT_COUNT_OVER_THRESHOLD_DESC =
++      "Current number of Regions In Transition over threshold time (Gauge).";
++  String RIT_OLDEST_AGE_DESC = "Timestamp in milliseconds of the oldest Region In Transition (Gauge).";
++  String RIT_DURATION_DESC =
++      "Total durations in milliseconds for all Regions in Transition (Histogram).";
++
+   void updateAssignmentTime(long time);
+ 
+   void updateBulkAssignTime(long time);
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
+index ab504f5..faae044 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/MetricsAssignmentManagerSourceImpl.java
+@@ -46,12 +46,13 @@ public class MetricsAssignmentManagerSourceImpl
+   }
+ 
+   public void init() {
+-    ritGauge = metricsRegistry.newGauge(RIT_COUNT_NAME, "", 0l);
+-    ritCountOverThresholdGauge = metricsRegistry.newGauge(RIT_COUNT_OVER_THRESHOLD_NAME, "", 0l);
+-    ritOldestAgeGauge = metricsRegistry.newGauge(RIT_OLDEST_AGE_NAME, "", 0l);
++    ritGauge = metricsRegistry.newGauge(RIT_COUNT_NAME, RIT_COUNT_DESC, 0l);
++    ritCountOverThresholdGauge = metricsRegistry.newGauge(RIT_COUNT_OVER_THRESHOLD_NAME,
++        RIT_COUNT_OVER_THRESHOLD_DESC,0l);
++    ritOldestAgeGauge = metricsRegistry.newGauge(RIT_OLDEST_AGE_NAME, RIT_OLDEST_AGE_DESC, 0l);
+     assignTimeHisto = metricsRegistry.newTimeHistogram(ASSIGN_TIME_NAME);
+     bulkAssignTimeHisto = metricsRegistry.newTimeHistogram(BULK_ASSIGN_TIME_NAME);
+-    ritDurationHisto = metricsRegistry.newTimeHistogram(RIT_DURATION_NAME);
++    ritDurationHisto = metricsRegistry.newTimeHistogram(RIT_DURATION_NAME, RIT_DURATION_DESC);
+   }
+ 
+   @Override
+diff --git a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/Procedure.java b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/Procedure.java
+index 761ab3a..591c0d0 100644
+--- a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/Procedure.java
++++ b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/Procedure.java
+@@ -38,7 +38,7 @@ import com.google.common.annotations.VisibleForTesting;
+ 
+ /**
+  * Base Procedure class responsible to handle the Procedure Metadata
+- * e.g. state, startTime, lastUpdate, stack-indexes, ...
++ * e.g. state, submittedTime, lastUpdate, stack-indexes, ...
+  *
+  * execute() is called each time the procedure is executed.
+  * it may be called multiple times in case of failure and restart, so the
+@@ -73,7 +73,7 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+   private long parentProcId = NO_PROC_ID;
+   private long rootProcId = NO_PROC_ID;
+   private long procId = NO_PROC_ID;
+-  private long startTime;
++  private long submittedTime;
+ 
+   // runtime state, updated every operation
+   private ProcedureState state = ProcedureState.INITIALIZING;
+@@ -240,6 +240,27 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+     return true;
+   }
+ 
++  /**
++   * This function will be called just when procedure is submitted for execution. Override this
++   * method to update the metrics at the beginning of the procedure
++   */
++  protected void updateMetricsOnSubmit(final TEnvironment env) {}
++
++  /**
++   * This function will be called just after procedure execution is finished. Override this method
++   * to update metrics at the end of the procedure
++   *
++   * TODO: As any of the sub-procedures on failure rolls back all procedures in the stack,
++   * including successfully finished siblings, this function may get called twice in certain
++   * cases for certain procedures. Explore further if this can be called once.
++   *
++   * @param env
++   * @param runtime - Runtime of the procedure in milliseconds
++   * @param success - true if procedure is completed successfully
++   */
++  protected void updateMetricsOnFinish(final TEnvironment env, final long runtime,
++                                       boolean success) {}
++
+   @Override
+   public String toString() {
+     // Return the simple String presentation of the procedure.
+@@ -287,8 +308,8 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+   public String toStringDetails() {
+     final StringBuilder sb = toStringSimpleSB();
+ 
+-    sb.append(" startTime=");
+-    sb.append(getStartTime());
++    sb.append(" submittedTime=");
++    sb.append(getSubmittedTime());
+ 
+     sb.append(" lastUpdate=");
+     sb.append(getLastUpdate());
+@@ -353,8 +374,8 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+     return nonceKey;
+   }
+ 
+-  public long getStartTime() {
+-    return startTime;
++  public long getSubmittedTime() {
++    return submittedTime;
+   }
+ 
+   public String getOwner() {
+@@ -372,7 +393,7 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+   @InterfaceAudience.Private
+   protected void setProcId(final long procId) {
+     this.procId = procId;
+-    this.startTime = EnvironmentEdgeManager.currentTime();
++    this.submittedTime = EnvironmentEdgeManager.currentTime();
+     setState(ProcedureState.RUNNABLE);
+   }
+ 
+@@ -414,8 +435,8 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+    * the creation/deserialization.
+    */
+   @InterfaceAudience.Private
+-  protected void setStartTime(final long startTime) {
+-    this.startTime = startTime;
++  protected void setSubmittedTime(final long submittedTime) {
++    this.submittedTime = submittedTime;
+   }
+ 
+   // ==========================================================================
+@@ -478,7 +499,7 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure> {
+    * @return the time elapsed between the last update and the start time of the procedure.
+    */
+   public long elapsedTime() {
+-    return getLastUpdate() - getStartTime();
++    return getLastUpdate() - getSubmittedTime();
+   }
+ 
+   /**
+diff --git a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureExecutor.java b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureExecutor.java
+index 43f5839..1bb6118 100644
+--- a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureExecutor.java
++++ b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureExecutor.java
+@@ -831,6 +831,9 @@ public class ProcedureExecutor<TEnvironment> {
+   private long pushProcedure(final Procedure proc) {
+     final long currentProcId = proc.getProcId();
+ 
++    // Update metrics on start of a procedure
++    proc.updateMetricsOnSubmit(getEnvironment());
++
+     // Create the rollback stack for the procedure
+     RootProcedureState stack = new RootProcedureState();
+     rollbackStack.put(currentProcId, stack);
+@@ -1145,6 +1148,9 @@ public class ProcedureExecutor<TEnvironment> {
+       }
+ 
+       if (proc.isSuccess()) {
++        // update metrics on finishing the procedure
++        proc.updateMetricsOnFinish(getEnvironment(), proc.elapsedTime(), true);
++
+         if (LOG.isDebugEnabled()) {
+           LOG.debug("Finished " + proc + " in " + StringUtils.humanTimeDiff(proc.elapsedTime()));
+         }
+@@ -1276,6 +1282,10 @@ public class ProcedureExecutor<TEnvironment> {
+ 
+     if (proc.removeStackIndex()) {
+       proc.setState(ProcedureState.ROLLEDBACK);
++
++      // update metrics on finishing the procedure (fail)
++      proc.updateMetricsOnFinish(getEnvironment(), proc.elapsedTime(), false);
++
+       if (proc.hasParent()) {
+         store.delete(proc.getProcId());
+         procedures.remove(proc.getProcId());
+@@ -1444,6 +1454,7 @@ public class ProcedureExecutor<TEnvironment> {
+   private void submitChildrenProcedures(final Procedure[] subprocs) {
+     for (int i = 0; i < subprocs.length; ++i) {
+       final Procedure subproc = subprocs[i];
++      subproc.updateMetricsOnSubmit(getEnvironment());
+       assert !procedures.containsKey(subproc.getProcId());
+       procedures.put(subproc.getProcId(), subproc);
+       scheduler.addFront(subproc);
+diff --git a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureUtil.java b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureUtil.java
+index 372dcac..b4222c7 100644
+--- a/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureUtil.java
++++ b/hbase-procedure/src/main/java/org/apache/hadoop/hbase/procedure2/ProcedureUtil.java
+@@ -97,7 +97,7 @@ public final class ProcedureUtil {
+       .setClassName(proc.getClass().getName())
+       .setProcId(proc.getProcId())
+       .setState(proc.getState())
+-      .setStartTime(proc.getStartTime())
++      .setSubmittedTime(proc.getSubmittedTime())
+       .setLastUpdate(proc.getLastUpdate());
+ 
+     if (proc.hasParent()) {
+@@ -164,7 +164,7 @@ public final class ProcedureUtil {
+     // set fields
+     proc.setProcId(proto.getProcId());
+     proc.setState(proto.getState());
+-    proc.setStartTime(proto.getStartTime());
++    proc.setSubmittedTime(proto.getSubmittedTime());
+     proc.setLastUpdate(proto.getLastUpdate());
+ 
+     if (proto.hasParentId()) {
+@@ -217,7 +217,7 @@ public final class ProcedureUtil {
+ 
+     builder.setClassName(procInfo.getProcName());
+     builder.setProcId(procInfo.getProcId());
+-    builder.setStartTime(procInfo.getStartTime());
++    builder.setSubmittedTime(procInfo.getSubmittedTime());
+     builder.setState(ProcedureProtos.ProcedureState.valueOf(procInfo.getProcState().name()));
+     builder.setLastUpdate(procInfo.getLastUpdate());
+ 
+@@ -257,7 +257,7 @@ public final class ProcedureUtil {
+         procProto.hasParentId() ? procProto.getParentId() : -1, nonceKey,
+         procProto.hasException() ?
+           ForeignExceptionUtil.toIOException(procProto.getException()) : null,
+-        procProto.getLastUpdate(), procProto.getStartTime(),
++        procProto.getLastUpdate(), procProto.getSubmittedTime(),
+         procProto.hasResult() ? procProto.getResult().toByteArray() : null);
+   }
+ 
+@@ -279,6 +279,6 @@ public final class ProcedureUtil {
+         convertToProcedureState(proc.getState()),
+         proc.hasParent() ? proc.getParentProcId() : -1, nonceKey,
+         exception != null ? exception.unwrapRemoteIOException() : null,
+-        proc.getLastUpdate(), proc.getStartTime(), proc.getResult());
++        proc.getLastUpdate(), proc.getSubmittedTime(), proc.getResult());
+   }
+ }
+\ No newline at end of file
+diff --git a/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestProcedureMetrics.java b/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestProcedureMetrics.java
+new file mode 100644
+index 0000000..0a57efa
+--- /dev/null
++++ b/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestProcedureMetrics.java
+@@ -0,0 +1,254 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.procedure2;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HBaseCommonTestingUtility;
++import org.apache.hadoop.hbase.procedure2.store.ProcedureStore;
++import org.apache.hadoop.hbase.testclassification.MasterTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++import java.io.IOException;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertTrue;
++
++@Category({MasterTests.class, SmallTests.class})
++public class TestProcedureMetrics {
++  private static final Log LOG = LogFactory.getLog(TestProcedureMetrics.class);
++
++  private static final int PROCEDURE_EXECUTOR_SLOTS = 1;
++
++  private TestProcEnv procEnv;
++  private static ProcedureExecutor<TestProcEnv> procExecutor;
++  private ProcedureStore procStore;
++
++  private HBaseCommonTestingUtility htu;
++  private FileSystem fs;
++  private Path testDir;
++  private Path logDir;
++
++  private static int beginCount = 0;
++  private static int successCount = 0;
++  private static int failedCount = 0;
++
++
++  @Before
++  public void setUp() throws IOException {
++    htu = new HBaseCommonTestingUtility();
++    testDir = htu.getDataTestDir();
++    fs = testDir.getFileSystem(htu.getConfiguration());
++    assertTrue(testDir.depth() > 1);
++
++    logDir = new Path(testDir, "proc-logs");
++    procEnv = new TestProcEnv();
++    procStore = ProcedureTestingUtility.createStore(htu.getConfiguration(), fs, logDir);
++    procExecutor = new ProcedureExecutor<TestProcEnv>(htu.getConfiguration(), procEnv, procStore);
++    procExecutor.testing = new ProcedureExecutor.Testing();
++    procStore.start(PROCEDURE_EXECUTOR_SLOTS);
++    procExecutor.start(PROCEDURE_EXECUTOR_SLOTS, true);
++  }
++
++  @After
++  public void tearDown() throws IOException {
++    procExecutor.stop();
++    procStore.stop(false);
++    fs.delete(logDir, true);
++  }
++
++  @Test
++  public void testMetricForSimpleProcedure() throws Exception {
++    // procedure that executes successfully
++    ProcedureMetrics proc = new ProcedureMetrics(true);
++    long id = ProcedureTestingUtility.submitAndWait(procExecutor, proc);
++    assertNotEquals("ProcId zero!", 0, id);
++    beginCount++;
++    successCount++;
++    ProcedureTestingUtility.waitProcedure(procExecutor, proc);
++    assertEquals("beginCount doesn't match!", beginCount, proc.beginCount);
++    assertEquals("successCount doesn't match!", successCount, proc.successCount);
++    assertEquals("failedCont doesn't match!", failedCount, proc.failedCount);
++  }
++
++  @Test
++  public void testMetricsForFailedProcedure() throws Exception {
++    // procedure that fails
++    ProcedureMetrics proc = new ProcedureMetrics(false);
++    long id = ProcedureTestingUtility.submitAndWait(procExecutor, proc);
++    assertNotEquals("ProcId zero!", 0, id);
++    beginCount++;
++    failedCount++;
++    ProcedureTestingUtility.waitProcedure(procExecutor, proc);
++    assertEquals("beginCount doesn't match!", beginCount, proc.beginCount);
++    assertEquals("successCount doesn't match!", successCount, proc.successCount);
++    assertEquals("failedCont doesn't match!", failedCount, proc.failedCount);
++  }
++
++  @Test
++  public void testMetricForYieldProcedure() throws Exception {
++    // procedure that yields
++    ProcedureMetrics proc = new ProcedureMetrics(true, true);
++    long id = ProcedureTestingUtility.submitAndWait(procExecutor, proc);
++    assertNotEquals("ProcId zero!", 0, id);
++    beginCount++;
++    successCount++;
++    ProcedureTestingUtility.waitProcedure(procExecutor, proc);
++    assertEquals("beginCount doesn't match!", beginCount, proc.beginCount);
++    assertEquals("successCount doesn't match!", successCount, proc.successCount);
++    assertEquals("failedCont doesn't match!", failedCount, proc.failedCount);
++  }
++
++  @Test
++  public void testMetricForFailedYiledProcedure() {
++    // procedure that yields and fails
++    ProcedureMetrics proc = new ProcedureMetrics(false, true);
++    long id = ProcedureTestingUtility.submitAndWait(procExecutor, proc);
++    assertNotEquals("ProcId zero!", 0, id);
++    beginCount++;
++    failedCount++;
++    ProcedureTestingUtility.waitProcedure(procExecutor, proc);
++    assertEquals("beginCount doesn't match!", beginCount, proc.beginCount);
++    assertEquals("successCount doesn't match!", successCount, proc.successCount);
++    assertEquals("failedCont doesn't match!", failedCount, proc.failedCount);
++  }
++
++  @Test
++  public void testMetricForProcedureWithChildren() throws Exception {
++    // Procedure that yileds with one of the sub-procedures that fail
++    int subProcCount = 10;
++    int failChildIndex = 2;
++    int yiledChildIndex = -1;
++    ProcedureMetrics[] subprocs = new ProcedureMetrics[subProcCount];
++    for (int i = 0; i < subProcCount; ++i) {
++      subprocs[i] = new ProcedureMetrics(failChildIndex != i, yiledChildIndex == i, 3);
++    }
++
++    ProcedureMetrics proc = new ProcedureMetrics(true, true, 3, subprocs);
++    long id = ProcedureTestingUtility.submitAndWait(procExecutor, proc);
++    assertNotEquals("ProcId zero!", 0, id);
++    beginCount += subProcCount + 1;
++    successCount += subProcCount - (failChildIndex + 1);
++    if (failChildIndex >= 0) {
++      failedCount += subProcCount + 1;
++    } else {
++      successCount++;
++    }
++    ProcedureTestingUtility.waitProcedure(procExecutor, proc);
++    assertEquals("beginCount doesn't match!", beginCount, proc.beginCount);
++    assertEquals("successCount doesn't match!", successCount, proc.successCount);
++    assertEquals("failedCont doesn't match!", failedCount, proc.failedCount);
++  }
++
++  private static class TestProcEnv {
++    public boolean toggleKillBeforeStoreUpdate = false;
++    public boolean triggerRollbackOnChild = false;
++  }
++
++  public static class ProcedureMetrics extends SequentialProcedure<TestProcEnv> {
++    public static long beginCount = 0;
++    public static long successCount = 0;
++    public static long failedCount = 0;
++
++    private boolean success;
++    private boolean yield;
++    private int yieldCount;
++    private int yieldNum;
++
++    private ProcedureMetrics[] subprocs = null;
++
++    public ProcedureMetrics() {
++      this(true);
++    }
++
++    public ProcedureMetrics(boolean success) {
++      this(success, true);
++    }
++
++    public ProcedureMetrics(boolean success, boolean yield) {
++      this(success, yield, 1);
++    }
++
++    public ProcedureMetrics(boolean success, boolean yield, int yieldCount) {
++      this(success, yield, yieldCount, null);
++    }
++
++    public ProcedureMetrics(boolean success, ProcedureMetrics[] subprocs) {
++      this(success, false, 1, subprocs);
++    }
++
++    public ProcedureMetrics(boolean success, boolean yield, int yieldCount,
++                            ProcedureMetrics[] subprocs) {
++      this.success = success;
++      this.yield = yield;
++      this.yieldCount = yieldCount;
++      this.subprocs = subprocs;
++      yieldNum = 0;
++    }
++
++    @Override
++    protected void updateMetricsOnSubmit(TestProcEnv env) {
++      beginCount++;
++    }
++
++    @Override
++    protected Procedure[] execute(TestProcEnv env) throws ProcedureYieldException,
++        ProcedureSuspendedException, InterruptedException {
++      if (this.yield) {
++        if (yieldNum < yieldCount) {
++          yieldNum++;
++          throw new ProcedureYieldException();
++        }
++      }
++      if (!this.success) {
++        setFailure("Failed", new InterruptedException("Failed"));
++        return null;
++      }
++      return subprocs;
++    }
++
++    @Override
++    protected void rollback(TestProcEnv env) throws IOException, InterruptedException {
++
++    }
++
++    @Override
++    protected boolean abort(TestProcEnv env) {
++      return false;
++    }
++
++    @Override
++    protected void updateMetricsOnFinish(final TestProcEnv env, final long time,
++    boolean success) {
++      if (success) {
++        successCount++;
++      } else {
++        failedCount++;
++      }
++    }
++
++  }
++}
+diff --git a/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestStateMachineProcedure.java b/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestStateMachineProcedure.java
+index 4b36c76..82b767e 100644
+--- a/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestStateMachineProcedure.java
++++ b/hbase-procedure/src/test/java/org/apache/hadoop/hbase/procedure2/TestStateMachineProcedure.java
+@@ -19,7 +19,6 @@
+ package org.apache.hadoop.hbase.procedure2;
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.logging.Log;
+diff --git a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
+index 0071bef..8ff19b2 100644
+--- a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
++++ b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
+@@ -58948,13 +58948,13 @@ public final class MasterProtos {
+     org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProcedureResultResponse.State getState();
+ 
+     /**
+-     * <code>optional uint64 start_time = 2;</code>
++     * <code>optional uint64 submitted_time = 2;</code>
+      */
+-    boolean hasStartTime();
++    boolean hasSubmittedTime();
+     /**
+-     * <code>optional uint64 start_time = 2;</code>
++     * <code>optional uint64 submitted_time = 2;</code>
+      */
+-    long getStartTime();
++    long getSubmittedTime();
+ 
+     /**
+      * <code>optional uint64 last_update = 3;</code>
+@@ -59000,7 +59000,7 @@ public final class MasterProtos {
+     }
+     private GetProcedureResultResponse() {
+       state_ = 0;
+-      startTime_ = 0L;
++      submittedTime_ = 0L;
+       lastUpdate_ = 0L;
+       result_ = org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString.EMPTY;
+     }
+@@ -59046,7 +59046,7 @@ public final class MasterProtos {
+             }
+             case 16: {
+               bitField0_ |= 0x00000002;
+-              startTime_ = input.readUInt64();
++              submittedTime_ = input.readUInt64();
+               break;
+             }
+             case 24: {
+@@ -59212,19 +59212,19 @@ public final class MasterProtos {
+       return result == null ? org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.GetProcedureResultResponse.State.NOT_FOUND : result;
+     }
+ 
+-    public static final int START_TIME_FIELD_NUMBER = 2;
+-    private long startTime_;
++    public static final int SUBMITTED_TIME_FIELD_NUMBER = 2;
++    private long submittedTime_;
+     /**
+-     * <code>optional uint64 start_time = 2;</code>
++     * <code>optional uint64 submitted_time = 2;</code>
+      */
+-    public boolean hasStartTime() {
++    public boolean hasSubmittedTime() {
+       return ((bitField0_ & 0x00000002) == 0x00000002);
+     }
+     /**
+-     * <code>optional uint64 start_time = 2;</code>
++     * <code>optional uint64 submitted_time = 2;</code>
+      */
+-    public long getStartTime() {
+-      return startTime_;
++    public long getSubmittedTime() {
++      return submittedTime_;
+     }
+ 
+     public static final int LAST_UPDATE_FIELD_NUMBER = 3;
+@@ -59298,7 +59298,7 @@ public final class MasterProtos {
+         output.writeEnum(1, state_);
+       }
+       if (((bitField0_ & 0x00000002) == 0x00000002)) {
+-        output.writeUInt64(2, startTime_);
++        output.writeUInt64(2, submittedTime_);
+       }
+       if (((bitField0_ & 0x00000004) == 0x00000004)) {
+         output.writeUInt64(3, lastUpdate_);
+@@ -59323,7 +59323,7 @@ public final class MasterProtos {
+       }
+       if (((bitField0_ & 0x00000002) == 0x00000002)) {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
+-          .computeUInt64Size(2, startTime_);
++          .computeUInt64Size(2, submittedTime_);
+       }
+       if (((bitField0_ & 0x00000004) == 0x00000004)) {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
+@@ -59358,10 +59358,10 @@ public final class MasterProtos {
+       if (hasState()) {
+         result = result && state_ == other.state_;
+       }
+-      result = result && (hasStartTime() == other.hasStartTime());
+-      if (hasStartTime()) {
+-        result = result && (getStartTime()
+-            == other.getStartTime());
++      result = result && (hasSubmittedTime() == other.hasSubmittedTime());
++      if (hasSubmittedTime()) {
++        result = result && (getSubmittedTime()
++            == other.getSubmittedTime());
+       }
+       result = result && (hasLastUpdate() == other.hasLastUpdate());
+       if (hasLastUpdate()) {
+@@ -59393,10 +59393,10 @@ public final class MasterProtos {
+         hash = (37 * hash) + STATE_FIELD_NUMBER;
+         hash = (53 * hash) + state_;
+       }
+-      if (hasStartTime()) {
+-        hash = (37 * hash) + START_TIME_FIELD_NUMBER;
++      if (hasSubmittedTime()) {
++        hash = (37 * hash) + SUBMITTED_TIME_FIELD_NUMBER;
+         hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashLong(
+-            getStartTime());
++            getSubmittedTime());
+       }
+       if (hasLastUpdate()) {
+         hash = (37 * hash) + LAST_UPDATE_FIELD_NUMBER;
+@@ -59532,7 +59532,7 @@ public final class MasterProtos {
+         super.clear();
+         state_ = 0;
+         bitField0_ = (bitField0_ & ~0x00000001);
+-        startTime_ = 0L;
++        submittedTime_ = 0L;
+         bitField0_ = (bitField0_ & ~0x00000002);
+         lastUpdate_ = 0L;
+         bitField0_ = (bitField0_ & ~0x00000004);
+@@ -59575,7 +59575,7 @@ public final class MasterProtos {
+         if (((from_bitField0_ & 0x00000002) == 0x00000002)) {
+           to_bitField0_ |= 0x00000002;
+         }
+-        result.startTime_ = startTime_;
++        result.submittedTime_ = submittedTime_;
+         if (((from_bitField0_ & 0x00000004) == 0x00000004)) {
+           to_bitField0_ |= 0x00000004;
+         }
+@@ -59637,8 +59637,8 @@ public final class MasterProtos {
+         if (other.hasState()) {
+           setState(other.getState());
+         }
+-        if (other.hasStartTime()) {
+-          setStartTime(other.getStartTime());
++        if (other.hasSubmittedTime()) {
++          setSubmittedTime(other.getSubmittedTime());
+         }
+         if (other.hasLastUpdate()) {
+           setLastUpdate(other.getLastUpdate());
+@@ -59716,34 +59716,34 @@ public final class MasterProtos {
+         return this;
+       }
+ 
+-      private long startTime_ ;
++      private long submittedTime_ ;
+       /**
+-       * <code>optional uint64 start_time = 2;</code>
++       * <code>optional uint64 submitted_time = 2;</code>
+        */
+-      public boolean hasStartTime() {
++      public boolean hasSubmittedTime() {
+         return ((bitField0_ & 0x00000002) == 0x00000002);
+       }
+       /**
+-       * <code>optional uint64 start_time = 2;</code>
++       * <code>optional uint64 submitted_time = 2;</code>
+        */
+-      public long getStartTime() {
+-        return startTime_;
++      public long getSubmittedTime() {
++        return submittedTime_;
+       }
+       /**
+-       * <code>optional uint64 start_time = 2;</code>
++       * <code>optional uint64 submitted_time = 2;</code>
+        */
+-      public Builder setStartTime(long value) {
++      public Builder setSubmittedTime(long value) {
+         bitField0_ |= 0x00000002;
+-        startTime_ = value;
++        submittedTime_ = value;
+         onChanged();
+         return this;
+       }
+       /**
+-       * <code>optional uint64 start_time = 2;</code>
++       * <code>optional uint64 submitted_time = 2;</code>
+        */
+-      public Builder clearStartTime() {
++      public Builder clearSubmittedTime() {
+         bitField0_ = (bitField0_ & ~0x00000002);
+-        startTime_ = 0L;
++        submittedTime_ = 0L;
+         onChanged();
+         return this;
+       }
+@@ -76629,214 +76629,214 @@ public final class MasterProtos {
+       "Description\"`\n\027IsProcedureDoneResponse\022\023" +
+       "\n\004done\030\001 \001(\010:\005false\0220\n\010snapshot\030\002 \001(\0132\036.",
+       "hbase.pb.ProcedureDescription\",\n\031GetProc" +
+-      "edureResultRequest\022\017\n\007proc_id\030\001 \002(\004\"\371\001\n\032" +
++      "edureResultRequest\022\017\n\007proc_id\030\001 \002(\004\"\375\001\n\032" +
+       "GetProcedureResultResponse\0229\n\005state\030\001 \002(" +
+       "\0162*.hbase.pb.GetProcedureResultResponse." +
+-      "State\022\022\n\nstart_time\030\002 \001(\004\022\023\n\013last_update" +
+-      "\030\003 \001(\004\022\016\n\006result\030\004 \001(\014\0224\n\texception\030\005 \001(" +
+-      "\0132!.hbase.pb.ForeignExceptionMessage\"1\n\005" +
+-      "State\022\r\n\tNOT_FOUND\020\000\022\013\n\007RUNNING\020\001\022\014\n\010FIN" +
+-      "ISHED\020\002\"M\n\025AbortProcedureRequest\022\017\n\007proc" +
+-      "_id\030\001 \002(\004\022#\n\025mayInterruptIfRunning\030\002 \001(\010",
+-      ":\004true\"6\n\026AbortProcedureResponse\022\034\n\024is_p" +
+-      "rocedure_aborted\030\001 \002(\010\"\027\n\025ListProcedures" +
+-      "Request\"@\n\026ListProceduresResponse\022&\n\tpro" +
+-      "cedure\030\001 \003(\0132\023.hbase.pb.Procedure\"\315\001\n\017Se" +
+-      "tQuotaRequest\022\021\n\tuser_name\030\001 \001(\t\022\022\n\nuser" +
+-      "_group\030\002 \001(\t\022\021\n\tnamespace\030\003 \001(\t\022\'\n\ntable" +
+-      "_name\030\004 \001(\0132\023.hbase.pb.TableName\022\022\n\nremo" +
+-      "ve_all\030\005 \001(\010\022\026\n\016bypass_globals\030\006 \001(\010\022+\n\010" +
+-      "throttle\030\007 \001(\0132\031.hbase.pb.ThrottleReques" +
+-      "t\"\022\n\020SetQuotaResponse\"J\n\037MajorCompaction",
+-      "TimestampRequest\022\'\n\ntable_name\030\001 \002(\0132\023.h" +
+-      "base.pb.TableName\"U\n(MajorCompactionTime" +
+-      "stampForRegionRequest\022)\n\006region\030\001 \002(\0132\031." +
+-      "hbase.pb.RegionSpecifier\"@\n MajorCompact" +
+-      "ionTimestampResponse\022\034\n\024compaction_times" +
+-      "tamp\030\001 \002(\003\"\035\n\033SecurityCapabilitiesReques" +
+-      "t\"\354\001\n\034SecurityCapabilitiesResponse\022G\n\014ca" +
+-      "pabilities\030\001 \003(\01621.hbase.pb.SecurityCapa" +
+-      "bilitiesResponse.Capability\"\202\001\n\nCapabili" +
+-      "ty\022\031\n\025SIMPLE_AUTHENTICATION\020\000\022\031\n\025SECURE_",
+-      "AUTHENTICATION\020\001\022\021\n\rAUTHORIZATION\020\002\022\026\n\022C" +
+-      "ELL_AUTHORIZATION\020\003\022\023\n\017CELL_VISIBILITY\020\004" +
+-      "\"\"\n ListDrainingRegionServersRequest\"N\n!" +
+-      "ListDrainingRegionServersResponse\022)\n\013ser" +
+-      "ver_name\030\001 \003(\0132\024.hbase.pb.ServerName\"F\n\031" +
+-      "DrainRegionServersRequest\022)\n\013server_name" +
+-      "\030\001 \003(\0132\024.hbase.pb.ServerName\"\034\n\032DrainReg" +
+-      "ionServersResponse\"P\n#RemoveDrainFromReg" +
+-      "ionServersRequest\022)\n\013server_name\030\001 \003(\0132\024" +
+-      ".hbase.pb.ServerName\"&\n$RemoveDrainFromR",
+-      "egionServersResponse*(\n\020MasterSwitchType" +
+-      "\022\t\n\005SPLIT\020\000\022\t\n\005MERGE\020\0012\3013\n\rMasterService" +
+-      "\022e\n\024GetSchemaAlterStatus\022%.hbase.pb.GetS" +
+-      "chemaAlterStatusRequest\032&.hbase.pb.GetSc" +
+-      "hemaAlterStatusResponse\022b\n\023GetTableDescr" +
+-      "iptors\022$.hbase.pb.GetTableDescriptorsReq" +
+-      "uest\032%.hbase.pb.GetTableDescriptorsRespo" +
+-      "nse\022P\n\rGetTableNames\022\036.hbase.pb.GetTable" +
+-      "NamesRequest\032\037.hbase.pb.GetTableNamesRes" +
+-      "ponse\022Y\n\020GetClusterStatus\022!.hbase.pb.Get",
+-      "ClusterStatusRequest\032\".hbase.pb.GetClust" +
+-      "erStatusResponse\022V\n\017IsMasterRunning\022 .hb" +
+-      "ase.pb.IsMasterRunningRequest\032!.hbase.pb" +
+-      ".IsMasterRunningResponse\022D\n\tAddColumn\022\032." +
+-      "hbase.pb.AddColumnRequest\032\033.hbase.pb.Add" +
+-      "ColumnResponse\022M\n\014DeleteColumn\022\035.hbase.p" +
+-      "b.DeleteColumnRequest\032\036.hbase.pb.DeleteC" +
+-      "olumnResponse\022M\n\014ModifyColumn\022\035.hbase.pb" +
+-      ".ModifyColumnRequest\032\036.hbase.pb.ModifyCo" +
+-      "lumnResponse\022G\n\nMoveRegion\022\033.hbase.pb.Mo",
+-      "veRegionRequest\032\034.hbase.pb.MoveRegionRes" +
+-      "ponse\022\\\n\021MergeTableRegions\022\".hbase.pb.Me" +
+-      "rgeTableRegionsRequest\032#.hbase.pb.MergeT" +
+-      "ableRegionsResponse\022M\n\014AssignRegion\022\035.hb" +
+-      "ase.pb.AssignRegionRequest\032\036.hbase.pb.As" +
+-      "signRegionResponse\022S\n\016UnassignRegion\022\037.h" +
+-      "base.pb.UnassignRegionRequest\032 .hbase.pb" +
+-      ".UnassignRegionResponse\022P\n\rOfflineRegion" +
+-      "\022\036.hbase.pb.OfflineRegionRequest\032\037.hbase" +
+-      ".pb.OfflineRegionResponse\022J\n\013DeleteTable",
+-      "\022\034.hbase.pb.DeleteTableRequest\032\035.hbase.p" +
+-      "b.DeleteTableResponse\022P\n\rtruncateTable\022\036" +
+-      ".hbase.pb.TruncateTableRequest\032\037.hbase.p" +
+-      "b.TruncateTableResponse\022J\n\013EnableTable\022\034" +
+-      ".hbase.pb.EnableTableRequest\032\035.hbase.pb." +
+-      "EnableTableResponse\022M\n\014DisableTable\022\035.hb" +
+-      "ase.pb.DisableTableRequest\032\036.hbase.pb.Di" +
+-      "sableTableResponse\022J\n\013ModifyTable\022\034.hbas" +
+-      "e.pb.ModifyTableRequest\032\035.hbase.pb.Modif" +
+-      "yTableResponse\022J\n\013CreateTable\022\034.hbase.pb",
+-      ".CreateTableRequest\032\035.hbase.pb.CreateTab" +
+-      "leResponse\022A\n\010Shutdown\022\031.hbase.pb.Shutdo" +
+-      "wnRequest\032\032.hbase.pb.ShutdownResponse\022G\n" +
+-      "\nStopMaster\022\033.hbase.pb.StopMasterRequest" +
+-      "\032\034.hbase.pb.StopMasterResponse\022h\n\031IsMast" +
+-      "erInMaintenanceMode\022$.hbase.pb.IsInMaint" +
+-      "enanceModeRequest\032%.hbase.pb.IsInMainten" +
+-      "anceModeResponse\022>\n\007Balance\022\030.hbase.pb.B" +
+-      "alanceRequest\032\031.hbase.pb.BalanceResponse" +
+-      "\022_\n\022SetBalancerRunning\022#.hbase.pb.SetBal",
+-      "ancerRunningRequest\032$.hbase.pb.SetBalanc" +
+-      "erRunningResponse\022\\\n\021IsBalancerEnabled\022\"" +
+-      ".hbase.pb.IsBalancerEnabledRequest\032#.hba" +
+-      "se.pb.IsBalancerEnabledResponse\022k\n\026SetSp" +
+-      "litOrMergeEnabled\022\'.hbase.pb.SetSplitOrM" +
+-      "ergeEnabledRequest\032(.hbase.pb.SetSplitOr" +
+-      "MergeEnabledResponse\022h\n\025IsSplitOrMergeEn" +
+-      "abled\022&.hbase.pb.IsSplitOrMergeEnabledRe" +
+-      "quest\032\'.hbase.pb.IsSplitOrMergeEnabledRe" +
+-      "sponse\022D\n\tNormalize\022\032.hbase.pb.Normalize",
+-      "Request\032\033.hbase.pb.NormalizeResponse\022e\n\024" +
+-      "SetNormalizerRunning\022%.hbase.pb.SetNorma" +
+-      "lizerRunningRequest\032&.hbase.pb.SetNormal" +
+-      "izerRunningResponse\022b\n\023IsNormalizerEnabl" +
+-      "ed\022$.hbase.pb.IsNormalizerEnabledRequest" +
+-      "\032%.hbase.pb.IsNormalizerEnabledResponse\022" +
+-      "S\n\016RunCatalogScan\022\037.hbase.pb.RunCatalogS" +
+-      "canRequest\032 .hbase.pb.RunCatalogScanResp" +
+-      "onse\022e\n\024EnableCatalogJanitor\022%.hbase.pb." +
+-      "EnableCatalogJanitorRequest\032&.hbase.pb.E",
+-      "nableCatalogJanitorResponse\022n\n\027IsCatalog" +
+-      "JanitorEnabled\022(.hbase.pb.IsCatalogJanit" +
+-      "orEnabledRequest\032).hbase.pb.IsCatalogJan" +
+-      "itorEnabledResponse\022V\n\017RunCleanerChore\022 " +
+-      ".hbase.pb.RunCleanerChoreRequest\032!.hbase" +
+-      ".pb.RunCleanerChoreResponse\022k\n\026SetCleane" +
+-      "rChoreRunning\022\'.hbase.pb.SetCleanerChore" +
+-      "RunningRequest\032(.hbase.pb.SetCleanerChor" +
+-      "eRunningResponse\022h\n\025IsCleanerChoreEnable" +
+-      "d\022&.hbase.pb.IsCleanerChoreEnabledReques",
+-      "t\032\'.hbase.pb.IsCleanerChoreEnabledRespon" +
+-      "se\022^\n\021ExecMasterService\022#.hbase.pb.Copro" +
+-      "cessorServiceRequest\032$.hbase.pb.Coproces" +
+-      "sorServiceResponse\022A\n\010Snapshot\022\031.hbase.p" +
+-      "b.SnapshotRequest\032\032.hbase.pb.SnapshotRes" +
+-      "ponse\022h\n\025GetCompletedSnapshots\022&.hbase.p" +
+-      "b.GetCompletedSnapshotsRequest\032\'.hbase.p" +
+-      "b.GetCompletedSnapshotsResponse\022S\n\016Delet" +
+-      "eSnapshot\022\037.hbase.pb.DeleteSnapshotReque" +
+-      "st\032 .hbase.pb.DeleteSnapshotResponse\022S\n\016",
+-      "IsSnapshotDone\022\037.hbase.pb.IsSnapshotDone" +
+-      "Request\032 .hbase.pb.IsSnapshotDoneRespons" +
+-      "e\022V\n\017RestoreSnapshot\022 .hbase.pb.RestoreS" +
+-      "napshotRequest\032!.hbase.pb.RestoreSnapsho" +
+-      "tResponse\022P\n\rExecProcedure\022\036.hbase.pb.Ex" +
+-      "ecProcedureRequest\032\037.hbase.pb.ExecProced" +
+-      "ureResponse\022W\n\024ExecProcedureWithRet\022\036.hb" +
+-      "ase.pb.ExecProcedureRequest\032\037.hbase.pb.E" +
+-      "xecProcedureResponse\022V\n\017IsProcedureDone\022" +
+-      " .hbase.pb.IsProcedureDoneRequest\032!.hbas",
+-      "e.pb.IsProcedureDoneResponse\022V\n\017ModifyNa" +
+-      "mespace\022 .hbase.pb.ModifyNamespaceReques" +
+-      "t\032!.hbase.pb.ModifyNamespaceResponse\022V\n\017" +
+-      "CreateNamespace\022 .hbase.pb.CreateNamespa" +
+-      "ceRequest\032!.hbase.pb.CreateNamespaceResp" +
+-      "onse\022V\n\017DeleteNamespace\022 .hbase.pb.Delet" +
+-      "eNamespaceRequest\032!.hbase.pb.DeleteNames" +
+-      "paceResponse\022k\n\026GetNamespaceDescriptor\022\'" +
+-      ".hbase.pb.GetNamespaceDescriptorRequest\032" +
+-      "(.hbase.pb.GetNamespaceDescriptorRespons",
+-      "e\022q\n\030ListNamespaceDescriptors\022).hbase.pb" +
+-      ".ListNamespaceDescriptorsRequest\032*.hbase" +
+-      ".pb.ListNamespaceDescriptorsResponse\022\206\001\n" +
+-      "\037ListTableDescriptorsByNamespace\0220.hbase" +
+-      ".pb.ListTableDescriptorsByNamespaceReque" +
+-      "st\0321.hbase.pb.ListTableDescriptorsByName" +
+-      "spaceResponse\022t\n\031ListTableNamesByNamespa" +
+-      "ce\022*.hbase.pb.ListTableNamesByNamespaceR" +
+-      "equest\032+.hbase.pb.ListTableNamesByNamesp" +
+-      "aceResponse\022P\n\rGetTableState\022\036.hbase.pb.",
+-      "GetTableStateRequest\032\037.hbase.pb.GetTable" +
+-      "StateResponse\022A\n\010SetQuota\022\031.hbase.pb.Set" +
+-      "QuotaRequest\032\032.hbase.pb.SetQuotaResponse" +
+-      "\022x\n\037getLastMajorCompactionTimestamp\022).hb" +
+-      "ase.pb.MajorCompactionTimestampRequest\032*" +
+-      ".hbase.pb.MajorCompactionTimestampRespon" +
+-      "se\022\212\001\n(getLastMajorCompactionTimestampFo" +
+-      "rRegion\0222.hbase.pb.MajorCompactionTimest" +
+-      "ampForRegionRequest\032*.hbase.pb.MajorComp" +
+-      "actionTimestampResponse\022_\n\022getProcedureR",
+-      "esult\022#.hbase.pb.GetProcedureResultReque" +
+-      "st\032$.hbase.pb.GetProcedureResultResponse" +
+-      "\022h\n\027getSecurityCapabilities\022%.hbase.pb.S" +
+-      "ecurityCapabilitiesRequest\032&.hbase.pb.Se" +
+-      "curityCapabilitiesResponse\022S\n\016AbortProce" +
+-      "dure\022\037.hbase.pb.AbortProcedureRequest\032 ." +
+-      "hbase.pb.AbortProcedureResponse\022S\n\016ListP" +
+-      "rocedures\022\037.hbase.pb.ListProceduresReque" +
+-      "st\032 .hbase.pb.ListProceduresResponse\022_\n\022" +
+-      "AddReplicationPeer\022#.hbase.pb.AddReplica",
+-      "tionPeerRequest\032$.hbase.pb.AddReplicatio" +
+-      "nPeerResponse\022h\n\025RemoveReplicationPeer\022&" +
+-      ".hbase.pb.RemoveReplicationPeerRequest\032\'" +
+-      ".hbase.pb.RemoveReplicationPeerResponse\022" +
+-      "h\n\025EnableReplicationPeer\022&.hbase.pb.Enab" +
+-      "leReplicationPeerRequest\032\'.hbase.pb.Enab" +
+-      "leReplicationPeerResponse\022k\n\026DisableRepl" +
+-      "icationPeer\022\'.hbase.pb.DisableReplicatio" +
+-      "nPeerRequest\032(.hbase.pb.DisableReplicati" +
+-      "onPeerResponse\022q\n\030GetReplicationPeerConf",
+-      "ig\022).hbase.pb.GetReplicationPeerConfigRe" +
+-      "quest\032*.hbase.pb.GetReplicationPeerConfi" +
+-      "gResponse\022z\n\033UpdateReplicationPeerConfig" +
+-      "\022,.hbase.pb.UpdateReplicationPeerConfigR" +
+-      "equest\032-.hbase.pb.UpdateReplicationPeerC" +
+-      "onfigResponse\022e\n\024ListReplicationPeers\022%." +
+-      "hbase.pb.ListReplicationPeersRequest\032&.h" +
+-      "base.pb.ListReplicationPeersResponse\022t\n\031" +
+-      "listDrainingRegionServers\022*.hbase.pb.Lis" +
+-      "tDrainingRegionServersRequest\032+.hbase.pb",
+-      ".ListDrainingRegionServersResponse\022_\n\022dr" +
+-      "ainRegionServers\022#.hbase.pb.DrainRegionS" +
+-      "erversRequest\032$.hbase.pb.DrainRegionServ" +
+-      "ersResponse\022}\n\034removeDrainFromRegionServ" +
+-      "ers\022-.hbase.pb.RemoveDrainFromRegionServ" +
+-      "ersRequest\032..hbase.pb.RemoveDrainFromReg" +
+-      "ionServersResponseBI\n1org.apache.hadoop." +
+-      "hbase.shaded.protobuf.generatedB\014MasterP" +
+-      "rotosH\001\210\001\001\240\001\001"
++      "State\022\026\n\016submitted_time\030\002 \001(\004\022\023\n\013last_up" +
++      "date\030\003 \001(\004\022\016\n\006result\030\004 \001(\014\0224\n\texception\030" +
++      "\005 \001(\0132!.hbase.pb.ForeignExceptionMessage" +
++      "\"1\n\005State\022\r\n\tNOT_FOUND\020\000\022\013\n\007RUNNING\020\001\022\014\n" +
++      "\010FINISHED\020\002\"M\n\025AbortProcedureRequest\022\017\n\007" +
++      "proc_id\030\001 \002(\004\022#\n\025mayInterruptIfRunning\030\002",
++      " \001(\010:\004true\"6\n\026AbortProcedureResponse\022\034\n\024" +
++      "is_procedure_aborted\030\001 \002(\010\"\027\n\025ListProced" +
++      "uresRequest\"@\n\026ListProceduresResponse\022&\n" +
++      "\tprocedure\030\001 \003(\0132\023.hbase.pb.Procedure\"\315\001" +
++      "\n\017SetQuotaRequest\022\021\n\tuser_name\030\001 \001(\t\022\022\n\n" +
++      "user_group\030\002 \001(\t\022\021\n\tnamespace\030\003 \001(\t\022\'\n\nt" +
++      "able_name\030\004 \001(\0132\023.hbase.pb.TableName\022\022\n\n" +
++      "remove_all\030\005 \001(\010\022\026\n\016bypass_globals\030\006 \001(\010" +
++      "\022+\n\010throttle\030\007 \001(\0132\031.hbase.pb.ThrottleRe" +
++      "quest\"\022\n\020SetQuotaResponse\"J\n\037MajorCompac",
++      "tionTimestampRequest\022\'\n\ntable_name\030\001 \002(\013" +
++      "2\023.hbase.pb.TableName\"U\n(MajorCompaction" +
++      "TimestampForRegionRequest\022)\n\006region\030\001 \002(" +
++      "\0132\031.hbase.pb.RegionSpecifier\"@\n MajorCom" +
++      "pactionTimestampResponse\022\034\n\024compaction_t" +
++      "imestamp\030\001 \002(\003\"\035\n\033SecurityCapabilitiesRe" +
++      "quest\"\354\001\n\034SecurityCapabilitiesResponse\022G" +
++      "\n\014capabilities\030\001 \003(\01621.hbase.pb.Security" +
++      "CapabilitiesResponse.Capability\"\202\001\n\nCapa" +
++      "bility\022\031\n\025SIMPLE_AUTHENTICATION\020\000\022\031\n\025SEC",
++      "URE_AUTHENTICATION\020\001\022\021\n\rAUTHORIZATION\020\002\022" +
++      "\026\n\022CELL_AUTHORIZATION\020\003\022\023\n\017CELL_VISIBILI" +
++      "TY\020\004\"\"\n ListDrainingRegionServersRequest" +
++      "\"N\n!ListDrainingRegionServersResponse\022)\n" +
++      "\013server_name\030\001 \003(\0132\024.hbase.pb.ServerName" +
++      "\"F\n\031DrainRegionServersRequest\022)\n\013server_" +
++      "name\030\001 \003(\0132\024.hbase.pb.ServerName\"\034\n\032Drai" +
++      "nRegionServersResponse\"P\n#RemoveDrainFro" +
++      "mRegionServersRequest\022)\n\013server_name\030\001 \003" +
++      "(\0132\024.hbase.pb.ServerName\"&\n$RemoveDrainF",
++      "romRegionServersResponse*(\n\020MasterSwitch" +
++      "Type\022\t\n\005SPLIT\020\000\022\t\n\005MERGE\020\0012\3013\n\rMasterSer" +
++      "vice\022e\n\024GetSchemaAlterStatus\022%.hbase.pb." +
++      "GetSchemaAlterStatusRequest\032&.hbase.pb.G" +
++      "etSchemaAlterStatusResponse\022b\n\023GetTableD" +
++      "escriptors\022$.hbase.pb.GetTableDescriptor" +
++      "sRequest\032%.hbase.pb.GetTableDescriptorsR" +
++      "esponse\022P\n\rGetTableNames\022\036.hbase.pb.GetT" +
++      "ableNamesRequest\032\037.hbase.pb.GetTableName" +
++      "sResponse\022Y\n\020GetClusterStatus\022!.hbase.pb",
++      ".GetClusterStatusRequest\032\".hbase.pb.GetC" +
++      "lusterStatusResponse\022V\n\017IsMasterRunning\022" +
++      " .hbase.pb.IsMasterRunningRequest\032!.hbas" +
++      "e.pb.IsMasterRunningResponse\022D\n\tAddColum" +
++      "n\022\032.hbase.pb.AddColumnRequest\032\033.hbase.pb" +
++      ".AddColumnResponse\022M\n\014DeleteColumn\022\035.hba" +
++      "se.pb.DeleteColumnRequest\032\036.hbase.pb.Del" +
++      "eteColumnResponse\022M\n\014ModifyColumn\022\035.hbas" +
++      "e.pb.ModifyColumnRequest\032\036.hbase.pb.Modi" +
++      "fyColumnResponse\022G\n\nMoveRegion\022\033.hbase.p",
++      "b.MoveRegionRequest\032\034.hbase.pb.MoveRegio" +
++      "nResponse\022\\\n\021MergeTableRegions\022\".hbase.p" +
++      "b.MergeTableRegionsRequest\032#.hbase.pb.Me" +
++      "rgeTableRegionsResponse\022M\n\014AssignRegion\022" +
++      "\035.hbase.pb.AssignRegionRequest\032\036.hbase.p" +
++      "b.AssignRegionResponse\022S\n\016UnassignRegion" +
++      "\022\037.hbase.pb.UnassignRegionRequest\032 .hbas" +
++      "e.pb.UnassignRegionResponse\022P\n\rOfflineRe" +
++      "gion\022\036.hbase.pb.OfflineRegionRequest\032\037.h" +
++      "base.pb.OfflineRegionResponse\022J\n\013DeleteT",
++      "able\022\034.hbase.pb.DeleteTableRequest\032\035.hba" +
++      "se.pb.DeleteTableResponse\022P\n\rtruncateTab" +
++      "le\022\036.hbase.pb.TruncateTableRequest\032\037.hba" +
++      "se.pb.TruncateTableResponse\022J\n\013EnableTab" +
++      "le\022\034.hbase.pb.EnableTableRequest\032\035.hbase" +
++      ".pb.EnableTableResponse\022M\n\014DisableTable\022" +
++      "\035.hbase.pb.DisableTableRequest\032\036.hbase.p" +
++      "b.DisableTableResponse\022J\n\013ModifyTable\022\034." +
++      "hbase.pb.ModifyTableRequest\032\035.hbase.pb.M" +
++      "odifyTableResponse\022J\n\013CreateTable\022\034.hbas",
++      "e.pb.CreateTableRequest\032\035.hbase.pb.Creat" +
++      "eTableResponse\022A\n\010Shutdown\022\031.hbase.pb.Sh" +
++      "utdownRequest\032\032.hbase.pb.ShutdownRespons" +
++      "e\022G\n\nStopMaster\022\033.hbase.pb.StopMasterReq" +
++      "uest\032\034.hbase.pb.StopMasterResponse\022h\n\031Is" +
++      "MasterInMaintenanceMode\022$.hbase.pb.IsInM" +
++      "aintenanceModeRequest\032%.hbase.pb.IsInMai" +
++      "ntenanceModeResponse\022>\n\007Balance\022\030.hbase." +
++      "pb.BalanceRequest\032\031.hbase.pb.BalanceResp" +
++      "onse\022_\n\022SetBalancerRunning\022#.hbase.pb.Se",
++      "tBalancerRunningRequest\032$.hbase.pb.SetBa" +
++      "lancerRunningResponse\022\\\n\021IsBalancerEnabl" +
++      "ed\022\".hbase.pb.IsBalancerEnabledRequest\032#" +
++      ".hbase.pb.IsBalancerEnabledResponse\022k\n\026S" +
++      "etSplitOrMergeEnabled\022\'.hbase.pb.SetSpli" +
++      "tOrMergeEnabledRequest\032(.hbase.pb.SetSpl" +
++      "itOrMergeEnabledResponse\022h\n\025IsSplitOrMer" +
++      "geEnabled\022&.hbase.pb.IsSplitOrMergeEnabl" +
++      "edRequest\032\'.hbase.pb.IsSplitOrMergeEnabl" +
++      "edResponse\022D\n\tNormalize\022\032.hbase.pb.Norma",
++      "lizeRequest\032\033.hbase.pb.NormalizeResponse" +
++      "\022e\n\024SetNormalizerRunning\022%.hbase.pb.SetN" +
++      "ormalizerRunningRequest\032&.hbase.pb.SetNo" +
++      "rmalizerRunningResponse\022b\n\023IsNormalizerE" +
++      "nabled\022$.hbase.pb.IsNormalizerEnabledReq" +
++      "uest\032%.hbase.pb.IsNormalizerEnabledRespo" +
++      "nse\022S\n\016RunCatalogScan\022\037.hbase.pb.RunCata" +
++      "logScanRequest\032 .hbase.pb.RunCatalogScan" +
++      "Response\022e\n\024EnableCatalogJanitor\022%.hbase" +
++      ".pb.EnableCatalogJanitorRequest\032&.hbase.",
++      "pb.EnableCatalogJanitorResponse\022n\n\027IsCat" +
++      "alogJanitorEnabled\022(.hbase.pb.IsCatalogJ" +
++      "anitorEnabledRequest\032).hbase.pb.IsCatalo" +
++      "gJanitorEnabledResponse\022V\n\017RunCleanerCho" +
++      "re\022 .hbase.pb.RunCleanerChoreRequest\032!.h" +
++      "base.pb.RunCleanerChoreResponse\022k\n\026SetCl" +
++      "eanerChoreRunning\022\'.hbase.pb.SetCleanerC" +
++      "horeRunningRequest\032(.hbase.pb.SetCleaner" +
++      "ChoreRunningResponse\022h\n\025IsCleanerChoreEn" +
++      "abled\022&.hbase.pb.IsCleanerChoreEnabledRe",
++      "quest\032\'.hbase.pb.IsCleanerChoreEnabledRe" +
++      "sponse\022^\n\021ExecMasterService\022#.hbase.pb.C" +
++      "oprocessorServiceRequest\032$.hbase.pb.Copr" +
++      "ocessorServiceResponse\022A\n\010Snapshot\022\031.hba" +
++      "se.pb.SnapshotRequest\032\032.hbase.pb.Snapsho" +
++      "tResponse\022h\n\025GetCompletedSnapshots\022&.hba" +
++      "se.pb.GetCompletedSnapshotsRequest\032\'.hba" +
++      "se.pb.GetCompletedSnapshotsResponse\022S\n\016D" +
++      "eleteSnapshot\022\037.hbase.pb.DeleteSnapshotR" +
++      "equest\032 .hbase.pb.DeleteSnapshotResponse",
++      "\022S\n\016IsSnapshotDone\022\037.hbase.pb.IsSnapshot" +
++      "DoneRequest\032 .hbase.pb.IsSnapshotDoneRes" +
++      "ponse\022V\n\017RestoreSnapshot\022 .hbase.pb.Rest" +
++      "oreSnapshotRequest\032!.hbase.pb.RestoreSna" +
++      "pshotResponse\022P\n\rExecProcedure\022\036.hbase.p" +
++      "b.ExecProcedureRequest\032\037.hbase.pb.ExecPr" +
++      "ocedureResponse\022W\n\024ExecProcedureWithRet\022" +
++      "\036.hbase.pb.ExecProcedureRequest\032\037.hbase." +
++      "pb.ExecProcedureResponse\022V\n\017IsProcedureD" +
++      "one\022 .hbase.pb.IsProcedureDoneRequest\032!.",
++      "hbase.pb.IsProcedureDoneResponse\022V\n\017Modi" +
++      "fyNamespace\022 .hbase.pb.ModifyNamespaceRe" +
++      "quest\032!.hbase.pb.ModifyNamespaceResponse" +
++      "\022V\n\017CreateNamespace\022 .hbase.pb.CreateNam" +
++      "espaceRequest\032!.hbase.pb.CreateNamespace" +
++      "Response\022V\n\017DeleteNamespace\022 .hbase.pb.D" +
++      "eleteNamespaceRequest\032!.hbase.pb.DeleteN" +
++      "amespaceResponse\022k\n\026GetNamespaceDescript" +
++      "or\022\'.hbase.pb.GetNamespaceDescriptorRequ" +
++      "est\032(.hbase.pb.GetNamespaceDescriptorRes",
++      "ponse\022q\n\030ListNamespaceDescriptors\022).hbas" +
++      "e.pb.ListNamespaceDescriptorsRequest\032*.h" +
++      "base.pb.ListNamespaceDescriptorsResponse" +
++      "\022\206\001\n\037ListTableDescriptorsByNamespace\0220.h" +
++      "base.pb.ListTableDescriptorsByNamespaceR" +
++      "equest\0321.hbase.pb.ListTableDescriptorsBy" +
++      "NamespaceResponse\022t\n\031ListTableNamesByNam" +
++      "espace\022*.hbase.pb.ListTableNamesByNamesp" +
++      "aceRequest\032+.hbase.pb.ListTableNamesByNa" +
++      "mespaceResponse\022P\n\rGetTableState\022\036.hbase",
++      ".pb.GetTableStateRequest\032\037.hbase.pb.GetT" +
++      "ableStateResponse\022A\n\010SetQuota\022\031.hbase.pb" +
++      ".SetQuotaRequest\032\032.hbase.pb.SetQuotaResp" +
++      "onse\022x\n\037getLastMajorCompactionTimestamp\022" +
++      ").hbase.pb.MajorCompactionTimestampReque" +
++      "st\032*.hbase.pb.MajorCompactionTimestampRe" +
++      "sponse\022\212\001\n(getLastMajorCompactionTimesta" +
++      "mpForRegion\0222.hbase.pb.MajorCompactionTi" +
++      "mestampForRegionRequest\032*.hbase.pb.Major" +
++      "CompactionTimestampResponse\022_\n\022getProced",
++      "ureResult\022#.hbase.pb.GetProcedureResultR" +
++      "equest\032$.hbase.pb.GetProcedureResultResp" +
++      "onse\022h\n\027getSecurityCapabilities\022%.hbase." +
++      "pb.SecurityCapabilitiesRequest\032&.hbase.p" +
++      "b.SecurityCapabilitiesResponse\022S\n\016AbortP" +
++      "rocedure\022\037.hbase.pb.AbortProcedureReques" +
++      "t\032 .hbase.pb.AbortProcedureResponse\022S\n\016L" +
++      "istProcedures\022\037.hbase.pb.ListProceduresR" +
++      "equest\032 .hbase.pb.ListProceduresResponse" +
++      "\022_\n\022AddReplicationPeer\022#.hbase.pb.AddRep",
++      "licationPeerRequest\032$.hbase.pb.AddReplic" +
++      "ationPeerResponse\022h\n\025RemoveReplicationPe" +
++      "er\022&.hbase.pb.RemoveReplicationPeerReque" +
++      "st\032\'.hbase.pb.RemoveReplicationPeerRespo" +
++      "nse\022h\n\025EnableReplicationPeer\022&.hbase.pb." +
++      "EnableReplicationPeerRequest\032\'.hbase.pb." +
++      "EnableReplicationPeerResponse\022k\n\026Disable" +
++      "ReplicationPeer\022\'.hbase.pb.DisableReplic" +
++      "ationPeerRequest\032(.hbase.pb.DisableRepli" +
++      "cationPeerResponse\022q\n\030GetReplicationPeer",
++      "Config\022).hbase.pb.GetReplicationPeerConf" +
++      "igRequest\032*.hbase.pb.GetReplicationPeerC" +
++      "onfigResponse\022z\n\033UpdateReplicationPeerCo" +
++      "nfig\022,.hbase.pb.UpdateReplicationPeerCon" +
++      "figRequest\032-.hbase.pb.UpdateReplicationP" +
++      "eerConfigResponse\022e\n\024ListReplicationPeer" +
++      "s\022%.hbase.pb.ListReplicationPeersRequest" +
++      "\032&.hbase.pb.ListReplicationPeersResponse" +
++      "\022t\n\031listDrainingRegionServers\022*.hbase.pb" +
++      ".ListDrainingRegionServersRequest\032+.hbas",
++      "e.pb.ListDrainingRegionServersResponse\022_" +
++      "\n\022drainRegionServers\022#.hbase.pb.DrainReg" +
++      "ionServersRequest\032$.hbase.pb.DrainRegion" +
++      "ServersResponse\022}\n\034removeDrainFromRegion" +
++      "Servers\022-.hbase.pb.RemoveDrainFromRegion" +
++      "ServersRequest\032..hbase.pb.RemoveDrainFro" +
++      "mRegionServersResponseBI\n1org.apache.had" +
++      "oop.hbase.shaded.protobuf.generatedB\014Mas" +
++      "terProtosH\001\210\001\001\240\001\001"
+     };
+     org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+         new org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.    InternalDescriptorAssigner() {
+@@ -77492,7 +77492,7 @@ public final class MasterProtos {
+     internal_static_hbase_pb_GetProcedureResultResponse_fieldAccessorTable = new
+       org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
+         internal_static_hbase_pb_GetProcedureResultResponse_descriptor,
+-        new java.lang.String[] { "State", "StartTime", "LastUpdate", "Result", "Exception", });
++        new java.lang.String[] { "State", "SubmittedTime", "LastUpdate", "Result", "Exception", });
+     internal_static_hbase_pb_AbortProcedureRequest_descriptor =
+       getDescriptor().getMessageTypes().get(106);
+     internal_static_hbase_pb_AbortProcedureRequest_fieldAccessorTable = new
+diff --git a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ProcedureProtos.java b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ProcedureProtos.java
+index 56d1e11..e6fe9b1 100644
+--- a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ProcedureProtos.java
++++ b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ProcedureProtos.java
+@@ -262,13 +262,13 @@ public final class ProcedureProtos {
+     long getProcId();
+ 
+     /**
+-     * <code>required uint64 start_time = 4;</code>
++     * <code>required uint64 submitted_time = 4;</code>
+      */
+-    boolean hasStartTime();
++    boolean hasSubmittedTime();
+     /**
+-     * <code>required uint64 start_time = 4;</code>
++     * <code>required uint64 submitted_time = 4;</code>
+      */
+-    long getStartTime();
++    long getSubmittedTime();
+ 
+     /**
+      * <code>optional string owner = 5;</code>
+@@ -449,7 +449,7 @@ public final class ProcedureProtos {
+       className_ = "";
+       parentId_ = 0L;
+       procId_ = 0L;
+-      startTime_ = 0L;
++      submittedTime_ = 0L;
+       owner_ = "";
+       state_ = 1;
+       stackId_ = java.util.Collections.emptyList();
+@@ -507,7 +507,7 @@ public final class ProcedureProtos {
+             }
+             case 32: {
+               bitField0_ |= 0x00000008;
+-              startTime_ = input.readUInt64();
++              submittedTime_ = input.readUInt64();
+               break;
+             }
+             case 42: {
+@@ -711,19 +711,19 @@ public final class ProcedureProtos {
+       return procId_;
+     }
+ 
+-    public static final int START_TIME_FIELD_NUMBER = 4;
+-    private long startTime_;
++    public static final int SUBMITTED_TIME_FIELD_NUMBER = 4;
++    private long submittedTime_;
+     /**
+-     * <code>required uint64 start_time = 4;</code>
++     * <code>required uint64 submitted_time = 4;</code>
+      */
+-    public boolean hasStartTime() {
++    public boolean hasSubmittedTime() {
+       return ((bitField0_ & 0x00000008) == 0x00000008);
+     }
+     /**
+-     * <code>required uint64 start_time = 4;</code>
++     * <code>required uint64 submitted_time = 4;</code>
+      */
+-    public long getStartTime() {
+-      return startTime_;
++    public long getSubmittedTime() {
++      return submittedTime_;
+     }
+ 
+     public static final int OWNER_FIELD_NUMBER = 5;
+@@ -987,7 +987,7 @@ public final class ProcedureProtos {
+         memoizedIsInitialized = 0;
+         return false;
+       }
+-      if (!hasStartTime()) {
++      if (!hasSubmittedTime()) {
+         memoizedIsInitialized = 0;
+         return false;
+       }
+@@ -1015,7 +1015,7 @@ public final class ProcedureProtos {
+         output.writeUInt64(3, procId_);
+       }
+       if (((bitField0_ & 0x00000008) == 0x00000008)) {
+-        output.writeUInt64(4, startTime_);
++        output.writeUInt64(4, submittedTime_);
+       }
+       if (((bitField0_ & 0x00000010) == 0x00000010)) {
+         org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.writeString(output, 5, owner_);
+@@ -1068,7 +1068,7 @@ public final class ProcedureProtos {
+       }
+       if (((bitField0_ & 0x00000008) == 0x00000008)) {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
+-          .computeUInt64Size(4, startTime_);
++          .computeUInt64Size(4, submittedTime_);
+       }
+       if (((bitField0_ & 0x00000010) == 0x00000010)) {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.computeStringSize(5, owner_);
+@@ -1146,10 +1146,10 @@ public final class ProcedureProtos {
+         result = result && (getProcId()
+             == other.getProcId());
+       }
+-      result = result && (hasStartTime() == other.hasStartTime());
+-      if (hasStartTime()) {
+-        result = result && (getStartTime()
+-            == other.getStartTime());
++      result = result && (hasSubmittedTime() == other.hasSubmittedTime());
++      if (hasSubmittedTime()) {
++        result = result && (getSubmittedTime()
++            == other.getSubmittedTime());
+       }
+       result = result && (hasOwner() == other.hasOwner());
+       if (hasOwner()) {
+@@ -1222,10 +1222,10 @@ public final class ProcedureProtos {
+         hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashLong(
+             getProcId());
+       }
+-      if (hasStartTime()) {
+-        hash = (37 * hash) + START_TIME_FIELD_NUMBER;
++      if (hasSubmittedTime()) {
++        hash = (37 * hash) + SUBMITTED_TIME_FIELD_NUMBER;
+         hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashLong(
+-            getStartTime());
++            getSubmittedTime());
+       }
+       if (hasOwner()) {
+         hash = (37 * hash) + OWNER_FIELD_NUMBER;
+@@ -1400,7 +1400,7 @@ public final class ProcedureProtos {
+         bitField0_ = (bitField0_ & ~0x00000002);
+         procId_ = 0L;
+         bitField0_ = (bitField0_ & ~0x00000004);
+-        startTime_ = 0L;
++        submittedTime_ = 0L;
+         bitField0_ = (bitField0_ & ~0x00000008);
+         owner_ = "";
+         bitField0_ = (bitField0_ & ~0x00000010);
+@@ -1465,7 +1465,7 @@ public final class ProcedureProtos {
+         if (((from_bitField0_ & 0x00000008) == 0x00000008)) {
+           to_bitField0_ |= 0x00000008;
+         }
+-        result.startTime_ = startTime_;
++        result.submittedTime_ = submittedTime_;
+         if (((from_bitField0_ & 0x00000010) == 0x00000010)) {
+           to_bitField0_ |= 0x00000010;
+         }
+@@ -1564,8 +1564,8 @@ public final class ProcedureProtos {
+         if (other.hasProcId()) {
+           setProcId(other.getProcId());
+         }
+-        if (other.hasStartTime()) {
+-          setStartTime(other.getStartTime());
++        if (other.hasSubmittedTime()) {
++          setSubmittedTime(other.getSubmittedTime());
+         }
+         if (other.hasOwner()) {
+           bitField0_ |= 0x00000010;
+@@ -1618,7 +1618,7 @@ public final class ProcedureProtos {
+         if (!hasProcId()) {
+           return false;
+         }
+-        if (!hasStartTime()) {
++        if (!hasSubmittedTime()) {
+           return false;
+         }
+         if (!hasState()) {
+@@ -1829,34 +1829,34 @@ public final class ProcedureProtos {
+         return this;
+       }
+ 
+-      private long startTime_ ;
++      private long submittedTime_ ;
+       /**
+-       * <code>required uint64 start_time = 4;</code>
++       * <code>required uint64 submitted_time = 4;</code>
+        */
+-      public boolean hasStartTime() {
++      public boolean hasSubmittedTime() {
+         return ((bitField0_ & 0x00000008) == 0x00000008);
+       }
+       /**
+-       * <code>required uint64 start_time = 4;</code>
++       * <code>required uint64 submitted_time = 4;</code>
+        */
+-      public long getStartTime() {
+-        return startTime_;
++      public long getSubmittedTime() {
++        return submittedTime_;
+       }
+       /**
+-       * <code>required uint64 start_time = 4;</code>
++       * <code>required uint64 submitted_time = 4;</code>
+        */
+-      public Builder setStartTime(long value) {
++      public Builder setSubmittedTime(long value) {
+         bitField0_ |= 0x00000008;
+-        startTime_ = value;
++        submittedTime_ = value;
+         onChanged();
+         return this;
+       }
+       /**
+-       * <code>required uint64 start_time = 4;</code>
++       * <code>required uint64 submitted_time = 4;</code>
+        */
+-      public Builder clearStartTime() {
++      public Builder clearSubmittedTime() {
+         bitField0_ = (bitField0_ & ~0x00000008);
+-        startTime_ = 0L;
++        submittedTime_ = 0L;
+         onChanged();
+         return this;
+       }
+@@ -7743,38 +7743,38 @@ public final class ProcedureProtos {
+   static {
+     java.lang.String[] descriptorData = {
+       "\n\017Procedure.proto\022\010hbase.pb\032\023ErrorHandli" +
+-      "ng.proto\"\313\002\n\tProcedure\022\022\n\nclass_name\030\001 \002" +
+-      "(\t\022\021\n\tparent_id\030\002 \001(\004\022\017\n\007proc_id\030\003 \002(\004\022\022" +
+-      "\n\nstart_time\030\004 \002(\004\022\r\n\005owner\030\005 \001(\t\022\'\n\005sta" +
+-      "te\030\006 \002(\0162\030.hbase.pb.ProcedureState\022\020\n\010st" +
+-      "ack_id\030\007 \003(\r\022\023\n\013last_update\030\010 \002(\004\022\017\n\007tim" +
+-      "eout\030\t \001(\r\0224\n\texception\030\n \001(\0132!.hbase.pb" +
+-      ".ForeignExceptionMessage\022\016\n\006result\030\013 \001(\014" +
+-      "\022\022\n\nstate_data\030\014 \001(\014\022\026\n\013nonce_group\030\r \001(" +
+-      "\004:\0010\022\020\n\005nonce\030\016 \001(\004:\0010\"+\n\027SequentialProc",
+-      "edureData\022\020\n\010executed\030\001 \002(\010\"*\n\031StateMach" +
+-      "ineProcedureData\022\r\n\005state\030\001 \003(\r\"X\n\022Proce" +
+-      "dureWALHeader\022\017\n\007version\030\001 \002(\r\022\014\n\004type\030\002" +
+-      " \002(\r\022\016\n\006log_id\030\003 \002(\004\022\023\n\013min_proc_id\030\004 \002(" +
+-      "\004\";\n\023ProcedureWALTrailer\022\017\n\007version\030\001 \002(" +
+-      "\r\022\023\n\013tracker_pos\030\002 \002(\004\"\225\001\n\025ProcedureStor" +
+-      "eTracker\0229\n\004node\030\001 \003(\0132+.hbase.pb.Proced" +
+-      "ureStoreTracker.TrackerNode\032A\n\013TrackerNo" +
+-      "de\022\020\n\010start_id\030\001 \002(\004\022\017\n\007updated\030\002 \003(\004\022\017\n" +
+-      "\007deleted\030\003 \003(\004\"\257\002\n\021ProcedureWALEntry\022.\n\004",
+-      "type\030\001 \002(\0162 .hbase.pb.ProcedureWALEntry." +
+-      "Type\022&\n\tprocedure\030\002 \003(\0132\023.hbase.pb.Proce" +
+-      "dure\022\017\n\007proc_id\030\003 \001(\004\022\020\n\010child_id\030\004 \003(\004\"" +
+-      "\236\001\n\004Type\022\025\n\021PROCEDURE_WAL_EOF\020\001\022\026\n\022PROCE" +
+-      "DURE_WAL_INIT\020\002\022\030\n\024PROCEDURE_WAL_INSERT\020" +
+-      "\003\022\030\n\024PROCEDURE_WAL_UPDATE\020\004\022\030\n\024PROCEDURE" +
+-      "_WAL_DELETE\020\005\022\031\n\025PROCEDURE_WAL_COMPACT\020\006" +
+-      "*{\n\016ProcedureState\022\020\n\014INITIALIZING\020\001\022\014\n\010" +
+-      "RUNNABLE\020\002\022\013\n\007WAITING\020\003\022\023\n\017WAITING_TIMEO" +
+-      "UT\020\004\022\016\n\nROLLEDBACK\020\005\022\013\n\007SUCCESS\020\006\022\n\n\006FAI",
+-      "LED\020\007BL\n1org.apache.hadoop.hbase.shaded." +
+-      "protobuf.generatedB\017ProcedureProtosH\001\210\001\001" +
+-      "\240\001\001"
++      "ng.proto\"\317\002\n\tProcedure\022\022\n\nclass_name\030\001 \002" +
++      "(\t\022\021\n\tparent_id\030\002 \001(\004\022\017\n\007proc_id\030\003 \002(\004\022\026" +
++      "\n\016submitted_time\030\004 \002(\004\022\r\n\005owner\030\005 \001(\t\022\'\n" +
++      "\005state\030\006 \002(\0162\030.hbase.pb.ProcedureState\022\020" +
++      "\n\010stack_id\030\007 \003(\r\022\023\n\013last_update\030\010 \002(\004\022\017\n" +
++      "\007timeout\030\t \001(\r\0224\n\texception\030\n \001(\0132!.hbas" +
++      "e.pb.ForeignExceptionMessage\022\016\n\006result\030\013" +
++      " \001(\014\022\022\n\nstate_data\030\014 \001(\014\022\026\n\013nonce_group\030" +
++      "\r \001(\004:\0010\022\020\n\005nonce\030\016 \001(\004:\0010\"+\n\027Sequential",
++      "ProcedureData\022\020\n\010executed\030\001 \002(\010\"*\n\031State" +
++      "MachineProcedureData\022\r\n\005state\030\001 \003(\r\"X\n\022P" +
++      "rocedureWALHeader\022\017\n\007version\030\001 \002(\r\022\014\n\004ty" +
++      "pe\030\002 \002(\r\022\016\n\006log_id\030\003 \002(\004\022\023\n\013min_proc_id\030" +
++      "\004 \002(\004\";\n\023ProcedureWALTrailer\022\017\n\007version\030" +
++      "\001 \002(\r\022\023\n\013tracker_pos\030\002 \002(\004\"\225\001\n\025Procedure" +
++      "StoreTracker\0229\n\004node\030\001 \003(\0132+.hbase.pb.Pr" +
++      "ocedureStoreTracker.TrackerNode\032A\n\013Track" +
++      "erNode\022\020\n\010start_id\030\001 \002(\004\022\017\n\007updated\030\002 \003(" +
++      "\004\022\017\n\007deleted\030\003 \003(\004\"\257\002\n\021ProcedureWALEntry",
++      "\022.\n\004type\030\001 \002(\0162 .hbase.pb.ProcedureWALEn" +
++      "try.Type\022&\n\tprocedure\030\002 \003(\0132\023.hbase.pb.P" +
++      "rocedure\022\017\n\007proc_id\030\003 \001(\004\022\020\n\010child_id\030\004 " +
++      "\003(\004\"\236\001\n\004Type\022\025\n\021PROCEDURE_WAL_EOF\020\001\022\026\n\022P" +
++      "ROCEDURE_WAL_INIT\020\002\022\030\n\024PROCEDURE_WAL_INS" +
++      "ERT\020\003\022\030\n\024PROCEDURE_WAL_UPDATE\020\004\022\030\n\024PROCE" +
++      "DURE_WAL_DELETE\020\005\022\031\n\025PROCEDURE_WAL_COMPA" +
++      "CT\020\006*{\n\016ProcedureState\022\020\n\014INITIALIZING\020\001" +
++      "\022\014\n\010RUNNABLE\020\002\022\013\n\007WAITING\020\003\022\023\n\017WAITING_T" +
++      "IMEOUT\020\004\022\016\n\nROLLEDBACK\020\005\022\013\n\007SUCCESS\020\006\022\n\n",
++      "\006FAILED\020\007BL\n1org.apache.hadoop.hbase.sha" +
++      "ded.protobuf.generatedB\017ProcedureProtosH" +
++      "\001\210\001\001\240\001\001"
+     };
+     org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+         new org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.    InternalDescriptorAssigner() {
+@@ -7794,7 +7794,7 @@ public final class ProcedureProtos {
+     internal_static_hbase_pb_Procedure_fieldAccessorTable = new
+       org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
+         internal_static_hbase_pb_Procedure_descriptor,
+-        new java.lang.String[] { "ClassName", "ParentId", "ProcId", "StartTime", "Owner", "State", "StackId", "LastUpdate", "Timeout", "Exception", "Result", "StateData", "NonceGroup", "Nonce", });
++        new java.lang.String[] { "ClassName", "ParentId", "ProcId", "SubmittedTime", "Owner", "State", "StackId", "LastUpdate", "Timeout", "Exception", "Result", "StateData", "NonceGroup", "Nonce", });
+     internal_static_hbase_pb_SequentialProcedureData_descriptor =
+       getDescriptor().getMessageTypes().get(1);
+     internal_static_hbase_pb_SequentialProcedureData_fieldAccessorTable = new
+diff --git a/hbase-protocol-shaded/src/main/protobuf/Master.proto b/hbase-protocol-shaded/src/main/protobuf/Master.proto
+index e22695b..d7d51e2 100644
+--- a/hbase-protocol-shaded/src/main/protobuf/Master.proto
++++ b/hbase-protocol-shaded/src/main/protobuf/Master.proto
+@@ -512,7 +512,7 @@ message GetProcedureResultResponse {
+   }
+ 
+   required State state = 1;
+-  optional uint64 start_time = 2;
++  optional uint64 submitted_time = 2;
+   optional uint64 last_update = 3;
+   optional bytes result = 4;
+   optional ForeignExceptionMessage exception = 5;
+diff --git a/hbase-protocol-shaded/src/main/protobuf/Procedure.proto b/hbase-protocol-shaded/src/main/protobuf/Procedure.proto
+index 2fed24d..1a3ecf5 100644
+--- a/hbase-protocol-shaded/src/main/protobuf/Procedure.proto
++++ b/hbase-protocol-shaded/src/main/protobuf/Procedure.proto
+@@ -43,7 +43,7 @@ message Procedure {
+   required string class_name = 1;        // full classname to be able to instantiate the procedure
+   optional uint64 parent_id = 2;         // parent if not a root-procedure otherwise not set
+   required uint64 proc_id = 3;
+-  required uint64 start_time = 4;
++  required uint64 submitted_time = 4;
+   optional string owner = 5;
+ 
+   // internal "runtime" state
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+index f86f800..9af8f45 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+@@ -1098,7 +1098,7 @@ public class MasterRpcServices extends RSRpcServices
+       if (v.getFirst() != null) {
+         ProcedureInfo result = v.getFirst();
+         builder.setState(GetProcedureResultResponse.State.FINISHED);
+-        builder.setStartTime(result.getStartTime());
++        builder.setSubmittedTime(result.getSubmittedTime());
+         builder.setLastUpdate(result.getLastUpdate());
+         if (result.isFailed()) {
+           builder.setException(ForeignExceptionUtil.toProtoForeignException(result.getException()));
+@@ -1113,7 +1113,7 @@ public class MasterRpcServices extends RSRpcServices
+           builder.setState(GetProcedureResultResponse.State.NOT_FOUND);
+         } else {
+           builder.setState(GetProcedureResultResponse.State.RUNNING);
+-          builder.setStartTime(proc.getStartTime());
++          builder.setSubmittedTime(proc.getSubmittedTime());
+           builder.setLastUpdate(proc.getLastUpdate());
+         }
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ServerCrashProcedure.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ServerCrashProcedure.java
+index 484decc..2703947 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ServerCrashProcedure.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ServerCrashProcedure.java
+@@ -166,7 +166,7 @@ implements ServerProcedureInterface {
+ 
+   private void throwProcedureYieldException(final String msg) throws ProcedureYieldException {
+     String logMsg = msg + "; cycle=" + this.cycles + ", running for " +
+-        StringUtils.formatTimeDiff(System.currentTimeMillis(), getStartTime());
++        StringUtils.formatTimeDiff(System.currentTimeMillis(), getSubmittedTime());
+     // The procedure executor logs ProcedureYieldException at trace level. For now, log these
+     // yields for server crash processing at DEBUG. Revisit when stable.
+     if (LOG.isDebugEnabled()) LOG.debug(logMsg);
+diff --git a/hbase-server/src/main/resources/hbase-webapps/master/procedures.jsp b/hbase-server/src/main/resources/hbase-webapps/master/procedures.jsp
+index 645f6fd..c841e61 100644
+--- a/hbase-server/src/main/resources/hbase-webapps/master/procedures.jsp
++++ b/hbase-server/src/main/resources/hbase-webapps/master/procedures.jsp
+@@ -124,7 +124,7 @@
+         <td><%= escapeXml(procInfo.getProcState().toString()) %></a></td>
+         <td><%= escapeXml(procInfo.getProcOwner()) %></a></td>
+         <td><%= escapeXml(procInfo.getProcName()) %></a></td>
+-        <td><%= new Date(procInfo.getStartTime()) %></a></td>
++        <td><%= new Date(procInfo.getSubmittedTime()) %></a></td>
+         <td><%= new Date(procInfo.getLastUpdate()) %></a></td>
+         <td><%= escapeXml(procInfo.isFailed() ? procInfo.getException().getMessage() : "") %></a></td>
+       </tr>
+diff --git a/hbase-shell/src/main/ruby/shell/commands/list_procedures.rb b/hbase-shell/src/main/ruby/shell/commands/list_procedures.rb
+index 4358a96..64a3388 100644
+--- a/hbase-shell/src/main/ruby/shell/commands/list_procedures.rb
++++ b/hbase-shell/src/main/ruby/shell/commands/list_procedures.rb
+@@ -29,13 +29,13 @@ EOF
+       end
+ 
+       def command()
+-        formatter.header([ "Id", "Name", "State", "Start_Time", "Last_Update" ])
++        formatter.header([ "Id", "Name", "State", "Submitted_Time", "Last_Update" ])
+ 
+         list = admin.list_procedures()
+         list.each do |proc|
+-          start_time = Time.at(proc.getStartTime / 1000).to_s
++          submitted_time = Time.at(proc.getSubmittedTime / 1000).to_s
+           last_update = Time.at(proc.getLastUpdate / 1000).to_s
+-          formatter.row([ proc.getProcId, proc.getProcName, proc.getProcState, start_time, last_update ])
++          formatter.row([ proc.getProcId, proc.getProcName, proc.getProcState, submitted_time, last_update ])
+         end
+ 
+         formatter.footer(list.size)
+-- 
+2.10.1 (Apple Git-78)
+

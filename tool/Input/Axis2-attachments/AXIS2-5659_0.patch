@@ -1,0 +1,728 @@
+Index: modules/kernel/src/org/apache/axis2/addressing/AddressingConstants.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/addressing/AddressingConstants.java	(revision 1609411)
++++ modules/kernel/src/org/apache/axis2/addressing/AddressingConstants.java	(working copy)
+@@ -116,6 +116,11 @@
+     static final String REFERENCE_PARAMETER_PARAMETER = "referenceParameters";
+ 
+     /**
++     * Used to attach any <wsid:Identity> OMElement found in an EPR embedded in a WSDL to an AxisEndpoint object.
++     */
++    static final String ADDRESSING_IDENTITY_PARAMETER = "addressingIdentity";
++    
++    /**
+      * This parameter is used to decide whether the reference parameters in an inbound request
+      * message are to be processed or not.
+      */
+@@ -145,6 +150,8 @@
+     static final String IDENTITY_KEY_INFO = "KeyInfo";
+     static final String IDENTITY_X509_DATA = "X509Data";
+     static final String IDENTITY_X509_CERT = "X509Certificate";
++    static final String IDENTITY_SPN = "Spn";
++    static final String IDENTITY_UPN = "Upn";
+     
+     static final String IDENTITY_PARAMETER = "WSAddressingAndIdentity";
+     
+@@ -152,6 +159,8 @@
+     static final QName QNAME_IDENTITY_KEY_INFO = new QName(XML_SIG_NS,IDENTITY_KEY_INFO,XML_SIG_PREFIX);
+     static final QName QNAME_IDENTITY_X509_DATA = new QName(XML_SIG_NS,IDENTITY_X509_DATA,XML_SIG_PREFIX);
+     static final QName QNAME_IDENTITY_X509_CERT = new QName(XML_SIG_NS,IDENTITY_X509_CERT,XML_SIG_PREFIX);
++    static final QName QNAME_IDENTITY_SPN = new QName(ADDRESSING_IDENTITY_NS, IDENTITY_SPN, ADDRESSING_IDENTITY_PREFIX);
++    static final QName QNAME_IDENTITY_UPN = new QName(ADDRESSING_IDENTITY_NS, IDENTITY_UPN, ADDRESSING_IDENTITY_PREFIX);
+     
+     interface Final {
+ 
+Index: modules/kernel/src/org/apache/axis2/addressing/AddressingHelper.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/addressing/AddressingHelper.java	(revision 1609411)
++++ modules/kernel/src/org/apache/axis2/addressing/AddressingHelper.java	(working copy)
+@@ -19,10 +19,14 @@
+ 
+ package org.apache.axis2.addressing;
+ 
++import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.AxisFault;
+ import org.apache.axis2.Constants;
+ import org.apache.axis2.context.MessageContext;
++import org.apache.axis2.deployment.DeploymentConstants;
++import org.apache.axis2.description.AxisBinding;
+ import org.apache.axis2.description.AxisDescription;
++import org.apache.axis2.description.AxisEndpoint;
+ import org.apache.axis2.description.AxisOperation;
+ import org.apache.axis2.description.Parameter;
+ import org.apache.axis2.util.LoggingControl;
+@@ -329,4 +333,47 @@
+             }
+         }
+ 	}
++	
++	/**
++	 * @param endpoint The endpoint to check for a {@link AddressingConstants#ADDRESSING_IDENTITY_PARAMETER}. Must not be <code>null</code>
++	 * @return The Addressing identity OMElement ({@link AddressingConstants#QNAME_IDENTITY}) if such is configured on the specified <code>endpoint</code> or
++	 * its <code>binding</code>, or <code>null</code> if not available.
++	 * This will normally be available if the service was created from a WSDL which contains a WS-Addressing endpoint reference with an &lt;wsid:Identity&gt; extension
++	 * either on the port or corresponding binding.
++	 */
++	public static OMElement getAddressingIdentityParameterValue(AxisEndpoint endpoint) {
++	    OMElement identityElement = (OMElement) endpoint.getParameterValue(AddressingConstants.ADDRESSING_IDENTITY_PARAMETER);
++	    
++	    //unwrap identity element if wrapped in a parameter element
++	    //NB: in revision 1371373 wrapping of parameter value when parsing parameters from services.xml has been removed
++    	if (identityElement != null && identityElement.getLocalName().equals(DeploymentConstants.TAG_PARAMETER)) {
++    		identityElement = identityElement.getFirstElement();
++    	}
++    	
++	    if (identityElement != null) {
++            if (LoggingControl.debugLoggingAllowed && log.isDebugEnabled()) {
++                log.debug(String.format("getAddressingIdentityParameterValue: %s parameter from AxisEndpoint '%s': %s", AddressingConstants.ADDRESSING_IDENTITY_PARAMETER,
++                    endpoint.getName(), identityElement.toString()));
++            }
++            
++            return identityElement;
++	    }
++	    
++	    AxisBinding binding = endpoint.getBinding();
++	    if (binding != null) {
++	        identityElement = (OMElement) binding.getParameterValue(AddressingConstants.ADDRESSING_IDENTITY_PARAMETER);
++	    }
++	    
++	    //unwrap identity element if wrapped in a parameter element
++    	if (identityElement != null && identityElement.getLocalName().equals(DeploymentConstants.TAG_PARAMETER)) {
++    		identityElement = identityElement.getFirstElement();
++    	}
++    	
++        if (LoggingControl.debugLoggingAllowed && log.isDebugEnabled()) {
++            log.debug(String.format("getAddressingIdentityParameterValue: %s parameter from AxisBinding '%s': %s", AddressingConstants.ADDRESSING_IDENTITY_PARAMETER,
++                binding.getName(), identityElement == null ? "N/A" : identityElement.toString()));
++        }
++        
++	    return identityElement;
++	}
+ }
+Index: modules/kernel/src/org/apache/axis2/context/MessageContext.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/context/MessageContext.java	(revision 1609411)
++++ modules/kernel/src/org/apache/axis2/context/MessageContext.java	(working copy)
+@@ -52,6 +52,7 @@
+ import org.apache.axis2.description.Parameter;
+ import org.apache.axis2.description.TransportInDescription;
+ import org.apache.axis2.description.TransportOutDescription;
++import org.apache.axis2.description.WSDL2Constants;
+ import org.apache.axis2.engine.AxisConfiguration;
+ import org.apache.axis2.engine.AxisError;
+ import org.apache.axis2.engine.Handler;
+@@ -4320,4 +4321,44 @@
+     public void setFailureReason(Exception failureReason) {
+         this.failureReason = failureReason;
+     }
++    
++    /**
++     * @return Identifies and returns the service endpoint for this message context. The method will use the following steps to identify the endpoint:
++     * <ul>
++     * <li>If a non-null {@link AxisEndpoint} instance is set under the {@link WSDL2Constants#ENDPOINT_LOCAL_NAME ENDPOINT_LOCAL_NAME} message context property, return it</li>
++     * <li>If a non-null {@link #getAxisService() axisService} instance is set and it specifies {@link AxisService#isClientSide() clientSide=true}, retrieve the endpoint which matches its {@link AxisService#getEndpointName() enpointName}</li>
++     * <li>else, return <code>null</code></li>
++     * </ul>
++     */
++    public AxisEndpoint findEndpoint() {
++        AxisEndpoint endpoint = (AxisEndpoint) getProperty(WSDL2Constants.ENDPOINT_LOCAL_NAME);
++        
++        final String methodName = "findEnpoint()";
++        if (endpoint != null) {
++            if (log.isDebugEnabled()) {
++                log.debug(String.format("%s:%s - identified endpoint from property '%s': %s", getLogIDString(), methodName, WSDL2Constants.ENDPOINT_LOCAL_NAME, endpoint.getName()));
++            }
++            
++            return endpoint;
++        }
++        
++        if (axisService == null) {
++            if (log.isWarnEnabled()) {
++                log.warn(String.format("%s:%s - no service set, cannot identify endpoint", getLogIDString(), methodName));
++            }
++            
++            return null;
++        }
++        
++        if (!axisService.isClientSide()) {
++            if (log.isWarnEnabled()) {
++                log.warn(String.format("%s:%s - no '%s' property set and serverSide=true, cannot uniquely identify endpoint for service: ", getLogIDString(), methodName, WSDL2Constants.ENDPOINT_LOCAL_NAME, axisService.getName()));
++            }
++            return null;
++        }
++        
++        //on client-side, the default endpoint name is the one the AxisService was created with
++        String endpointName = axisService.getEndpointName();
++        return axisService.getEndpoint(endpointName);
++    }
+ }
+Index: modules/kernel/src/org/apache/axis2/description/AxisService2WSDL11.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/description/AxisService2WSDL11.java	(revision 1609411)
++++ modules/kernel/src/org/apache/axis2/description/AxisService2WSDL11.java	(working copy)
+@@ -676,7 +676,7 @@
+ 					WSDLSerializationUtil.addExtensionElement(fac, port,
+ 							SOAP_ADDRESS, LOCATION, (endpointURL == null) ? ""
+ 									: endpointURL, soap);
+-					generateEPRElement(fac, port, endpointURL);
++					generateEPRElement(axisEndpoint, fac, port, endpointURL);
+ 					addPolicyAsExtElement(axisEndpoint, port);
+ 					service.addChild(modifyPort(port));
+ 					if (isAlreadyAdded(axisBinding, definition)) {
+@@ -726,7 +726,7 @@
+ 					WSDLSerializationUtil.addExtensionElement(fac, port,
+ 							SOAP_ADDRESS, LOCATION, (endpointURL == null) ? ""
+ 									: endpointURL, soap12);
+-					generateEPRElement(fac, port, endpointURL);
++					generateEPRElement(axisEndpoint, fac, port, endpointURL);
+ 					addPolicyAsExtElement(axisEndpoint, port);
+ 					service.addChild(modifyPort(port));
+ 					if (isAlreadyAdded(axisBinding, definition)) {
+@@ -1352,26 +1352,52 @@
+ 	}
+ 	
+ 	/**
+-	 * Generate the Identity element according to the WS-AddressingAndIdentity if the 
+-	 * AddressingConstants.IDENTITY_PARAMETER parameter is set. 
+-	 * http://schemas.xmlsoap.org/ws/2006/02/addressingidentity/ 
++	 * Generate a &lt;wsid:Identity&gt; element according to the 
++	 * <a href="http://www.oasis-open.org/committees/download.php/29516/ws-addressingandidentity.doc">WS-AddressingAndIdentity specification</a>
++	 * and add it as a child of the given <code>epr</code> &lt;wsa:EndpointReference&gt; element.
++	 * <p>
++	 * If none of the <code>identityParameter</code> and <code>x509CertIdentityParameter</code> configures a valid value, this method will skip creating and
++	 * adding an identity element.
++	 * </p>
++	 * 
++	 * @param fac A factory to use for creating OMElements.
++	 * @param epr The endpoint reference element to add the generated identity element to. Must not be <code>null</code>.
++	 * @param identity An optional &lt;wsid:Identity&gt; OMElement to clone and use, instead of generating a new one.
++	 * @param x509CertIdentityParameter An optional parameter that may contain a &lt;ds:X509Certificate&gt; String literal value to set as key info in the created identity element.
+ 	 */
+-	
+-	private void generateIdentityElement(OMFactory fac,OMElement epr, Parameter wsaIdParam) {
+-	    
+-	    // Create the Identity element
+-	    OMElement identity = fac.createOMElement(AddressingConstants.QNAME_IDENTITY);
+-	    OMElement keyInfo = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_KEY_INFO);
+-	    OMElement x509Data = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_X509_DATA);
+-	    OMElement x509cert = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_X509_CERT);
+-	    x509cert.setText((String)wsaIdParam.getValue());
+-	    
+-	    x509Data.addChild(x509cert);
+-	    keyInfo.addChild(x509Data);
+-	    identity.addChild(keyInfo);
+-	    
+-	    epr.addChild(identity);
+-	    
++	private void generateIdentityElement(OMFactory fac, OMElement epr, OMElement identity, Parameter x509CertIdentityParameter) {
++	    if (identity != null) {
++	    	identity = identity.cloneOMElement();
++    		epr.addChild(identity);	
++	    }
++	        
++	    if (x509CertIdentityParameter != null && x509CertIdentityParameter.getValue() != null) {
++	        if (identity == null) {
++	            identity = fac.createOMElement(AddressingConstants.QNAME_IDENTITY);
++	            epr.addChild(identity);
++	        }
++	        
++    	    OMElement keyInfo = identity.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_KEY_INFO);
++    	    if (keyInfo == null) {
++    	        keyInfo = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_KEY_INFO);
++    	        identity.addChild(keyInfo);
++    	    }
++    	    
++    	    OMElement x509Data = keyInfo.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_X509_DATA);
++    	    if (x509Data == null) {
++    	        x509Data = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_X509_DATA);
++    	        keyInfo.addChild(x509Data);
++    	    }
++    	    
++    	    OMElement x509cert = x509Data.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_X509_CERT);
++    	    if (x509cert == null) {
++    	        x509cert = fac.createOMElement(AddressingConstants.QNAME_IDENTITY_X509_CERT);
++    	        x509Data.addChild(x509cert);
++    	    }
++    	    
++    	    String x509CertValue = (String) x509CertIdentityParameter.getValue();
++    	    x509cert.setText(x509CertValue);
++	    }
+ 	}
+ 	
+ 	
+@@ -1384,12 +1410,15 @@
+          * </wsa:EndpointReference>
+ 	 * 
+ 	 */
+-	private void generateEPRElement(OMFactory fac, OMElement port, String endpointURL){
++	private void generateEPRElement(AxisEndpoint endpoint, OMFactory fac, OMElement port, String endpointURL){
++	    //an optional String parameter that contains x509 certificate information 
++	    Parameter x509CertIdentityParameter = axisService.getParameter(AddressingConstants.IDENTITY_PARAMETER);
+ 	    
+-	    Parameter parameter = axisService.getParameter(AddressingConstants.IDENTITY_PARAMETER);
+-	            
+-	    // If the parameter is not set, return
+-	    if (parameter == null || parameter.getValue() == null) {
++	    //an optional OMElement parameter that represents an <wsid:Identity> element
++	    OMElement identityElement = AddressingHelper.getAddressingIdentityParameterValue(endpoint);
++
++	    if ((x509CertIdentityParameter == null || x509CertIdentityParameter.getValue() == null) && identityElement == null) {
++	        //none of these is configured, for backward compatibility do not generate anything and return
+ 	        return;
+ 	    }
+ 	    
+@@ -1401,7 +1430,7 @@
+ 	    wsaEpr.addChild(address);
+ 	    
+ 	    // This will generate the identity element if the service parameter is set
+-	    generateIdentityElement(fac, wsaEpr, parameter);
++	    generateIdentityElement(fac, wsaEpr, identityElement, x509CertIdentityParameter);
+ 	    
+ 	    port.addChild(wsaEpr);   
+ 	    
+Index: modules/kernel/src/org/apache/axis2/description/WSDL11ToAxisServiceBuilder.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/description/WSDL11ToAxisServiceBuilder.java	(revision 1609411)
++++ modules/kernel/src/org/apache/axis2/description/WSDL11ToAxisServiceBuilder.java	(working copy)
+@@ -564,6 +564,12 @@
+     				if(referenceParameters != null){
+     					axisEndpoint.addParameter(AddressingConstants.REFERENCE_PARAMETER_PARAMETER, new ArrayList(referenceParameters.values()));
+     				}
++    				for (OMElement extensibleElement : epr.getExtensibleElements()) {
++    				    if (AddressingConstants.QNAME_IDENTITY.equals(extensibleElement.getQName())) {
++    				        axisEndpoint.addParameter(AddressingConstants.ADDRESSING_IDENTITY_PARAMETER, extensibleElement.cloneOMElement());
++    				        break;
++    				    }
++    				}
+     			} catch (Exception e) {
+     				if(log.isDebugEnabled()){
+     					log.debug("Exception encountered processing embedded wsa:EndpointReference", e);
+Index: modules/kernel/test-resources/deployment/AddressingIdentityServiceTest/service.xml
+===================================================================
+--- modules/kernel/test-resources/deployment/AddressingIdentityServiceTest/service.xml	(revision 0)
++++ modules/kernel/test-resources/deployment/AddressingIdentityServiceTest/service.xml	(revision 0)
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<service name="Echo">
++    <parameter name="ServiceClass">org.apache.axis2.sample.echo.EchoImpl</parameter>
++
++    <!-- Configure SPN using addressingIdentity extensibility element -->
++    <parameter name="addressingIdentity">
++        <Identity xmlns="http://schemas.xmlsoap.org/ws/2006/02/addressingidentity">
++            <Upn>bob@EXAMPLE.COM</Upn>
++        </Identity>
++    </parameter>
++    
++</service>
+Index: modules/kernel/test-resources/wsdl/identity.wsdl
+===================================================================
+--- modules/kernel/test-resources/wsdl/identity.wsdl	(revision 0)
++++ modules/kernel/test-resources/wsdl/identity.wsdl	(revision 0)
+@@ -0,0 +1,165 @@
++<wsdl:definitions xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
++    xmlns:mime="http://schemas.xmlsoap.org/wsdl/mime/" xmlns:soap12="http://schemas.xmlsoap.org/wsdl/soap12/"
++    xmlns:http="http://schemas.xmlsoap.org/wsdl/http/" xmlns:ns1="http://org.apache.axis2/xsd"
++    xmlns:wsaw="http://www.w3.org/2006/05/addressing/wsdl" xmlns:ns="http://echo.sample.axis2.apache.org"
++    xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
++    targetNamespace="http://echo.sample.axis2.apache.org">
++    <wsdl:documentation>Echo</wsdl:documentation>
++    <wsdl:types>
++        <xs:schema attributeFormDefault="qualified"
++            elementFormDefault="qualified" targetNamespace="http://echo.sample.axis2.apache.org">
++            <xs:element name="echoStringArray">
++                <xs:complexType>
++                    <xs:sequence>
++                        <xs:element maxOccurs="unbounded" minOccurs="0" name="in"
++                            nillable="true" type="xs:string" />
++                    </xs:sequence>
++                </xs:complexType>
++            </xs:element>
++            <xs:element name="echoStringArrayResponse">
++                <xs:complexType>
++                    <xs:sequence>
++                        <xs:element maxOccurs="unbounded" minOccurs="0" name="return"
++                            nillable="true" type="xs:string" />
++                    </xs:sequence>
++                </xs:complexType>
++            </xs:element>
++            <xs:element name="echoString">
++                <xs:complexType>
++                    <xs:sequence>
++                        <xs:element minOccurs="0" name="in" nillable="true"
++                            type="xs:string" />
++                    </xs:sequence>
++                </xs:complexType>
++            </xs:element>
++            <xs:element name="echoStringResponse">
++                <xs:complexType>
++                    <xs:sequence>
++                        <xs:element minOccurs="0" name="return" nillable="true"
++                            type="xs:string" />
++                    </xs:sequence>
++                </xs:complexType>
++            </xs:element>
++        </xs:schema>
++    </wsdl:types>
++    <wsdl:message name="echoStringArrayRequest">
++        <wsdl:part name="parameters" element="ns:echoStringArray" />
++    </wsdl:message>
++    <wsdl:message name="echoStringArrayResponse">
++        <wsdl:part name="parameters" element="ns:echoStringArrayResponse" />
++    </wsdl:message>
++    <wsdl:message name="echoStringRequest">
++        <wsdl:part name="parameters" element="ns:echoString" />
++    </wsdl:message>
++    <wsdl:message name="echoStringResponse">
++        <wsdl:part name="parameters" element="ns:echoStringResponse" />
++    </wsdl:message>
++    <wsdl:portType name="EchoPortType">
++        <wsdl:operation name="echoStringArray">
++            <wsdl:input message="ns:echoStringArrayRequest"
++                wsaw:Action="urn:echoStringArray" />
++            <wsdl:output message="ns:echoStringArrayResponse"
++                wsaw:Action="urn:echoStringArrayResponse" />
++        </wsdl:operation>
++        <wsdl:operation name="echoString">
++            <wsdl:input message="ns:echoStringRequest" wsaw:Action="urn:echoString" />
++            <wsdl:output message="ns:echoStringResponse" wsaw:Action="urn:echoStringResponse" />
++        </wsdl:operation>
++    </wsdl:portType>
++    <wsdl:binding name="EchoSoap11Binding" type="ns:EchoPortType">
++        <soap:binding transport="http://schemas.xmlsoap.org/soap/http"
++            style="document" />
++        <wsdl:operation name="echoStringArray">
++            <soap:operation soapAction="urn:echoStringArray"
++                style="document" />
++            <wsdl:input>
++                <soap:body use="literal" />
++            </wsdl:input>
++            <wsdl:output>
++                <soap:body use="literal" />
++            </wsdl:output>
++        </wsdl:operation>
++        <wsdl:operation name="echoString">
++            <soap:operation soapAction="urn:echoString" style="document" />
++            <wsdl:input>
++                <soap:body use="literal" />
++            </wsdl:input>
++            <wsdl:output>
++                <soap:body use="literal" />
++            </wsdl:output>
++        </wsdl:operation>
++    </wsdl:binding>
++    <wsdl:binding name="EchoSoap12Binding" type="ns:EchoPortType">
++        <soap12:binding transport="http://schemas.xmlsoap.org/soap/http"
++            style="document" />
++        <wsdl:operation name="echoStringArray">
++            <soap12:operation soapAction="urn:echoStringArray"
++                style="document" />
++            <wsdl:input>
++                <soap12:body use="literal" />
++            </wsdl:input>
++            <wsdl:output>
++                <soap12:body use="literal" />
++            </wsdl:output>
++        </wsdl:operation>
++        <wsdl:operation name="echoString">
++            <soap12:operation soapAction="urn:echoString" style="document" />
++            <wsdl:input>
++                <soap12:body use="literal" />
++            </wsdl:input>
++            <wsdl:output>
++                <soap12:body use="literal" />
++            </wsdl:output>
++        </wsdl:operation>
++    </wsdl:binding>
++    <wsdl:binding name="EchoHttpBinding" type="ns:EchoPortType">
++        <http:binding verb="POST" />
++        <wsdl:operation name="echoStringArray">
++            <http:operation location="echoStringArray" />
++            <wsdl:input>
++                <mime:content type="application/xml" part="parameters" />
++            </wsdl:input>
++            <wsdl:output>
++                <mime:content type="application/xml" part="parameters" />
++            </wsdl:output>
++        </wsdl:operation>
++        <wsdl:operation name="echoString">
++            <http:operation location="echoString" />
++            <wsdl:input>
++                <mime:content type="application/xml" part="parameters" />
++            </wsdl:input>
++            <wsdl:output>
++                <mime:content type="application/xml" part="parameters" />
++            </wsdl:output>
++        </wsdl:operation>
++    </wsdl:binding>
++    <wsdl:service name="Echo">
++        <wsdl:port name="EchoHttpSoap11Endpoint" binding="ns:EchoSoap11Binding">
++            <soap:address location="http://localhost:8080/axis2/services/Echo.EchoHttpSoap11Endpoint" />
++            <wsa:EndpointReference xmlns:wsa="http://www.w3.org/2005/08/addressing">
++                <wsa:Address>http://localhost:8080/axis2/services/Echo.EchoHttpSoap12Endpoint</wsa:Address>
++                <Identity xmlns="http://schemas.xmlsoap.org/ws/2006/02/addressingidentity">
++                    <Spn>http/server.example.com</Spn>
++                </Identity>
++            </wsa:EndpointReference>
++        </wsdl:port>
++        <wsdl:port name="EchoHttpSoap12Endpoint" binding="ns:EchoSoap12Binding">
++            <soap12:address location="http://localhost:8080/axis2/services/Echo.EchoHttpSoap12Endpoint" />
++            <wsa:EndpointReference xmlns:wsa="http://www.w3.org/2005/08/addressing">
++                <wsa:Address>http://localhost:8080/axis2/services/Echo.EchoHttpSoap12Endpoint</wsa:Address>
++                <Identity xmlns="http://schemas.xmlsoap.org/ws/2006/02/addressingidentity">
++                    <Spn>http/server.example.com</Spn>
++                </Identity>
++            </wsa:EndpointReference>
++        </wsdl:port>
++        <wsdl:port name="EchoHttpEndpoint" binding="ns:EchoHttpBinding">
++            <http:address location="http://localhost:8080/axis2/services/Echo.EchoHttpEndpoint" />
++            <wsa:EndpointReference xmlns:wsa="http://www.w3.org/2005/08/addressing">
++                <wsa:Address>http://localhost:8080/axis2/services/Echo.EchoHttpEndpoint</wsa:Address>
++                <Identity xmlns="http://schemas.xmlsoap.org/ws/2006/02/addressingidentity">
++                    <Spn>http/server.example.com</Spn>
++                </Identity>
++            </wsa:EndpointReference>
++        </wsdl:port>
++    </wsdl:service>
++</wsdl:definitions>
+\ No newline at end of file
+Index: modules/kernel/test/org/apache/axis2/deployment/AddressingIdentityServiceTest.java
+===================================================================
+--- modules/kernel/test/org/apache/axis2/deployment/AddressingIdentityServiceTest.java	(revision 0)
++++ modules/kernel/test/org/apache/axis2/deployment/AddressingIdentityServiceTest.java	(revision 0)
+@@ -0,0 +1,236 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.axis2.deployment;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.InputStream;
++import java.util.Iterator;
++import java.util.Map;
++
++import javax.xml.namespace.QName;
++
++import junit.framework.TestCase;
++
++import org.apache.axiom.om.OMElement;
++import org.apache.axis2.addressing.AddressingConstants;
++import org.apache.axis2.context.ConfigurationContext;
++import org.apache.axis2.context.ConfigurationContextFactory;
++import org.apache.axis2.description.AxisEndpoint;
++import org.apache.axis2.description.AxisService;
++import org.apache.axis2.description.AxisService2WSDL11;
++import org.apache.axis2.description.Parameter;
++import org.apache.axis2.description.TransportInDescription;
++import org.apache.axis2.description.WSDL11ToAxisServiceBuilder;
++import org.apache.axis2.description.java2wsdl.Java2WSDLConstants;
++import org.apache.axis2.engine.AxisConfiguration;
++import org.apache.axis2.wsdl.WSDLConstants;
++
++public class AddressingIdentityServiceTest extends TestCase {
++    private static final String HTTP_ENDPOINT_NAME = "EchoHttpEndpoint";
++    
++    private static final String EXPECTED_SPN = "http/server.example.com";
++    private static final String EXPECTED_UPN = "bob@EXAMPLE.COM";
++    
++    private static final String IDENTITY_SERVICE_XML = "test-resources/deployment/AddressingIdentityServiceTest/service.xml";
++    private static final String IDENTITY_SERVICE_WSDL = "test-resources/wsdl/identity.wsdl";
++                    
++    private AxisConfiguration axisConfig;
++    private ConfigurationContext configContext;
++    
++
++    protected void setUp() throws Exception {
++        this.configContext = ConfigurationContextFactory.createEmptyConfigurationContext();
++        this.axisConfig = configContext.getAxisConfiguration();
++        TransportInDescription httpReceiver = new TransportInDescription("http");
++        httpReceiver.setReceiver(new DummyTransportListener());
++        this.axisConfig.addTransportIn(httpReceiver);
++    }
++
++    /**
++     * Tests AxisService construction from a services.xml containing a 
++     * {@link AddressingConstants#ADDRESSING_IDENTITY_PARAMETER ADDRESSING_IDENTITY_PARAMETER} parameter
++     * containing a &lt;wsa:EndpointReference&gt; element with an UPN identity.
++     * The test will then generate the wsdl using {@link AxisService2WSDL11} API and verify that the port
++     * contains the &lt;wsa:EndpointReference&gt; extensibility element with the same UPN identity.
++     * 
++     * @throws Exception
++     */
++    public void testEndpointReferenceWithUPNIdentityService() throws Exception {
++        InputStream in = null;
++        try {
++            assertNotNull(axisConfig);
++            
++            AxisService service = new AxisService();
++
++            in = new FileInputStream(IDENTITY_SERVICE_XML);
++            ServiceBuilder serviceBuilder = new ServiceBuilder(in, configContext, service);
++            service = serviceBuilder.populateService(serviceBuilder.buildOM());
++            
++            axisConfig.addService(service);
++
++            AxisService2WSDL11 wsdlGenerator = new AxisService2WSDL11(service);
++            wsdlGenerator.setCheckIfEndPointActive(false);
++            OMElement wsdl = wsdlGenerator.generateOM();
++            
++            Map<String, AxisEndpoint> endpoints = service.getEndpoints();
++            assertEquals(String.format("Expected to find %d endpoints for service %s, but found: %d", 3, service.getName(), endpoints.size()), 3, endpoints.size());
++            
++            for (Iterator<String> it = endpoints.keySet().iterator(); it.hasNext(); ) {
++                AxisEndpoint endpoint = service.getEndpoint(it.next());
++                if (HTTP_ENDPOINT_NAME.equals(endpoint.getName())) {
++                    //Axis2 does not attach EPRs to http endpoint, therefore we skip it
++                    continue;
++                }
++                OMElement identityElement = checkWsdlContainsIdentityElement(wsdl, service, endpoint);
++                
++                OMElement upnElement = identityElement.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_UPN);
++                assertNotNull(String.format("Could not find any '%s' claim in Identity element of endpoint '%s': %s",
++                    AddressingConstants.QNAME_IDENTITY_UPN, endpoint.getName(), identityElement.toString()), upnElement);
++                
++                String upn = upnElement.getText();
++                assertTrue(String.format("Expected to find UPN of '%s' but got: %s", EXPECTED_UPN, upn),
++                    EXPECTED_UPN.equals(upn)); 
++            }
++        } finally {
++            if (in != null) {
++                in.close();
++            }
++        }
++    }
++    
++    /**
++     * Tests AxisService construction from a WSDL containing an &lt;wsa:EndpointReference&gt; port
++     * extensibility element with an SPN identity.
++     * Validates that the AxisEndpoint of the created service contains an 
++     * {@link AddressingConstants#ADDRESSING_IDENTITY_PARAMETER ADDRESSING_IDENTITY_PARAMETER} parameter with 
++     * an &lt;wsid:Identity&gt; OMElement with the same SPN as in the original wsdl.
++     * The test will then re-generate the wsdl using {@link AxisService2WSDL11} API and verify that the port
++     * contains the &lt;wsa:EndpointReference&gt; extensibility element with the same SPN identity.
++     * 
++     * @throws Exception
++     */
++    public void testEndpointReferenceWithSPNIdentityWSDL() throws Exception {
++        InputStream in = null;
++        try {
++            File wsdlFile = new File(IDENTITY_SERVICE_WSDL);
++            in = new FileInputStream(wsdlFile);
++            AxisService service = new WSDL11ToAxisServiceBuilder(in).populateService();
++            assertNotNull("Could not load AxisService from wsdl: " + wsdlFile.getAbsolutePath(), service);
++            
++            Map<String, AxisEndpoint> endpoints = service.getEndpoints();
++            assertFalse(String.format("No endpoints found for service %s", service.getName()), endpoints.isEmpty());
++            
++            for (Iterator<String> it = endpoints.keySet().iterator(); it.hasNext(); ) {
++                AxisEndpoint endpoint = service.getEndpoint(it.next());
++            
++                assertNotNull(String.format("Could not find any '%s' endpoint in wsdl: %s", endpoint.getName(),
++                    wsdlFile.getAbsolutePath()), endpoint);
++                
++                Parameter wsIdentityParameter = endpoint.getParameter(AddressingConstants.ADDRESSING_IDENTITY_PARAMETER);
++                assertNotNull(String.format("Could not find any '%s' parameter on '%s' endpoint.",
++                    AddressingConstants.ADDRESSING_IDENTITY_PARAMETER, endpoint.getName()), wsIdentityParameter);
++                
++                assertNotNull(String.format("Parameter '%s' parameter on '%s' endpoint has null value.",
++                    AddressingConstants.ADDRESSING_IDENTITY_PARAMETER, endpoint.getName()), wsIdentityParameter.getValue());
++                
++                assertTrue(String.format("Value of parameter '%s' on '%s' endpoint is not an instance of %s but is: %s",
++                    AddressingConstants.ADDRESSING_IDENTITY_PARAMETER, endpoint.getName(), OMElement.class, wsIdentityParameter.getValue().getClass().getName()),
++                    wsIdentityParameter.getValue() instanceof OMElement);
++                
++                OMElement identityElement = (OMElement) wsIdentityParameter.getValue();
++                OMElement spnElement = identityElement.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_SPN);
++                
++                assertNotNull(String.format("Could not find any '%s' child element in Identity element of endpoint '%s': %s",
++                    AddressingConstants.QNAME_IDENTITY_SPN, endpoint.getName(), identityElement.toString()), spnElement);
++                
++                String spn = spnElement.getText();
++    
++                assertTrue(String.format("Expected to find SPN of '%s' but got: %s", EXPECTED_SPN, spn),
++                    EXPECTED_SPN.equals(spn));
++            }
++            
++            axisConfig.addService(service);
++            
++            AxisService2WSDL11 wsdlGenerator = new AxisService2WSDL11(service);
++            OMElement wsdl = wsdlGenerator.generateOM();
++            
++            endpoints = service.getEndpoints();
++            assertFalse(String.format("No endpoints found for service %s", service.getName()), endpoints.isEmpty());
++            
++            for (Iterator<String> it = endpoints.keySet().iterator(); it.hasNext(); ) {
++                AxisEndpoint endpoint = service.getEndpoint(it.next());
++                if (HTTP_ENDPOINT_NAME.equals(endpoint.getName())) {
++                    //Axis2 does not attach EPRs to http endpoint, therefore we skip it
++                    continue;
++                }
++                OMElement identityElement = checkWsdlContainsIdentityElement(wsdl, service, endpoint);
++                
++                OMElement spnElement = identityElement.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY_SPN);
++                assertNotNull(String.format("Could not find any '%s' element in Identity element of endpoint '%s': %s",
++                    AddressingConstants.QNAME_IDENTITY_SPN, endpoint.getName(), identityElement.toString()), spnElement);
++                
++                String spn = spnElement.getText();
++                assertTrue(String.format("Expected to find SPN of '%s' but got: %s", EXPECTED_SPN, spn),
++                    EXPECTED_SPN.equals(spn)); 
++            }
++        } finally {
++            if (in != null) {
++                in.close();
++            }
++        }
++    }
++    
++    private OMElement checkWsdlContainsIdentityElement(OMElement wsdl, AxisService service, AxisEndpoint endpoint) {
++        QName nameAtt = new QName("", Java2WSDLConstants.ATTRIBUTE_NAME);
++        QName serviceQName = new QName(WSDLConstants.WSDL1_1_NAMESPACE, Java2WSDLConstants.SERVICE_LOCAL_NAME);
++        
++        OMElement serviceElement = wsdl.getFirstChildWithName(serviceQName);
++        assertNotNull(String.format("Could not find any '%s' service element in wsdl: \n%s", serviceQName, wsdl.toString()), serviceElement);
++        assertEquals("Expected to find a single service with name: " + service.getName(), service.getName(), serviceElement.getAttributeValue(nameAtt));
++        
++        OMElement portElement = findPort(serviceElement, endpoint.getName());
++        assertNotNull(String.format("Could not find any port element with name '%s' in service element: \n%s",
++            endpoint.getName(), serviceElement.toString()), portElement);
++        
++        OMElement eprElement = portElement.getFirstChildWithName(AddressingConstants.Final.WSA_ENDPOINT_REFERENCE);
++        assertNotNull(String.format("Could not find any '%s' element in port element: \n%s",
++            AddressingConstants.Final.WSA_ENDPOINT_REFERENCE, portElement.toString()), eprElement);
++        
++        OMElement identityElement = eprElement.getFirstChildWithName(AddressingConstants.QNAME_IDENTITY);
++        assertNotNull(String.format("Could not find any '%s' element in EPR element: \n%s",
++            AddressingConstants.QNAME_IDENTITY, eprElement.toString(), identityElement));
++        
++        return identityElement;
++    }
++    
++    private OMElement findPort(OMElement serviceElement, String portName) {
++        QName portQName = new QName(WSDLConstants.WSDL1_1_NAMESPACE, Java2WSDLConstants.PORT);
++        
++        for (@SuppressWarnings("rawtypes")Iterator portIter = serviceElement.getChildrenWithName(portQName); portIter.hasNext(); ) {
++            OMElement portElement = (OMElement) portIter.next();
++            if (portName.equals(portElement.getAttributeValue(new QName("", Java2WSDLConstants.ATTRIBUTE_NAME)))) {
++                return portElement;
++            }
++        }
++        
++        return null;
++    }
++}

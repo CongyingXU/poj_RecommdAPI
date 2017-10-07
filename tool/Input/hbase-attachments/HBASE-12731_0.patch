@@ -1,0 +1,806 @@
+From 85430ff9b3eee81fbac4dce381db0328e96b5ff0 Mon Sep 17 00:00:00 2001
+From: Andrew Purtell <apurtell@apache.org>
+Date: Thu, 22 Jan 2015 11:19:12 -0800
+Subject: [PATCH] HBASE-12731 Heap occupancy based client pushback
+
+---
+ .../backoff/ExponentialClientBackoffPolicy.java    |  41 ++++-
+ .../hbase/client/backoff/ServerStatistics.java     |   8 +-
+ .../hbase/client/TestClientExponentialBackoff.java |  33 ++++
+ .../java/org/apache/hadoop/hbase/HConstants.java   |   6 +
+ .../hbase/protobuf/generated/ClientProtos.java     | 202 +++++++++++++++++----
+ hbase-protocol/src/main/protobuf/Client.proto      |   7 +-
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |   1 +
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   5 +
+ .../hbase/regionserver/HeapMemoryManager.java      |  72 ++++++--
+ .../hbase/regionserver/RegionServerServices.java   |   4 +
+ .../hadoop/hbase/MockRegionServerServices.java     |   6 +
+ .../hadoop/hbase/master/MockRegionServer.java      |   6 +
+ 12 files changed, 337 insertions(+), 54 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ExponentialClientBackoffPolicy.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ExponentialClientBackoffPolicy.java
+index 6e75670..5b1d3d2 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ExponentialClientBackoffPolicy.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ExponentialClientBackoffPolicy.java
+@@ -20,10 +20,13 @@ package org.apache.hadoop.hbase.client.backoff;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ 
++import com.google.common.base.Preconditions;
++
+ /**
+  * Simple exponential backoff policy on for the client that uses a  percent^4 times the
+  * max backoff to generate the backoff time.
+@@ -38,9 +41,15 @@ public class ExponentialClientBackoffPolicy implements ClientBackoffPolicy {
+   public static final long DEFAULT_MAX_BACKOFF = 5 * ONE_MINUTE;
+   public static final String MAX_BACKOFF_KEY = "hbase.client.exponential-backoff.max";
+   private long maxBackoff;
++  private float heapOccupancyLowWatermark;
++  private float heapOccupancyHighWatermark;
+ 
+   public ExponentialClientBackoffPolicy(Configuration conf) {
+     this.maxBackoff = conf.getLong(MAX_BACKOFF_KEY, DEFAULT_MAX_BACKOFF);
++    this.heapOccupancyLowWatermark = conf.getFloat(HConstants.HEAP_OCCUPANCY_LOW_WATERMARK_KEY,
++      HConstants.DEFAULT_HEAP_OCCUPANCY_LOW_WATERMARK);
++    this.heapOccupancyHighWatermark = conf.getFloat(HConstants.HEAP_OCCUPANCY_HIGH_WATERMARK_KEY,
++      HConstants.DEFAULT_HEAP_OCCUPANCY_HIGH_WATERMARK);
+   }
+ 
+   @Override
+@@ -56,16 +65,40 @@ public class ExponentialClientBackoffPolicy implements ClientBackoffPolicy {
+       return 0;
+     }
+ 
++    // Factor in memstore load
++    double percent = regionStats.getMemstoreLoadPercent() / 100.0;
++
++    // Factor in heap occupancy
++    float heapOccupancy = regionStats.getHeapOccupancyPercent() / 100.0f;
++    if (heapOccupancy >= heapOccupancyLowWatermark) {
++      // If we are higher than the high watermark, we are already applying max
++      // backoff and cannot scale more (see scale() below)
++      if (heapOccupancy > heapOccupancyHighWatermark) {
++        heapOccupancy = heapOccupancyHighWatermark;
++      }
++      percent = Math.max(percent,
++          scale(heapOccupancy, heapOccupancyLowWatermark, heapOccupancyHighWatermark,
++              0.1, 1.0));
++    }
++
+     // square the percent as a value less than 1. Closer we move to 100 percent,
+     // the percent moves to 1, but squaring causes the exponential curve
+-    double percent = regionStats.getMemstoreLoadPercent() / 100.0;
+     double multiplier = Math.pow(percent, 4.0);
+-    // shouldn't ever happen, but just incase something changes in the statistic data
+     if (multiplier > 1) {
+-      LOG.warn("Somehow got a backoff multiplier greater than the allowed backoff. Forcing back " +
+-          "down to the max backoff");
+       multiplier = 1;
+     }
+     return (long) (multiplier * maxBackoff);
+   }
++
++  /** Scale valueIn in the range [baseMin,baseMax] to the range [limitMin,limitMax] */
++  private static double scale(double valueIn, double baseMin, double baseMax, double limitMin,
++      double limitMax) {
++    Preconditions.checkArgument(baseMin <= baseMax, "Illegal source range [%s,%s]",
++        baseMin, baseMax);
++    Preconditions.checkArgument(limitMin <= limitMax, "Illegal target range [%s,%s]",
++        limitMin, limitMax);
++    Preconditions.checkArgument(valueIn >= baseMin && valueIn <= baseMax,
++        "Value %s must be within the range [%s,%s]", valueIn, baseMin, baseMax);
++    return ((limitMax - limitMin) * (valueIn - baseMin) / (baseMax - baseMin)) + limitMin;
++  }
+ }
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ServerStatistics.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ServerStatistics.java
+index a3b8e11..c7519be 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ServerStatistics.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/backoff/ServerStatistics.java
+@@ -54,15 +54,21 @@ public class ServerStatistics {
+     return stats.get(regionName);
+   }
+ 
+-  public static class RegionStatistics{
++  public static class RegionStatistics {
+     private int memstoreLoad = 0;
++    private int heapOccupancy = 0;
+ 
+     public void update(ClientProtos.RegionLoadStats currentStats) {
+       this.memstoreLoad = currentStats.getMemstoreLoad();
++      this.heapOccupancy = currentStats.getHeapOccupancy();
+     }
+ 
+     public int getMemstoreLoadPercent(){
+       return this.memstoreLoad;
+     }
++
++    public int getHeapOccupancyPercent(){
++      return this.heapOccupancy;
++    }
+   }
+ }
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientExponentialBackoff.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientExponentialBackoff.java
+index 88e409d..3a902d0 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientExponentialBackoff.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientExponentialBackoff.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hbase.client;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.client.backoff.ExponentialClientBackoffPolicy;
+ import org.apache.hadoop.hbase.client.backoff.ServerStatistics;
+@@ -101,10 +102,42 @@ public class TestClientExponentialBackoff {
+     }
+   }
+ 
++  @Test
++  public void testHeapOccupancyPolicy() {
++    Configuration conf = new Configuration(false);
++    ExponentialClientBackoffPolicy backoff = new ExponentialClientBackoffPolicy(conf);
++
++    ServerStatistics stats = new ServerStatistics();
++    long backoffTime;
++
++    update(stats, 0, 95);
++    backoffTime = backoff.getBackoffTime(server, regionname, stats);
++    assertTrue("Heap occupancy at low watermark had no effect", backoffTime > 0);
++
++    long previous = backoffTime;
++    update(stats, 0, 96);
++    backoffTime = backoff.getBackoffTime(server, regionname, stats);
++    assertTrue("Increase above low watermark should have increased backoff",
++      backoffTime > previous);
++
++    update(stats, 0, 98);
++    backoffTime = backoff.getBackoffTime(server, regionname, stats);
++    assertEquals("We should be using max backoff when at high watermark", backoffTime,
++      ExponentialClientBackoffPolicy.DEFAULT_MAX_BACKOFF);
++  }
++
+   private void update(ServerStatistics stats, int load) {
+     ClientProtos.RegionLoadStats stat = ClientProtos.RegionLoadStats.newBuilder()
+         .setMemstoreLoad
+             (load).build();
+     stats.update(regionname, stat);
+   }
++
++  private void update(ServerStatistics stats, int memstoreLoad, int heapOccupancy) {
++    ClientProtos.RegionLoadStats stat = ClientProtos.RegionLoadStats.newBuilder()
++        .setMemstoreLoad(memstoreLoad)
++        .setHeapOccupancy(heapOccupancy)
++            .build();
++    stats.update(regionname, stat);
++  }
+ }
+\ No newline at end of file
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 8585299..e84f78a 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -1128,6 +1128,12 @@ public final class HConstants {
+   public static final String ENABLE_CLIENT_BACKPRESSURE = "hbase.client.backpressure.enabled";
+   public static final boolean DEFAULT_ENABLE_CLIENT_BACKPRESSURE = false;
+ 
++  public static final String HEAP_OCCUPANCY_LOW_WATERMARK_KEY =
++      "hbase.heap.occupancy.low_water_mark";
++  public static final float DEFAULT_HEAP_OCCUPANCY_LOW_WATERMARK = 0.95f;
++  public static final String HEAP_OCCUPANCY_HIGH_WATERMARK_KEY =
++      "hbase.heap.occupancy.high_water_mark";
++  public static final float DEFAULT_HEAP_OCCUPANCY_HIGH_WATERMARK = 0.98f;
+ 
+   private HConstants() {
+     // Can't be instantiated with this ctor.
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+index ab86e1e..afd67a1 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+@@ -26218,7 +26218,7 @@ public final class ClientProtos {
+      * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+      *
+      * <pre>
+-     * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++     * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+      * </pre>
+      */
+     boolean hasMemstoreLoad();
+@@ -26226,10 +26226,30 @@ public final class ClientProtos {
+      * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+      *
+      * <pre>
+-     * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++     * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+      * </pre>
+      */
+     int getMemstoreLoad();
++
++    // optional int32 heapOccupancy = 2 [default = 0];
++    /**
++     * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++     *
++     * <pre>
++     * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++     * We can move this to "ServerLoadStats" should we develop them.
++     * </pre>
++     */
++    boolean hasHeapOccupancy();
++    /**
++     * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++     *
++     * <pre>
++     * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++     * We can move this to "ServerLoadStats" should we develop them.
++     * </pre>
++     */
++    int getHeapOccupancy();
+   }
+   /**
+    * Protobuf type {@code RegionLoadStats}
+@@ -26292,6 +26312,11 @@ public final class ClientProtos {
+               memstoreLoad_ = input.readInt32();
+               break;
+             }
++            case 16: {
++              bitField0_ |= 0x00000002;
++              heapOccupancy_ = input.readInt32();
++              break;
++            }
+           }
+         }
+       } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -26339,7 +26364,7 @@ public final class ClientProtos {
+      * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+      *
+      * <pre>
+-     * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++     * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+      * </pre>
+      */
+     public boolean hasMemstoreLoad() {
+@@ -26349,15 +26374,42 @@ public final class ClientProtos {
+      * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+      *
+      * <pre>
+-     * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++     * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+      * </pre>
+      */
+     public int getMemstoreLoad() {
+       return memstoreLoad_;
+     }
+ 
++    // optional int32 heapOccupancy = 2 [default = 0];
++    public static final int HEAPOCCUPANCY_FIELD_NUMBER = 2;
++    private int heapOccupancy_;
++    /**
++     * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++     *
++     * <pre>
++     * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++     * We can move this to "ServerLoadStats" should we develop them.
++     * </pre>
++     */
++    public boolean hasHeapOccupancy() {
++      return ((bitField0_ & 0x00000002) == 0x00000002);
++    }
++    /**
++     * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++     *
++     * <pre>
++     * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++     * We can move this to "ServerLoadStats" should we develop them.
++     * </pre>
++     */
++    public int getHeapOccupancy() {
++      return heapOccupancy_;
++    }
++
+     private void initFields() {
+       memstoreLoad_ = 0;
++      heapOccupancy_ = 0;
+     }
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+@@ -26374,6 +26426,9 @@ public final class ClientProtos {
+       if (((bitField0_ & 0x00000001) == 0x00000001)) {
+         output.writeInt32(1, memstoreLoad_);
+       }
++      if (((bitField0_ & 0x00000002) == 0x00000002)) {
++        output.writeInt32(2, heapOccupancy_);
++      }
+       getUnknownFields().writeTo(output);
+     }
+ 
+@@ -26387,6 +26442,10 @@ public final class ClientProtos {
+         size += com.google.protobuf.CodedOutputStream
+           .computeInt32Size(1, memstoreLoad_);
+       }
++      if (((bitField0_ & 0x00000002) == 0x00000002)) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeInt32Size(2, heapOccupancy_);
++      }
+       size += getUnknownFields().getSerializedSize();
+       memoizedSerializedSize = size;
+       return size;
+@@ -26415,6 +26474,11 @@ public final class ClientProtos {
+         result = result && (getMemstoreLoad()
+             == other.getMemstoreLoad());
+       }
++      result = result && (hasHeapOccupancy() == other.hasHeapOccupancy());
++      if (hasHeapOccupancy()) {
++        result = result && (getHeapOccupancy()
++            == other.getHeapOccupancy());
++      }
+       result = result &&
+           getUnknownFields().equals(other.getUnknownFields());
+       return result;
+@@ -26432,6 +26496,10 @@ public final class ClientProtos {
+         hash = (37 * hash) + MEMSTORELOAD_FIELD_NUMBER;
+         hash = (53 * hash) + getMemstoreLoad();
+       }
++      if (hasHeapOccupancy()) {
++        hash = (37 * hash) + HEAPOCCUPANCY_FIELD_NUMBER;
++        hash = (53 * hash) + getHeapOccupancy();
++      }
+       hash = (29 * hash) + getUnknownFields().hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -26548,6 +26616,8 @@ public final class ClientProtos {
+         super.clear();
+         memstoreLoad_ = 0;
+         bitField0_ = (bitField0_ & ~0x00000001);
++        heapOccupancy_ = 0;
++        bitField0_ = (bitField0_ & ~0x00000002);
+         return this;
+       }
+ 
+@@ -26580,6 +26650,10 @@ public final class ClientProtos {
+           to_bitField0_ |= 0x00000001;
+         }
+         result.memstoreLoad_ = memstoreLoad_;
++        if (((from_bitField0_ & 0x00000002) == 0x00000002)) {
++          to_bitField0_ |= 0x00000002;
++        }
++        result.heapOccupancy_ = heapOccupancy_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -26599,6 +26673,9 @@ public final class ClientProtos {
+         if (other.hasMemstoreLoad()) {
+           setMemstoreLoad(other.getMemstoreLoad());
+         }
++        if (other.hasHeapOccupancy()) {
++          setHeapOccupancy(other.getHeapOccupancy());
++        }
+         this.mergeUnknownFields(other.getUnknownFields());
+         return this;
+       }
+@@ -26632,7 +26709,7 @@ public final class ClientProtos {
+        * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+        *
+        * <pre>
+-       * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+        * </pre>
+        */
+       public boolean hasMemstoreLoad() {
+@@ -26642,7 +26719,7 @@ public final class ClientProtos {
+        * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+        *
+        * <pre>
+-       * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+        * </pre>
+        */
+       public int getMemstoreLoad() {
+@@ -26652,7 +26729,7 @@ public final class ClientProtos {
+        * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+        *
+        * <pre>
+-       * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+        * </pre>
+        */
+       public Builder setMemstoreLoad(int value) {
+@@ -26665,7 +26742,7 @@ public final class ClientProtos {
+        * <code>optional int32 memstoreLoad = 1 [default = 0];</code>
+        *
+        * <pre>
+-       * percent load on the memstore. Guaranteed to be positive, between 0 and 100
++       * Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+        * </pre>
+        */
+       public Builder clearMemstoreLoad() {
+@@ -26675,6 +26752,59 @@ public final class ClientProtos {
+         return this;
+       }
+ 
++      // optional int32 heapOccupancy = 2 [default = 0];
++      private int heapOccupancy_ ;
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public boolean hasHeapOccupancy() {
++        return ((bitField0_ & 0x00000002) == 0x00000002);
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public int getHeapOccupancy() {
++        return heapOccupancy_;
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public Builder setHeapOccupancy(int value) {
++        bitField0_ |= 0x00000002;
++        heapOccupancy_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional int32 heapOccupancy = 2 [default = 0];</code>
++       *
++       * <pre>
++       * Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++       * We can move this to "ServerLoadStats" should we develop them.
++       * </pre>
++       */
++      public Builder clearHeapOccupancy() {
++        bitField0_ = (bitField0_ & ~0x00000002);
++        heapOccupancy_ = 0;
++        onChanged();
++        return this;
++      }
++
+       // @@protoc_insertion_point(builder_scope:RegionLoadStats)
+     }
+ 
+@@ -31922,33 +32052,33 @@ public final class ClientProtos {
+       "\030\003 \001(\0132\004.Get\022-\n\014service_call\030\004 \001(\0132\027.Cop" +
+       "rocessorServiceCall\"Y\n\014RegionAction\022 \n\006r" +
+       "egion\030\001 \002(\0132\020.RegionSpecifier\022\016\n\006atomic\030" +
+-      "\002 \001(\010\022\027\n\006action\030\003 \003(\0132\007.Action\"*\n\017Region" +
+-      "LoadStats\022\027\n\014memstoreLoad\030\001 \001(\005:\0010\"\266\001\n\021R" +
+-      "esultOrException\022\r\n\005index\030\001 \001(\r\022\027\n\006resul" +
+-      "t\030\002 \001(\0132\007.Result\022!\n\texception\030\003 \001(\0132\016.Na" +
+-      "meBytesPair\0221\n\016service_result\030\004 \001(\0132\031.Co",
+-      "processorServiceResult\022#\n\tloadStats\030\005 \001(" +
+-      "\0132\020.RegionLoadStats\"f\n\022RegionActionResul" +
+-      "t\022-\n\021resultOrException\030\001 \003(\0132\022.ResultOrE" +
+-      "xception\022!\n\texception\030\002 \001(\0132\016.NameBytesP" +
+-      "air\"f\n\014MultiRequest\022#\n\014regionAction\030\001 \003(" +
+-      "\0132\r.RegionAction\022\022\n\nnonceGroup\030\002 \001(\004\022\035\n\t" +
+-      "condition\030\003 \001(\0132\n.Condition\"S\n\rMultiResp" +
+-      "onse\022/\n\022regionActionResult\030\001 \003(\0132\023.Regio" +
+-      "nActionResult\022\021\n\tprocessed\030\002 \001(\010*\'\n\013Cons" +
+-      "istency\022\n\n\006STRONG\020\000\022\014\n\010TIMELINE\020\0012\205\003\n\rCl",
+-      "ientService\022 \n\003Get\022\013.GetRequest\032\014.GetRes" +
+-      "ponse\022)\n\006Mutate\022\016.MutateRequest\032\017.Mutate" +
+-      "Response\022#\n\004Scan\022\014.ScanRequest\032\r.ScanRes" +
+-      "ponse\022>\n\rBulkLoadHFile\022\025.BulkLoadHFileRe" +
+-      "quest\032\026.BulkLoadHFileResponse\022F\n\013ExecSer" +
+-      "vice\022\032.CoprocessorServiceRequest\032\033.Copro" +
+-      "cessorServiceResponse\022R\n\027ExecRegionServe" +
+-      "rService\022\032.CoprocessorServiceRequest\032\033.C" +
+-      "oprocessorServiceResponse\022&\n\005Multi\022\r.Mul" +
+-      "tiRequest\032\016.MultiResponseBB\n*org.apache.",
+-      "hadoop.hbase.protobuf.generatedB\014ClientP" +
+-      "rotosH\001\210\001\001\240\001\001"
++      "\002 \001(\010\022\027\n\006action\030\003 \003(\0132\007.Action\"D\n\017Region" +
++      "LoadStats\022\027\n\014memstoreLoad\030\001 \001(\005:\0010\022\030\n\rhe" +
++      "apOccupancy\030\002 \001(\005:\0010\"\266\001\n\021ResultOrExcepti" +
++      "on\022\r\n\005index\030\001 \001(\r\022\027\n\006result\030\002 \001(\0132\007.Resu" +
++      "lt\022!\n\texception\030\003 \001(\0132\016.NameBytesPair\0221\n",
++      "\016service_result\030\004 \001(\0132\031.CoprocessorServi" +
++      "ceResult\022#\n\tloadStats\030\005 \001(\0132\020.RegionLoad" +
++      "Stats\"f\n\022RegionActionResult\022-\n\021resultOrE" +
++      "xception\030\001 \003(\0132\022.ResultOrException\022!\n\tex" +
++      "ception\030\002 \001(\0132\016.NameBytesPair\"f\n\014MultiRe" +
++      "quest\022#\n\014regionAction\030\001 \003(\0132\r.RegionActi" +
++      "on\022\022\n\nnonceGroup\030\002 \001(\004\022\035\n\tcondition\030\003 \001(" +
++      "\0132\n.Condition\"S\n\rMultiResponse\022/\n\022region" +
++      "ActionResult\030\001 \003(\0132\023.RegionActionResult\022" +
++      "\021\n\tprocessed\030\002 \001(\010*\'\n\013Consistency\022\n\n\006STR",
++      "ONG\020\000\022\014\n\010TIMELINE\020\0012\205\003\n\rClientService\022 \n" +
++      "\003Get\022\013.GetRequest\032\014.GetResponse\022)\n\006Mutat" +
++      "e\022\016.MutateRequest\032\017.MutateResponse\022#\n\004Sc" +
++      "an\022\014.ScanRequest\032\r.ScanResponse\022>\n\rBulkL" +
++      "oadHFile\022\025.BulkLoadHFileRequest\032\026.BulkLo" +
++      "adHFileResponse\022F\n\013ExecService\022\032.Coproce" +
++      "ssorServiceRequest\032\033.CoprocessorServiceR" +
++      "esponse\022R\n\027ExecRegionServerService\022\032.Cop" +
++      "rocessorServiceRequest\032\033.CoprocessorServ" +
++      "iceResponse\022&\n\005Multi\022\r.MultiRequest\032\016.Mu",
++      "ltiResponseBB\n*org.apache.hadoop.hbase.p" +
++      "rotobuf.generatedB\014ClientProtosH\001\210\001\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+@@ -32110,7 +32240,7 @@ public final class ClientProtos {
+           internal_static_RegionLoadStats_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_RegionLoadStats_descriptor,
+-              new java.lang.String[] { "MemstoreLoad", });
++              new java.lang.String[] { "MemstoreLoad", "HeapOccupancy", });
+           internal_static_ResultOrException_descriptor =
+             getDescriptor().getMessageTypes().get(23);
+           internal_static_ResultOrException_fieldAccessorTable = new
+diff --git a/hbase-protocol/src/main/protobuf/Client.proto b/hbase-protocol/src/main/protobuf/Client.proto
+index 1a3c43e..606ca8d 100644
+--- a/hbase-protocol/src/main/protobuf/Client.proto
++++ b/hbase-protocol/src/main/protobuf/Client.proto
+@@ -356,9 +356,12 @@ message RegionAction {
+ /*
+ * Statistics about the current load on the region
+ */
+-message RegionLoadStats{
+-  // percent load on the memstore. Guaranteed to be positive, between 0 and 100
++message RegionLoadStats {
++  // Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+   optional int32 memstoreLoad = 1 [default = 0];
++  // Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
++  // We can move this to "ServerLoadStats" should we develop them.
++  optional int32 heapOccupancy = 2 [default = 0];
+ }
+ 
+ /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index dd1cf8d..2b6f974 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -5244,6 +5244,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { //
+     ClientProtos.RegionLoadStats.Builder stats = ClientProtos.RegionLoadStats.newBuilder();
+     stats.setMemstoreLoad((int) (Math.min(100, (this.memstoreSize.get() * 100) / this
+         .memstoreFlushSize)));
++    stats.setHeapOccupancy((int)rsServices.getHeapMemoryManager().getHeapOccupancyPercent()*100);
+     return stats.build();
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 4669f8f..5263a99 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -3140,4 +3140,9 @@ public class HRegionServer extends HasThread implements
+     conf.reloadConfiguration();
+     configurationManager.notifyAllObservers(conf);
+   }
++
++  @Override
++  public HeapMemoryManager getHeapMemoryManager() {
++    return hMemManager;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HeapMemoryManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HeapMemoryManager.java
+index ddd3e95..112634e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HeapMemoryManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HeapMemoryManager.java
+@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.regionserver;
+ import static org.apache.hadoop.hbase.HConstants.HFILE_BLOCK_CACHE_SIZE_KEY;
+ 
+ import java.lang.management.ManagementFactory;
++import java.lang.management.MemoryUsage;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.commons.logging.Log;
+@@ -57,7 +58,7 @@ public class HeapMemoryManager {
+       "hbase.regionserver.global.memstore.size.min.range";
+   public static final String HBASE_RS_HEAP_MEMORY_TUNER_PERIOD = 
+       "hbase.regionserver.heapmemory.tuner.period";
+-  public static final int HBASE_RS_HEAP_MEMORY_TUNER_DEFAULT_PERIOD = 5 * 60 * 1000;
++  public static final int HBASE_RS_HEAP_MEMORY_TUNER_DEFAULT_PERIOD = 60 * 1000;
+   public static final String HBASE_RS_HEAP_MEMORY_TUNER_CLASS = 
+       "hbase.regionserver.heapmemory.tuner.class";
+ 
+@@ -70,12 +71,16 @@ public class HeapMemoryManager {
+   private float blockCachePercentMaxRange;
+   private float l2BlockCachePercent;
+ 
++  private float heapOccupancyPercent;
++
+   private final ResizableBlockCache blockCache;
+   private final FlushRequester memStoreFlusher;
+   private final Server server;
+ 
+   private HeapMemoryTunerChore heapMemTunerChore = null;
+   private final boolean tunerOn;
++  private final int defaultChorePeriod;
++  private final float heapOccupancyLowWatermark;
+ 
+   private long maxHeapSize = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();
+ 
+@@ -91,10 +96,15 @@ public class HeapMemoryManager {
+   @VisibleForTesting
+   HeapMemoryManager(ResizableBlockCache blockCache, FlushRequester memStoreFlusher,
+       Server server) {
++    Configuration conf = server.getConfiguration();
+     this.blockCache = blockCache;
+     this.memStoreFlusher = memStoreFlusher;
+     this.server = server;
+-    this.tunerOn = doInit(server.getConfiguration());
++    this.tunerOn = doInit(conf);
++    this.defaultChorePeriod = conf.getInt(HBASE_RS_HEAP_MEMORY_TUNER_PERIOD,
++      HBASE_RS_HEAP_MEMORY_TUNER_DEFAULT_PERIOD);
++    this.heapOccupancyLowWatermark = conf.getFloat(HConstants.HEAP_OCCUPANCY_LOW_WATERMARK_KEY,
++      HConstants.DEFAULT_HEAP_OCCUPANCY_LOW_WATERMARK);
+   }
+ 
+   private boolean doInit(Configuration conf) {
+@@ -174,10 +184,10 @@ public class HeapMemoryManager {
+   }
+ 
+   public void start() {
++    LOG.info("Starting HeapMemoryTuner chore.");
++    this.heapMemTunerChore = new HeapMemoryTunerChore();
++    Threads.setDaemonThreadRunning(heapMemTunerChore.getThread());
+     if (tunerOn) {
+-      LOG.info("Starting HeapMemoryTuner chore.");
+-      this.heapMemTunerChore = new HeapMemoryTunerChore();
+-      Threads.setDaemonThreadRunning(heapMemTunerChore.getThread());
+       // Register HeapMemoryTuner as a memstore flush listener
+       memStoreFlusher.registerFlushRequestListener(heapMemTunerChore);
+     }
+@@ -185,10 +195,8 @@ public class HeapMemoryManager {
+ 
+   public void stop() {
+     // The thread is Daemon. Just interrupting the ongoing process.
+-    if (tunerOn) {
+-      LOG.info("Stoping HeapMemoryTuner chore.");
+-      this.heapMemTunerChore.interrupt();
+-    }
++    LOG.info("Stoping HeapMemoryTuner chore.");
++    this.heapMemTunerChore.interrupt();
+   }
+ 
+   // Used by the test cases.
+@@ -196,16 +204,23 @@ public class HeapMemoryManager {
+     return this.tunerOn;
+   }
+ 
++  /**
++   * @return heap occupancy percentage, 0 <= n <= 1
++   */
++  public float getHeapOccupancyPercent() {
++    return this.heapOccupancyPercent;
++  }
++
+   private class HeapMemoryTunerChore extends Chore implements FlushRequestListener {
+     private HeapMemoryTuner heapMemTuner;
+     private AtomicLong blockedFlushCount = new AtomicLong();
+     private AtomicLong unblockedFlushCount = new AtomicLong();
+     private long evictCount = 0L;
+     private TunerContext tunerContext = new TunerContext();
++    private boolean alarming = false;
+ 
+     public HeapMemoryTunerChore() {
+-      super(server.getServerName() + "-HeapMemoryTunerChore", server.getConfiguration().getInt(
+-          HBASE_RS_HEAP_MEMORY_TUNER_PERIOD, HBASE_RS_HEAP_MEMORY_TUNER_DEFAULT_PERIOD), server);
++      super(server.getServerName() + "-HeapMemoryTunerChore", defaultChorePeriod, server);
+       Class<? extends HeapMemoryTuner> tunerKlass = server.getConfiguration().getClass(
+           HBASE_RS_HEAP_MEMORY_TUNER_CLASS, DefaultHeapMemoryTuner.class, HeapMemoryTuner.class);
+       heapMemTuner = ReflectionUtils.newInstance(tunerKlass, server.getConfiguration());
+@@ -213,6 +228,41 @@ public class HeapMemoryManager {
+ 
+     @Override
+     protected void chore() {
++      // Sample heap occupancy
++      MemoryUsage memUsage = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
++      heapOccupancyPercent = (float)memUsage.getUsed() / (float)memUsage.getCommitted();
++      // If we are above the heap occupancy alarm low watermark, switch to short
++      // sleeps for close monitoring. Stop autotuning, we are in a danger zone.
++      if (heapOccupancyPercent >= heapOccupancyLowWatermark) {
++        if (!alarming) {
++          LOG.warn("heapOccupancyPercent " + heapOccupancyPercent +
++            " is above heap occupancy alarm watermark (" + heapOccupancyLowWatermark + ")");
++          alarming = true;
++        }
++        getSleeper().skipSleepCycle();
++        try {
++          // Need to sleep ourselves since we've told the chore's sleeper
++          // to skip the next sleep cycle.
++          Thread.sleep(1000);
++        } catch (InterruptedException e) {
++          // Interrupted, propagate
++          Thread.currentThread().interrupt();
++        }
++      } else {
++        if (alarming) {
++          LOG.info("heapOccupancyPercent " + heapOccupancyPercent +
++            " is now below the heap occupancy alarm watermark (" +
++            heapOccupancyLowWatermark + ")");
++          alarming = false;
++        }
++      }
++      // Autotune if tuning is enabled and allowed
++      if (tunerOn && !alarming) {
++        tune();
++      }
++    }
++
++    private void tune() {
+       evictCount = blockCache.getStats().getEvictedCount() - evictCount;
+       tunerContext.setBlockedFlushCount(blockedFlushCount.getAndSet(0));
+       tunerContext.setUnblockedFlushCount(unblockedFlushCount.getAndSet(0));
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+index 08d038c..3565195 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+@@ -149,4 +149,8 @@ public interface RegionServerServices
+    */
+   boolean registerService(Service service);
+ 
++  /**
++   * @return heap memory manager instance
++   */
++  HeapMemoryManager getHeapMemoryManager();
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+index e7111e2..e6e98f2 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.quotas.RegionServerQuotaManager;
+ import org.apache.hadoop.hbase.regionserver.CompactionRequestor;
+ import org.apache.hadoop.hbase.regionserver.FlushRequester;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
++import org.apache.hadoop.hbase.regionserver.HeapMemoryManager;
+ import org.apache.hadoop.hbase.regionserver.Leases;
+ import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
+@@ -280,4 +281,9 @@ public class MockRegionServerServices implements RegionServerServices {
+     // TODO Auto-generated method stub
+     return false;
+   }
++
++  @Override
++  public HeapMemoryManager getHeapMemoryManager() {
++    return null;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+index 82d224b..0fc33db 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+@@ -94,6 +94,7 @@ import org.apache.hadoop.hbase.quotas.RegionServerQuotaManager;
+ import org.apache.hadoop.hbase.regionserver.CompactionRequestor;
+ import org.apache.hadoop.hbase.regionserver.FlushRequester;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
++import org.apache.hadoop.hbase.regionserver.HeapMemoryManager;
+ import org.apache.hadoop.hbase.regionserver.Leases;
+ import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
+@@ -614,4 +615,9 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
+       throws ServiceException {
+     return null;
+   }
++
++  @Override
++  public HeapMemoryManager getHeapMemoryManager() {
++    return null;
++  }
+ }
+\ No newline at end of file
+-- 
+1.9.1
+

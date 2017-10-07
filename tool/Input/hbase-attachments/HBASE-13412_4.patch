@@ -1,0 +1,101 @@
+From e9752dfdd60ab333ee57d5b0ccd439d86bfcbf06 Mon Sep 17 00:00:00 2001
+From: Elliott Clark <eclark@apache.org>
+Date: Mon, 6 Apr 2015 10:22:32 -0700
+Subject: [PATCH] HBASE-13412 Region split decisions should have jitter
+
+---
+ .../ConstantSizeRegionSplitPolicy.java             |  6 ++++++
+ .../hbase/regionserver/TestRegionSplitPolicy.java  | 25 +++++++++++++++++-----
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ConstantSizeRegionSplitPolicy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ConstantSizeRegionSplitPolicy.java
+index 2459ae6..cfe7123 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ConstantSizeRegionSplitPolicy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ConstantSizeRegionSplitPolicy.java
+@@ -23,6 +23,8 @@ import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ 
++import java.util.Random;
++
+ /**
+  * A {@link RegionSplitPolicy} implementation which splits a region
+  * as soon as any of its store files exceeds a maximum configurable
+@@ -34,6 +36,8 @@ import org.apache.hadoop.hbase.HTableDescriptor;
+  */
+ @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
+ public class ConstantSizeRegionSplitPolicy extends RegionSplitPolicy {
++  private static final Random RANDOM = new Random();
++
+   private long desiredMaxFileSize;
+ 
+   @Override
+@@ -48,6 +52,8 @@ public class ConstantSizeRegionSplitPolicy extends RegionSplitPolicy {
+       this.desiredMaxFileSize = conf.getLong(HConstants.HREGION_MAX_FILESIZE,
+         HConstants.DEFAULT_MAX_FILE_SIZE);
+     }
++    double sizeJitter = conf.getDouble("hbase.hregion.max.filesize.jitter", 0.25D);
++    this.desiredMaxFileSize += (long)(desiredMaxFileSize * (RANDOM.nextFloat() - 0.5D) * sizeJitter);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionSplitPolicy.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionSplitPolicy.java
+index 6a234bb..a713dd8 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionSplitPolicy.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionSplitPolicy.java
+@@ -17,9 +17,15 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
++import static org.hamcrest.Matchers.greaterThan;
++import static org.hamcrest.Matchers.greaterThanOrEqualTo;
++import static org.hamcrest.Matchers.lessThan;
++import static org.hamcrest.Matchers.lessThanOrEqualTo;
++import static org.hamcrest.core.Is.is;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
+@@ -110,14 +116,23 @@ public class TestRegionSplitPolicy {
+     // now be no longer be splittable since split size has gone up.
+     regions.add(mockRegion);
+     assertFalse(policy.shouldSplit());
+-    // Quadruple (2 squared) the store size and make sure its just over; verify it'll split
+-    Mockito.doReturn((flushSize * 2 * 2 * 2) + 1).when(mockStore).getSize();
++    // make sure its just over; verify it'll split
++    Mockito.doReturn((long)(maxSplitSize * 1.025 + 1)).when(mockStore).getSize();
+     assertTrue(policy.shouldSplit());
+ 
+     // Finally assert that even if loads of regions, we'll split at max size
+-    assertEquals(maxSplitSize, policy.getSizeToCheck(1000));
++    assertWithinJitter(maxSplitSize, policy.getSizeToCheck(1000));
+     // Assert same is true if count of regions is zero.
+-    assertEquals(maxSplitSize, policy.getSizeToCheck(0));
++    assertWithinJitter(maxSplitSize, policy.getSizeToCheck(0));
++  }
++
++  private void assertWithinJitter(long maxSplitSize, long sizeToCheck) {
++    assertThat("Lower bound of jitter",
++        (long)(maxSplitSize * 0.75),
++        lessThanOrEqualTo(sizeToCheck));
++    assertThat("Upper bound of jitter",
++        (long)(maxSplitSize * 1.25),
++        greaterThanOrEqualTo(sizeToCheck));
+   }
+ 
+   @Test
+@@ -129,7 +144,7 @@ public class TestRegionSplitPolicy {
+     ConstantSizeRegionSplitPolicy policy =
+         (ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(
+             mockRegion, conf);
+-    assertEquals(1234L, policy.getDesiredMaxFileSize());
++    assertWithinJitter(1234L, policy.getDesiredMaxFileSize());
+ 
+     // If specified in HTD, should use that
+     htd.setMaxFileSize(9999L);
+-- 
+2.3.0
+

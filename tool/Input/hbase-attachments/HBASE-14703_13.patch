@@ -1,0 +1,872 @@
+From 762946f4cf899e65157fecc7c85168928d446928 Mon Sep 17 00:00:00 2001
+From: chenheng <chenheng@apache.org>
+Date: Wed, 25 Nov 2015 11:30:51 +0800
+Subject: [PATCH] m
+
+---
+ .../hadoop/hbase/client/AbstractMultiCallable.java |  82 ++++++
+ .../org/apache/hadoop/hbase/client/HTable.java     |  95 +++----
+ .../apache/hadoop/hbase/protobuf/ProtobufUtil.java |   6 +-
+ .../hadoop/hbase/protobuf/ResponseConverter.java   |  10 +-
+ .../hbase/protobuf/generated/ClientProtos.java     | 292 +++++----------------
+ hbase-protocol/src/main/protobuf/Client.proto      |   8 +-
+ .../hadoop/hbase/client/TestCheckAndMutate.java    |   9 +-
+ 7 files changed, 197 insertions(+), 305 deletions(-)
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/client/AbstractMultiCallable.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AbstractMultiCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AbstractMultiCallable.java
+new file mode 100644
+index 0000000..61b126b
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AbstractMultiCallable.java
+@@ -0,0 +1,82 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.client;
++
++import com.google.protobuf.ServiceException;
++import org.apache.hadoop.hbase.DoNotRetryIOException;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.filter.BinaryComparator;
++import org.apache.hadoop.hbase.filter.CompareFilter;
++import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
++import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.protobuf.RequestConverter;
++import org.apache.hadoop.hbase.protobuf.ResponseConverter;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
++import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
++import org.apache.hadoop.hbase.util.Bytes;
++
++import java.io.IOException;
++
++/**
++ * Currently it is used in MutateRow and CheckAndMutate.
++ * To use this class, you should implement your own buildRequest method.
++ * TODO: unify other calls to use this callable
++ */
++@InterfaceAudience.Private
++public abstract class AbstractMultiCallable extends PayloadCarryingServerCallable<MultiResponse> {
++
++    private final RetryingTimeTracker tracker = new RetryingTimeTracker();
++
++    public AbstractMultiCallable(Connection connection, TableName tableName, final byte[] row,
++                                 RpcControllerFactory rpcControllerFactory) {
++        super(connection, tableName, row, rpcControllerFactory);
++    }
++
++    @Override
++    public MultiResponse call(int callTimeout) throws IOException {
++        tracker.start();
++        controller.setPriority(tableName);
++        int remainingTime = tracker.getRemainingTime(callTimeout);
++        if (remainingTime == 0) {
++            throw new DoNotRetryIOException("Timeout for mutate row");
++        }
++        controller.setCallTimeout(remainingTime);
++        try {
++            ClientProtos.MultiRequest request = buildRequest();
++            ClientProtos.MultiResponse response = getStub().multi(controller, request);
++            ClientProtos.RegionActionResult res = response.getRegionActionResultList().get(0);
++            if (res.hasException()) {
++                Throwable ex = ProtobufUtil.toException(res.getException());
++                if(ex instanceof IOException) {
++                    throw (IOException)ex;
++                }
++                throw new IOException("Failed to mutate row: "+
++                        Bytes.toStringBinary(row), ex);
++            }
++            return ResponseConverter.getResults(request, response, controller.cellScanner());
++        } catch (ServiceException se) {
++            throw ProtobufUtil.getRemoteException(se);
++        }
++    }
++
++    public abstract ClientProtos.MultiRequest buildRequest() throws IOException;
++
++}
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index d104a86..0849279 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -62,6 +62,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MultiRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionAction;
++import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.CompareType;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Pair;
+@@ -589,41 +590,18 @@ public class HTable implements HTableInterface {
+    */
+   @Override
+   public void mutateRow(final RowMutations rm) throws IOException {
+-    final RetryingTimeTracker tracker = new RetryingTimeTracker();
+     PayloadCarryingServerCallable<MultiResponse> callable =
+-      new PayloadCarryingServerCallable<MultiResponse>(connection, getName(), rm.getRow(),
+-        rpcControllerFactory) {
+-      @Override
+-      public MultiResponse call(int callTimeout) throws IOException {
+-        tracker.start();
+-        controller.setPriority(tableName);
+-        int remainingTime = tracker.getRemainingTime(callTimeout);
+-        if (remainingTime == 0) {
+-          throw new DoNotRetryIOException("Timeout for mutate row");
+-        }
+-        controller.setCallTimeout(remainingTime);
+-        try {
+-          RegionAction.Builder regionMutationBuilder = RequestConverter.buildRegionAction(
+-            getLocation().getRegionInfo().getRegionName(), rm);
+-          regionMutationBuilder.setAtomic(true);
+-          MultiRequest request =
+-            MultiRequest.newBuilder().addRegionAction(regionMutationBuilder.build()).build();
+-          ClientProtos.MultiResponse response = getStub().multi(controller, request);
+-          ClientProtos.RegionActionResult res = response.getRegionActionResultList().get(0);
+-          if (res.hasException()) {
+-            Throwable ex = ProtobufUtil.toException(res.getException());
+-            if(ex instanceof IOException) {
+-              throw (IOException)ex;
+-            }
+-            throw new IOException("Failed to mutate row: "+Bytes.toStringBinary(rm.getRow()), ex);
+-          }
+-          return ResponseConverter.getResults(request, response, controller.cellScanner());
+-        } catch (ServiceException se) {
+-          throw ProtobufUtil.getRemoteException(se);
+-        }
+-      }
+-    };
+-
++            new AbstractMultiCallable(this.connection, this.tableName, rm.getRow(), this.rpcControllerFactory) {
++              @Override
++              public MultiRequest buildRequest() throws IOException {
++                RegionAction.Builder regionMutationBuilder = RequestConverter.buildRegionAction(
++                        getLocation().getRegionInfo().getRegionName(), rm);
++                regionMutationBuilder.setAtomic(true);
++                MultiRequest request =
++                        MultiRequest.newBuilder().addRegionAction(regionMutationBuilder.build()).build();
++                return request;
++              }
++            };
+     AsyncRequestFuture ars = multiAp.submitAll(pool, tableName, rm.getMutations(),
+         null, null, callable, operationTimeout);
+     ars.waitUntilDone();
+@@ -874,37 +852,26 @@ public class HTable implements HTableInterface {
+    */
+   @Override
+   public boolean checkAndMutate(final byte [] row, final byte [] family, final byte [] qualifier,
+-      final CompareOp compareOp, final byte [] value, final RowMutations rm)
+-  throws IOException {
+-    RegionServerCallable<Boolean> callable =
+-        new RegionServerCallable<Boolean>(connection, getName(), row) {
+-          @Override
+-          public Boolean call(int callTimeout) throws IOException {
+-            PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+-            controller.setPriority(tableName);
+-            controller.setCallTimeout(callTimeout);
+-            try {
+-              CompareType compareType = CompareType.valueOf(compareOp.name());
+-              MultiRequest request = RequestConverter.buildMutateRequest(
+-                  getLocation().getRegionInfo().getRegionName(), row, family, qualifier,
+-                  new BinaryComparator(value), compareType, rm);
+-              ClientProtos.MultiResponse response = getStub().multi(controller, request);
+-              ClientProtos.RegionActionResult res = response.getRegionActionResultList().get(0);
+-              if (res.hasException()) {
+-                Throwable ex = ProtobufUtil.toException(res.getException());
+-                if(ex instanceof IOException) {
+-                  throw (IOException)ex;
+-                }
+-                throw new IOException("Failed to checkAndMutate row: "+
+-                    Bytes.toStringBinary(rm.getRow()), ex);
++    final CompareOp compareOp, final byte [] value, final RowMutations rm)
++    throws IOException {
++    PayloadCarryingServerCallable<MultiResponse> callable =
++            new AbstractMultiCallable(this.connection, this.tableName, row, this.rpcControllerFactory) {
++              @Override
++              public MultiRequest buildRequest() throws IOException {
++                HBaseProtos.CompareType compareType = HBaseProtos.CompareType.valueOf(compareOp.name());
++                return RequestConverter.buildMutateRequest(
++                        getLocation().getRegionInfo().getRegionName(), row, family, qualifier,
++                        new BinaryComparator(value), compareType, rm);
+               }
+-              return Boolean.valueOf(response.getProcessed());
+-            } catch (ServiceException se) {
+-              throw ProtobufUtil.getRemoteException(se);
+-            }
+-          }
+-        };
+-    return rpcCallerFactory.<Boolean> newCaller().callWithRetries(callable, this.operationTimeout);
++            };
++    Object[] results = new Object[rm.getMutations().size()];
++    AsyncRequestFuture ars = multiAp.submitAll(pool, tableName, rm.getMutations(),
++      null, results, callable, operationTimeout);
++    ars.waitUntilDone();
++    if (ars.hasError()) {
++      throw ars.getErrors();
++    }
++    return ((Result)results[0]).getExists();
+   }
+ 
+   /**
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index 7519391..f9e4c01 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -188,9 +188,9 @@ public final class ProtobufUtil {
+    *  we reuse them across calls.
+    */
+   private final static Cell[] EMPTY_CELL_ARRAY = new Cell[]{};
+-  public final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
+-  private final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
+-  private final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
++  private final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
++  public final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
++  public final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
+   private final static Result EMPTY_RESULT_STALE = Result.create(EMPTY_CELL_ARRAY, null, true);
+   private final static Result EMPTY_RESULT_EXISTS_TRUE_STALE
+     = Result.create((Cell[])null, true, true);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+index 664849f..421907d 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ResponseConverter.java
+@@ -127,15 +127,13 @@ public final class ResponseConverter {
+           responseValue = ProtobufUtil.toResult(roe.getResult(), cells);
+         } else if (roe.hasServiceResult()) {
+           responseValue = roe.getServiceResult();
+-        } else if (response.getProcessed()) {
++        } else{
+           // Sometimes, the response is just "it was processed". Generally, this occurs for things
+           // like mutateRows where either we get back 'processed' (or not) and optionally some
+           // statistics about the regions we touched.
+-          responseValue = ProtobufUtil.EMPTY_RESULT;
+-        } else {
+-          // no result & no exception. Unexpected.
+-          throw new IllegalStateException("No result & no exception roe=" + roe +
+-              " for region " + actions.getRegion());
++          responseValue = response.getProcessed() ?
++                          ProtobufUtil.EMPTY_RESULT_EXISTS_TRUE :
++                          ProtobufUtil.EMPTY_RESULT_EXISTS_FALSE;
+         }
+         results.add(regionName, roe.getIndex(), responseValue);
+       }
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+index 1bbbe7b..ae7f84a 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ClientProtos.java
+@@ -28267,32 +28267,6 @@ public final class ClientProtos {
+      * </pre>
+      */
+     int getCompactionPressure();
+-
+-    // optional bool enabled = 4 [default = false];
+-    /**
+-     * <code>optional bool enabled = 4 [default = false];</code>
+-     *
+-     * <pre>
+-     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-     * there is no change to the local behavior because there is no load. Futher, even if the
+-     * server sends back statistics, its up to the client to have the tracker enabled via a
+-     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-     * for understanding the
+-     * </pre>
+-     */
+-    boolean hasEnabled();
+-    /**
+-     * <code>optional bool enabled = 4 [default = false];</code>
+-     *
+-     * <pre>
+-     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-     * there is no change to the local behavior because there is no load. Futher, even if the
+-     * server sends back statistics, its up to the client to have the tracker enabled via a
+-     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-     * for understanding the
+-     * </pre>
+-     */
+-    boolean getEnabled();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.RegionLoadStats}
+@@ -28365,11 +28339,6 @@ public final class ClientProtos {
+               compactionPressure_ = input.readInt32();
+               break;
+             }
+-            case 32: {
+-              bitField0_ |= 0x00000008;
+-              enabled_ = input.readBool();
+-              break;
+-            }
+           }
+         }
+       } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -28484,43 +28453,10 @@ public final class ClientProtos {
+       return compactionPressure_;
+     }
+ 
+-    // optional bool enabled = 4 [default = false];
+-    public static final int ENABLED_FIELD_NUMBER = 4;
+-    private boolean enabled_;
+-    /**
+-     * <code>optional bool enabled = 4 [default = false];</code>
+-     *
+-     * <pre>
+-     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-     * there is no change to the local behavior because there is no load. Futher, even if the
+-     * server sends back statistics, its up to the client to have the tracker enabled via a
+-     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-     * for understanding the
+-     * </pre>
+-     */
+-    public boolean hasEnabled() {
+-      return ((bitField0_ & 0x00000008) == 0x00000008);
+-    }
+-    /**
+-     * <code>optional bool enabled = 4 [default = false];</code>
+-     *
+-     * <pre>
+-     * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-     * there is no change to the local behavior because there is no load. Futher, even if the
+-     * server sends back statistics, its up to the client to have the tracker enabled via a
+-     * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-     * for understanding the
+-     * </pre>
+-     */
+-    public boolean getEnabled() {
+-      return enabled_;
+-    }
+-
+     private void initFields() {
+       memstoreLoad_ = 0;
+       heapOccupancy_ = 0;
+       compactionPressure_ = 0;
+-      enabled_ = false;
+     }
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+@@ -28543,9 +28479,6 @@ public final class ClientProtos {
+       if (((bitField0_ & 0x00000004) == 0x00000004)) {
+         output.writeInt32(3, compactionPressure_);
+       }
+-      if (((bitField0_ & 0x00000008) == 0x00000008)) {
+-        output.writeBool(4, enabled_);
+-      }
+       getUnknownFields().writeTo(output);
+     }
+ 
+@@ -28567,10 +28500,6 @@ public final class ClientProtos {
+         size += com.google.protobuf.CodedOutputStream
+           .computeInt32Size(3, compactionPressure_);
+       }
+-      if (((bitField0_ & 0x00000008) == 0x00000008)) {
+-        size += com.google.protobuf.CodedOutputStream
+-          .computeBoolSize(4, enabled_);
+-      }
+       size += getUnknownFields().getSerializedSize();
+       memoizedSerializedSize = size;
+       return size;
+@@ -28609,11 +28538,6 @@ public final class ClientProtos {
+         result = result && (getCompactionPressure()
+             == other.getCompactionPressure());
+       }
+-      result = result && (hasEnabled() == other.hasEnabled());
+-      if (hasEnabled()) {
+-        result = result && (getEnabled()
+-            == other.getEnabled());
+-      }
+       result = result &&
+           getUnknownFields().equals(other.getUnknownFields());
+       return result;
+@@ -28639,10 +28563,6 @@ public final class ClientProtos {
+         hash = (37 * hash) + COMPACTIONPRESSURE_FIELD_NUMBER;
+         hash = (53 * hash) + getCompactionPressure();
+       }
+-      if (hasEnabled()) {
+-        hash = (37 * hash) + ENABLED_FIELD_NUMBER;
+-        hash = (53 * hash) + hashBoolean(getEnabled());
+-      }
+       hash = (29 * hash) + getUnknownFields().hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -28763,8 +28683,6 @@ public final class ClientProtos {
+         bitField0_ = (bitField0_ & ~0x00000002);
+         compactionPressure_ = 0;
+         bitField0_ = (bitField0_ & ~0x00000004);
+-        enabled_ = false;
+-        bitField0_ = (bitField0_ & ~0x00000008);
+         return this;
+       }
+ 
+@@ -28805,10 +28723,6 @@ public final class ClientProtos {
+           to_bitField0_ |= 0x00000004;
+         }
+         result.compactionPressure_ = compactionPressure_;
+-        if (((from_bitField0_ & 0x00000008) == 0x00000008)) {
+-          to_bitField0_ |= 0x00000008;
+-        }
+-        result.enabled_ = enabled_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -28834,9 +28748,6 @@ public final class ClientProtos {
+         if (other.hasCompactionPressure()) {
+           setCompactionPressure(other.getCompactionPressure());
+         }
+-        if (other.hasEnabled()) {
+-          setEnabled(other.getEnabled());
+-        }
+         this.mergeUnknownFields(other.getUnknownFields());
+         return this;
+       }
+@@ -29015,71 +28926,6 @@ public final class ClientProtos {
+         return this;
+       }
+ 
+-      // optional bool enabled = 4 [default = false];
+-      private boolean enabled_ ;
+-      /**
+-       * <code>optional bool enabled = 4 [default = false];</code>
+-       *
+-       * <pre>
+-       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-       * there is no change to the local behavior because there is no load. Futher, even if the
+-       * server sends back statistics, its up to the client to have the tracker enabled via a
+-       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-       * for understanding the
+-       * </pre>
+-       */
+-      public boolean hasEnabled() {
+-        return ((bitField0_ & 0x00000008) == 0x00000008);
+-      }
+-      /**
+-       * <code>optional bool enabled = 4 [default = false];</code>
+-       *
+-       * <pre>
+-       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-       * there is no change to the local behavior because there is no load. Futher, even if the
+-       * server sends back statistics, its up to the client to have the tracker enabled via a
+-       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-       * for understanding the
+-       * </pre>
+-       */
+-      public boolean getEnabled() {
+-        return enabled_;
+-      }
+-      /**
+-       * <code>optional bool enabled = 4 [default = false];</code>
+-       *
+-       * <pre>
+-       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-       * there is no change to the local behavior because there is no load. Futher, even if the
+-       * server sends back statistics, its up to the client to have the tracker enabled via a
+-       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-       * for understanding the
+-       * </pre>
+-       */
+-      public Builder setEnabled(boolean value) {
+-        bitField0_ |= 0x00000008;
+-        enabled_ = value;
+-        onChanged();
+-        return this;
+-      }
+-      /**
+-       * <code>optional bool enabled = 4 [default = false];</code>
+-       *
+-       * <pre>
+-       * if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-       * there is no change to the local behavior because there is no load. Futher, even if the
+-       * server sends back statistics, its up to the client to have the tracker enabled via a
+-       * configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-       * for understanding the
+-       * </pre>
+-       */
+-      public Builder clearEnabled() {
+-        bitField0_ = (bitField0_ & ~0x00000008);
+-        enabled_ = false;
+-        onChanged();
+-        return this;
+-      }
+-
+       // @@protoc_insertion_point(builder_scope:hbase.pb.RegionLoadStats)
+     }
+ 
+@@ -30257,31 +30103,31 @@ public final class ClientProtos {
+      */
+     org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceResultOrBuilder getServiceResultOrBuilder();
+ 
+-    // optional .hbase.pb.RegionLoadStats loadStats = 5;
++    // optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    boolean hasLoadStats();
++    @java.lang.Deprecated boolean hasLoadStats();
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats();
++    @java.lang.Deprecated org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats();
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder();
++    @java.lang.Deprecated org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.ResultOrException}
+@@ -30542,37 +30388,37 @@ public final class ClientProtos {
+       return serviceResult_;
+     }
+ 
+-    // optional .hbase.pb.RegionLoadStats loadStats = 5;
++    // optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];
+     public static final int LOADSTATS_FIELD_NUMBER = 5;
+     private org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats loadStats_;
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    public boolean hasLoadStats() {
++    @java.lang.Deprecated public boolean hasLoadStats() {
+       return ((bitField0_ & 0x00000010) == 0x00000010);
+     }
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats() {
++    @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats() {
+       return loadStats_;
+     }
+     /**
+-     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++     * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+      *
+      * <pre>
+      * current load on the region
+      * </pre>
+      */
+-    public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder() {
++    @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder() {
+       return loadStats_;
+     }
+ 
+@@ -31452,28 +31298,28 @@ public final class ClientProtos {
+         return serviceResultBuilder_;
+       }
+ 
+-      // optional .hbase.pb.RegionLoadStats loadStats = 5;
++      // optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];
+       private org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats loadStats_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.getDefaultInstance();
+       private com.google.protobuf.SingleFieldBuilder<
+           org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder, org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder> loadStatsBuilder_;
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public boolean hasLoadStats() {
++      @java.lang.Deprecated public boolean hasLoadStats() {
+         return ((bitField0_ & 0x00000010) == 0x00000010);
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats() {
++      @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats getLoadStats() {
+         if (loadStatsBuilder_ == null) {
+           return loadStats_;
+         } else {
+@@ -31481,13 +31327,13 @@ public final class ClientProtos {
+         }
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public Builder setLoadStats(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
++      @java.lang.Deprecated public Builder setLoadStats(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
+         if (loadStatsBuilder_ == null) {
+           if (value == null) {
+             throw new NullPointerException();
+@@ -31501,13 +31347,13 @@ public final class ClientProtos {
+         return this;
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public Builder setLoadStats(
++      @java.lang.Deprecated public Builder setLoadStats(
+           org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder builderForValue) {
+         if (loadStatsBuilder_ == null) {
+           loadStats_ = builderForValue.build();
+@@ -31519,13 +31365,13 @@ public final class ClientProtos {
+         return this;
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public Builder mergeLoadStats(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
++      @java.lang.Deprecated public Builder mergeLoadStats(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats value) {
+         if (loadStatsBuilder_ == null) {
+           if (((bitField0_ & 0x00000010) == 0x00000010) &&
+               loadStats_ != org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.getDefaultInstance()) {
+@@ -31542,13 +31388,13 @@ public final class ClientProtos {
+         return this;
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public Builder clearLoadStats() {
++      @java.lang.Deprecated public Builder clearLoadStats() {
+         if (loadStatsBuilder_ == null) {
+           loadStats_ = org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.getDefaultInstance();
+           onChanged();
+@@ -31559,25 +31405,25 @@ public final class ClientProtos {
+         return this;
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder getLoadStatsBuilder() {
++      @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStats.Builder getLoadStatsBuilder() {
+         bitField0_ |= 0x00000010;
+         onChanged();
+         return getLoadStatsFieldBuilder().getBuilder();
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+        * </pre>
+        */
+-      public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder() {
++      @java.lang.Deprecated public org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionLoadStatsOrBuilder getLoadStatsOrBuilder() {
+         if (loadStatsBuilder_ != null) {
+           return loadStatsBuilder_.getMessageOrBuilder();
+         } else {
+@@ -31585,7 +31431,7 @@ public final class ClientProtos {
+         }
+       }
+       /**
+-       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5;</code>
++       * <code>optional .hbase.pb.RegionLoadStats loadStats = 5 [deprecated = true];</code>
+        *
+        * <pre>
+        * current load on the region
+@@ -35654,43 +35500,43 @@ public final class ClientProtos {
+       "orServiceCall\"k\n\014RegionAction\022)\n\006region\030" +
+       "\001 \002(\0132\031.hbase.pb.RegionSpecifier\022\016\n\006atom" +
+       "ic\030\002 \001(\010\022 \n\006action\030\003 \003(\0132\020.hbase.pb.Acti" +
+-      "on\"{\n\017RegionLoadStats\022\027\n\014memstoreLoad\030\001 " +
++      "on\"c\n\017RegionLoadStats\022\027\n\014memstoreLoad\030\001 " +
+       "\001(\005:\0010\022\030\n\rheapOccupancy\030\002 \001(\005:\0010\022\035\n\022comp" +
+-      "actionPressure\030\003 \001(\005:\0010\022\026\n\007enabled\030\004 \001(\010" +
+-      ":\005false\"j\n\024MultiRegionLoadStats\022)\n\006regio" +
+-      "n\030\001 \003(\0132\031.hbase.pb.RegionSpecifier\022\'\n\004st",
+-      "at\030\002 \003(\0132\031.hbase.pb.RegionLoadStats\"\332\001\n\021" +
+-      "ResultOrException\022\r\n\005index\030\001 \001(\r\022 \n\006resu" +
+-      "lt\030\002 \001(\0132\020.hbase.pb.Result\022*\n\texception\030" +
+-      "\003 \001(\0132\027.hbase.pb.NameBytesPair\022:\n\016servic" +
+-      "e_result\030\004 \001(\0132\".hbase.pb.CoprocessorSer" +
+-      "viceResult\022,\n\tloadStats\030\005 \001(\0132\031.hbase.pb" +
+-      ".RegionLoadStats\"x\n\022RegionActionResult\0226" +
+-      "\n\021resultOrException\030\001 \003(\0132\033.hbase.pb.Res" +
+-      "ultOrException\022*\n\texception\030\002 \001(\0132\027.hbas" +
+-      "e.pb.NameBytesPair\"x\n\014MultiRequest\022,\n\014re",
+-      "gionAction\030\001 \003(\0132\026.hbase.pb.RegionAction" +
+-      "\022\022\n\nnonceGroup\030\002 \001(\004\022&\n\tcondition\030\003 \001(\0132" +
+-      "\023.hbase.pb.Condition\"\226\001\n\rMultiResponse\0228" +
+-      "\n\022regionActionResult\030\001 \003(\0132\034.hbase.pb.Re" +
+-      "gionActionResult\022\021\n\tprocessed\030\002 \001(\010\0228\n\020r" +
+-      "egionStatistics\030\003 \001(\0132\036.hbase.pb.MultiRe" +
+-      "gionLoadStats*\'\n\013Consistency\022\n\n\006STRONG\020\000" +
+-      "\022\014\n\010TIMELINE\020\0012\203\004\n\rClientService\0222\n\003Get\022" +
+-      "\024.hbase.pb.GetRequest\032\025.hbase.pb.GetResp" +
+-      "onse\022;\n\006Mutate\022\027.hbase.pb.MutateRequest\032",
+-      "\030.hbase.pb.MutateResponse\0225\n\004Scan\022\025.hbas" +
+-      "e.pb.ScanRequest\032\026.hbase.pb.ScanResponse" +
+-      "\022P\n\rBulkLoadHFile\022\036.hbase.pb.BulkLoadHFi" +
+-      "leRequest\032\037.hbase.pb.BulkLoadHFileRespon" +
+-      "se\022X\n\013ExecService\022#.hbase.pb.Coprocessor" +
+-      "ServiceRequest\032$.hbase.pb.CoprocessorSer" +
+-      "viceResponse\022d\n\027ExecRegionServerService\022" +
+-      "#.hbase.pb.CoprocessorServiceRequest\032$.h" +
+-      "base.pb.CoprocessorServiceResponse\0228\n\005Mu" +
+-      "lti\022\026.hbase.pb.MultiRequest\032\027.hbase.pb.M",
+-      "ultiResponseBB\n*org.apache.hadoop.hbase." +
+-      "protobuf.generatedB\014ClientProtosH\001\210\001\001\240\001\001"
++      "actionPressure\030\003 \001(\005:\0010\"j\n\024MultiRegionLo" +
++      "adStats\022)\n\006region\030\001 \003(\0132\031.hbase.pb.Regio" +
++      "nSpecifier\022\'\n\004stat\030\002 \003(\0132\031.hbase.pb.Regi",
++      "onLoadStats\"\336\001\n\021ResultOrException\022\r\n\005ind" +
++      "ex\030\001 \001(\r\022 \n\006result\030\002 \001(\0132\020.hbase.pb.Resu" +
++      "lt\022*\n\texception\030\003 \001(\0132\027.hbase.pb.NameByt" +
++      "esPair\022:\n\016service_result\030\004 \001(\0132\".hbase.p" +
++      "b.CoprocessorServiceResult\0220\n\tloadStats\030" +
++      "\005 \001(\0132\031.hbase.pb.RegionLoadStatsB\002\030\001\"x\n\022" +
++      "RegionActionResult\0226\n\021resultOrException\030" +
++      "\001 \003(\0132\033.hbase.pb.ResultOrException\022*\n\tex" +
++      "ception\030\002 \001(\0132\027.hbase.pb.NameBytesPair\"x" +
++      "\n\014MultiRequest\022,\n\014regionAction\030\001 \003(\0132\026.h",
++      "base.pb.RegionAction\022\022\n\nnonceGroup\030\002 \001(\004" +
++      "\022&\n\tcondition\030\003 \001(\0132\023.hbase.pb.Condition" +
++      "\"\226\001\n\rMultiResponse\0228\n\022regionActionResult" +
++      "\030\001 \003(\0132\034.hbase.pb.RegionActionResult\022\021\n\t" +
++      "processed\030\002 \001(\010\0228\n\020regionStatistics\030\003 \001(" +
++      "\0132\036.hbase.pb.MultiRegionLoadStats*\'\n\013Con" +
++      "sistency\022\n\n\006STRONG\020\000\022\014\n\010TIMELINE\020\0012\203\004\n\rC" +
++      "lientService\0222\n\003Get\022\024.hbase.pb.GetReques" +
++      "t\032\025.hbase.pb.GetResponse\022;\n\006Mutate\022\027.hba" +
++      "se.pb.MutateRequest\032\030.hbase.pb.MutateRes",
++      "ponse\0225\n\004Scan\022\025.hbase.pb.ScanRequest\032\026.h" +
++      "base.pb.ScanResponse\022P\n\rBulkLoadHFile\022\036." +
++      "hbase.pb.BulkLoadHFileRequest\032\037.hbase.pb" +
++      ".BulkLoadHFileResponse\022X\n\013ExecService\022#." +
++      "hbase.pb.CoprocessorServiceRequest\032$.hba" +
++      "se.pb.CoprocessorServiceResponse\022d\n\027Exec" +
++      "RegionServerService\022#.hbase.pb.Coprocess" +
++      "orServiceRequest\032$.hbase.pb.CoprocessorS" +
++      "erviceResponse\0228\n\005Multi\022\026.hbase.pb.Multi" +
++      "Request\032\027.hbase.pb.MultiResponseBB\n*org.",
++      "apache.hadoop.hbase.protobuf.generatedB\014" +
++      "ClientProtosH\001\210\001\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+@@ -35852,7 +35698,7 @@ public final class ClientProtos {
+           internal_static_hbase_pb_RegionLoadStats_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_hbase_pb_RegionLoadStats_descriptor,
+-              new java.lang.String[] { "MemstoreLoad", "HeapOccupancy", "CompactionPressure", "Enabled", });
++              new java.lang.String[] { "MemstoreLoad", "HeapOccupancy", "CompactionPressure", });
+           internal_static_hbase_pb_MultiRegionLoadStats_descriptor =
+             getDescriptor().getMessageTypes().get(23);
+           internal_static_hbase_pb_MultiRegionLoadStats_fieldAccessorTable = new
+diff --git a/hbase-protocol/src/main/protobuf/Client.proto b/hbase-protocol/src/main/protobuf/Client.proto
+index a8331c3..e701e41 100644
+--- a/hbase-protocol/src/main/protobuf/Client.proto
++++ b/hbase-protocol/src/main/protobuf/Client.proto
+@@ -399,12 +399,6 @@ message RegionLoadStats {
+   optional int32 heapOccupancy = 2 [default = 0];
+   // Compaction pressure. Guaranteed to be positive, between 0 and 100.
+   optional int32 compactionPressure = 3 [default = 0];
+-  // if the stats are enabled. By the default above being 0, even if a statistic is sent back,
+-  // there is no change to the local behavior because there is no load. Futher, even if the
+-  // server sends back statistics, its up to the client to have the tracker enabled via a
+-  // configuration flag, so they don't have to use it, even if its sent. This flag is only useful
+-  // for understanding the
+-  optional bool enabled = 4 [default = false];
+ }
+ 
+ message MultiRegionLoadStats{
+@@ -426,7 +420,7 @@ message ResultOrException {
+   // result if this was a coprocessor service call
+   optional CoprocessorServiceResult service_result = 4;
+   // current load on the region
+-  optional RegionLoadStats loadStats = 5;
++  optional RegionLoadStats loadStats = 5 [deprecated=true];
+ }
+ 
+ /**
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
+index 082de09..1234194 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCheckAndMutate.java
+@@ -53,7 +53,7 @@ public class TestCheckAndMutate {
+   }
+ 
+   @Test
+-  public void testCheckAndMutate() throws Exception {
++  public void testCheckAndMutate() throws Throwable {
+     final TableName tableName = TableName.valueOf("TestPutWithDelete");
+     final byte[] rowKey = Bytes.toBytes("12345");
+     final byte[] family = Bytes.toBytes("cf");
+@@ -109,7 +109,12 @@ public class TestCheckAndMutate {
+         table.checkAndMutate(rowKey, family, Bytes.toBytes("A"), CompareFilter.CompareOp.EQUAL,
+             Bytes.toBytes("a"), rm);
+         fail("Expected NoSuchColumnFamilyException");
+-      } catch(NoSuchColumnFamilyException e) {
++      } catch (RetriesExhaustedWithDetailsException e) {
++        try {
++          throw e.getCause(0);
++        } catch (NoSuchColumnFamilyException e1) {
++          // expected
++        }
+       }
+     } finally {
+       table.close();
+-- 
+1.9.3 (Apple Git-50)
+

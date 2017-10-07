@@ -1,0 +1,189 @@
+From 90df678af8afc7ebebd74f76490cef3dc20dae6b Mon Sep 17 00:00:00 2001
+From: Rajeshbabu Chintaguntla <rajeshbabu.chintaguntla@huawei.com>
+Date: Thu, 27 Nov 2014 17:03:22 +0530
+Subject: [PATCH] HBASE-12583 Allow creating reference files even the split row
+ not lies in the storefile range if required(Rajeshbabu)
+
+---
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |  2 +-
+ .../hbase/regionserver/HRegionFileSystem.java      | 45 +++++++++++++---------
+ .../hbase/regionserver/RegionSplitPolicy.java      | 12 ++++++
+ .../TestSplitTransactionOnCluster.java             | 45 ++++++++++++++++++++++
+ 4 files changed, 84 insertions(+), 20 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 4a4d004..69b5db4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -771,7 +771,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { //
+ 
+     // Initialize split policy
+     this.splitPolicy = RegionSplitPolicy.create(this, conf);
+-
++    fs.setSplitPolicy(splitPolicy);
+     this.lastFlushTime = EnvironmentEdgeManager.currentTime();
+     // Use maximum of wal sequenceid or that which was found in stores
+     // (particularly if no recovered edits, seqid will be -1).
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
+index 4f728ae..0b2e992 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionFileSystem.java
+@@ -79,6 +79,7 @@ public class HRegionFileSystem {
+   private final Configuration conf;
+   private final Path tableDir;
+   private final FileSystem fs;
++  private RegionSplitPolicy splitPolicy;
+ 
+   /**
+    * In order to handle NN connectivity hiccups, one need to retry non-idempotent operation at the
+@@ -573,27 +574,29 @@ public class HRegionFileSystem {
+   Path splitStoreFile(final HRegionInfo hri, final String familyName,
+       final StoreFile f, final byte[] splitRow, final boolean top) throws IOException {
+ 
+-    // Check whether the split row lies in the range of the store file
+-    // If it is outside the range, return directly.
+-    if (top) {
+-      //check if larger than last key.
+-      KeyValue splitKey = KeyValueUtil.createFirstOnRow(splitRow);
+-      byte[] lastKey = f.createReader().getLastKey();
+-      // If lastKey is null means storefile is empty.
+-      if (lastKey == null) return null;
+-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
++    if(splitPolicy ==null || !splitPolicy.skipStoreFileRangeCheck()) {
++      // Check whether the split row lies in the range of the store file
++      // If it is outside the range, return directly.
++      if (top) {
++        //check if larger than last key.
++        KeyValue splitKey = KeyValueUtil.createFirstOnRow(splitRow);
++        byte[] lastKey = f.createReader().getLastKey();
++        // If lastKey is null means storefile is empty.
++        if (lastKey == null) return null;
++        if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+           splitKey.getKeyOffset(), splitKey.getKeyLength(), lastKey, 0, lastKey.length) > 0) {
+-        return null;
+-      }
+-    } else {
+-      //check if smaller than first key
+-      KeyValue splitKey = KeyValueUtil.createLastOnRow(splitRow);
+-      byte[] firstKey = f.createReader().getFirstKey();
+-      // If firstKey is null means storefile is empty.
+-      if (firstKey == null) return null;
+-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
++          return null;
++        }
++      } else {
++        //check if smaller than first key
++        KeyValue splitKey = KeyValueUtil.createLastOnRow(splitRow);
++        byte[] firstKey = f.createReader().getFirstKey();
++        // If firstKey is null means storefile is empty.
++        if (firstKey == null) return null;
++        if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+           splitKey.getKeyOffset(), splitKey.getKeyLength(), firstKey, 0, firstKey.length) < 0) {
+-        return null;
++          return null;
++        }
+       }
+     }
+ 
+@@ -1076,4 +1079,8 @@ public class HRegionFileSystem {
+     LOG.debug(msg + ", sleeping " + baseSleepBeforeRetries + " times " + sleepMultiplier);
+     Thread.sleep((long)baseSleepBeforeRetries * sleepMultiplier);
+   }
++
++  public void setSplitPolicy(RegionSplitPolicy spliPolicy) {
++    this.splitPolicy = spliPolicy;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
+index 53979af..95df821 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionSplitPolicy.java
+@@ -125,4 +125,16 @@ public abstract class RegionSplitPolicy extends Configured {
+           e);
+     }
+   }
++
++  /**
++   * In {@link HRegionFileSystem#splitStoreFile(org.apache.hadoop.hbase.HRegionInfo, 
++   * String, StoreFile, byte[], boolean)} we are not creating the split reference if split row 
++   * not lies in the StoreFile range. But some use cases we may need to create the split reference
++   * even the split row not lies in the range. 
++   * This method can be used to whether to skip the the StoreRile range check or not.
++   * @return whether to skip the StoreFile range check or or not
++   */
++  public boolean skipStoreFileRangeCheck() {
++    return false;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+index 99e8443..d4cd24d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+@@ -27,6 +27,7 @@ import static org.junit.Assert.fail;
+ 
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
++import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.CountDownLatch;
+@@ -969,6 +970,37 @@ public class TestSplitTransactionOnCluster {
+       TESTING_UTIL.deleteTable(tableName);
+     }
+   }
++
++  @Test
++  public void testStoreFileReferenceCreationWhenSplitPolicySaysToSkipRangeCheck()
++      throws Exception {
++    final TableName tableName =
++        TableName.valueOf("testStoreFileReferenceCreationWhenSplitPolicySaysToSkipRangeCheck");
++    try {
++      HTableDescriptor htd = new HTableDescriptor(tableName);
++      htd.addFamily(new HColumnDescriptor("f"));
++      htd.setRegionSplitPolicyClassName(CustomSplitPolicy.class.getName());
++      admin.createTable(htd);
++      List<HRegion> regions = awaitTableRegions(tableName);
++      HRegion region = regions.get(0);
++      for(int i = 3;i<9;i++) {
++        Put p = new Put(Bytes.toBytes("row"+i));
++        p.add(Bytes.toBytes("f"), Bytes.toBytes("q"), Bytes.toBytes("value"+i));
++        region.put(p);
++      }
++      region.flushcache();
++      Store store = region.getStore(Bytes.toBytes("f"));
++      Collection<StoreFile> storefiles = store.getStorefiles();
++      assertEquals(storefiles.size(), 1);
++      assertFalse(region.hasReferences());
++      Path referencePath = region.getRegionFileSystem().splitStoreFile(region.getRegionInfo(), "f",
++        storefiles.iterator().next(), Bytes.toBytes("row1"), false);
++      assertNotNull(referencePath);
++    } finally {
++      TESTING_UTIL.deleteTable(tableName);
++    }
++  }
++
+     public static class MockedCoordinatedStateManager extends ZkCoordinatedStateManager {
+ 
+         public void initialize(Server server, HRegion region) {
+@@ -1268,5 +1300,18 @@ public class TestSplitTransactionOnCluster {
+       st.stepsAfterPONR(rs, rs, daughterRegions);
+     }
+   }
++
++  static class CustomSplitPolicy extends RegionSplitPolicy {
++
++    @Override
++    protected boolean shouldSplit() {
++      return true;
++    }
++    
++    @Override
++    public boolean skipStoreFileRangeCheck() {
++      return true;
++    }
++  }
+ }
+ 
+-- 
+1.9.4.msysgit.0
+

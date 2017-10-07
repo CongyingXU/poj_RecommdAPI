@@ -1,0 +1,634 @@
+From f22cfdefafc40626dbb6df3665ff6c5658032a53 Mon Sep 17 00:00:00 2001
+From: Kahlil Oppenheimer <kahliloppenheimer@gmail.com>
+Date: Tue, 6 Jun 2017 15:53:43 -0400
+Subject: [PATCH 1/3] Added fast locality
+
+---
+ .../hbase/master/balancer/BaseLoadBalancer.java    | 109 ++++++++++++++++
+ .../master/balancer/StochasticLoadBalancer.java    | 140 +++++++++++++++------
+ 2 files changed, 213 insertions(+), 36 deletions(-)
+
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+index a494ecc386..286b84a106 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+@@ -43,6 +43,7 @@ import org.apache.hadoop.hbase.ClusterStatus;
+ import org.apache.hadoop.hbase.HBaseIOException;
+ import org.apache.hadoop.hbase.HDFSBlocksDistribution;
+ import org.apache.hadoop.hbase.HRegionInfo;
++import org.apache.hadoop.hbase.RegionLoad;
+ import org.apache.hadoop.hbase.ServerLoad;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+@@ -164,6 +165,8 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+     Map<ServerName, List<HRegionInfo>> clusterState;
+ 
+     protected final RackManager rackManager;
++    private float[][][] cachedLocalities; // Maps localityType [server|rack] -> region -> [server|rack]Index
++    private int[][] regionsToMostLocalEntities; // Maps localityType [server|rack] -> [server|rack]Index with highest locality
+ 
+     protected Cluster(
+         Map<ServerName, List<HRegionInfo>> clusterState,
+@@ -482,6 +485,112 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       }
+     }
+ 
++    /**
++     * Retrieves and lazily initializes a field storing the locality of
++     * every region/server combination
++     */
++    public float[][] getOrComputeCachedLocalities(LocalityType type) {
++      if (cachedLocalities == null || regionsToMostLocalEntities == null) {
++        computeCachedLocalities();
++      }
++      return cachedLocalities[type.ordinal()];
++    }
++
++    /**
++     * Lazily initializes and retrieves a mapping of region -> server for which region has
++     * the highest the locality
++     */
++    public int[] getOrComputeRegionsToMostLocalEntities(LocalityType type) {
++      if (cachedLocalities == null || regionsToMostLocalEntities == null) {
++        computeCachedLocalities();
++      }
++      return regionsToMostLocalEntities[type.ordinal()];
++    }
++
++    /**
++     * Looks up locality from cache of localities. Will create cache if it does
++     * not already exist.
++     */
++    public float getOrComputeLocality(int region, int server, LocalityType type) {
++      return getOrComputeCachedLocalities(type)[region][server];
++    }
++
++    /**
++     * Returns locality weighted by region size in MB. Will create locality cache
++     * if it does not already exist.
++     */
++    public double getOrComputeWeightedLocality(int region, int server, LocalityType type) {
++      return getRegionSizeMb(region) * getOrComputeLocality(region, server, type);
++    }
++
++    /**
++     * Returns the size in MB from the most recent RegionLoad for region
++     */
++    public int getRegionSizeMb(int region) {
++      Deque<BalancerRegionLoad> load = regionLoads[region];
++      // This means regions have no actual data on disk
++      if (load == null) {
++        return 0;
++      }
++      return regionLoads[region].getLast().getStorefileSizeMB();
++    }
++
++    /**
++     * Computes and caches the locality for each region/server and region/rack combinations,
++     * as well as storing a mapping of region -> server and region -> rack such that server
++     * and rack have the highest locality for region
++     */
++    private void computeCachedLocalities() {
++      cachedLocalities = new float[LocalityType.values().length][numRegions][numServers];
++      regionsToMostLocalEntities = new int[LocalityType.values().length][numRegions];
++
++      // Compute localities and find most local server per region
++      for (int region = 0; region < numRegions; region++) {
++        int serverWithBestLocality = 0;
++        float bestLocalityForRegion = 0;
++        for (int server = 0; server < numServers; server++) {
++          float locality = getLocalityOfRegion(region, server);
++          cachedLocalities[LocalityType.SERVER.ordinal()][region][server] = locality;
++
++          // Aggregate per-rack locality
++          int rack = serverIndexToRackIndex[server];
++          int numServersInRack = serversPerRack[rack].length;
++          cachedLocalities[LocalityType.RACK.ordinal()][region][rack] += locality / numServersInRack;
++
++          if (locality > bestLocalityForRegion) {
++            serverWithBestLocality = server;
++            bestLocalityForRegion = locality;
++          }
++        }
++        regionsToMostLocalEntities[LocalityType.SERVER.ordinal()][region] = serverWithBestLocality;
++
++        // Find most local rack per region
++        int rackWithBestLocality = 0;
++        float bestRackLocalityForRegion = 0.0f;
++        for (int rack = 0; rack < numRacks; rack++) {
++          float rackLocality = cachedLocalities[LocalityType.RACK.ordinal()][region][rack];
++          if (rackLocality > bestRackLocalityForRegion) {
++            bestRackLocalityForRegion = rackLocality;
++            rackWithBestLocality = rack;
++          }
++        }
++        regionsToMostLocalEntities[LocalityType.RACK.ordinal()][region] = rackWithBestLocality;
++      }
++
++    }
++
++    /**
++     * Maps region index to rack index
++     */
++    public int getRackForRegion(int region) {
++      return serverIndexToRackIndex[regionIndexToServerIndex[region]];
++    }
++
++    public enum LocalityType {
++      SERVER,
++      RACK
++    }
++
+     /** An action to move or swap a region */
+     public static class Action {
+       public static enum Type {
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+index fd4b091a4f..05bfcdd7dd 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+@@ -45,6 +45,7 @@ import org.apache.hadoop.hbase.master.RegionPlan;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action.Type;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.AssignRegionAction;
++import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.LocalityType;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.MoveRegionAction;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.SwapRegionsAction;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -140,6 +141,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   // when new services are offered
+   private LocalityBasedCandidateGenerator localityCandidateGenerator;
+   private LocalityCostFunction localityCost;
++  private RackLocalityCostFunction rackLocalityCost;
+   private RegionReplicaHostCostFunction regionReplicaHostCostFunction;
+   private RegionReplicaRackCostFunction regionReplicaRackCostFunction;
+   private boolean isByTable = false;
+@@ -173,6 +175,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       localityCandidateGenerator = new LocalityBasedCandidateGenerator(services);
+     }
+     localityCost = new LocalityCostFunction(conf, services);
++    rackLocalityCost = new RackLocalityCostFunction(conf, services);
+ 
+     if (this.candidateGenerators == null) {
+       candidateGenerators = Lists.newArrayList();
+@@ -194,6 +197,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       new PrimaryRegionCountSkewCostFunction(conf),
+       new MoveCostFunction(conf),
+       localityCost,
++      rackLocalityCost,
+       new TableSkewCostFunction(conf),
+       regionReplicaHostCostFunction,
+       regionReplicaRackCostFunction,
+@@ -250,8 +254,8 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   public synchronized void setMasterServices(MasterServices masterServices) {
+     super.setMasterServices(masterServices);
+     this.localityCost.setServices(masterServices);
++    this.rackLocalityCost.setServices(masterServices);
+     this.localityCandidateGenerator.setServices(masterServices);
+-
+   }
+ 
+   @Override
+@@ -336,7 +340,8 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+     // Allow turning this feature off if the locality cost is not going to
+     // be used in any computations.
+     RegionLocationFinder finder = null;
+-    if (this.localityCost != null && this.localityCost.getMultiplier() > 0) {
++    if (this.localityCost != null && this.localityCost.getMultiplier() > 0
++        || this.rackLocalityCost != null && this.rackLocalityCost.getMultiplier() > 0) {
+       finder = this.regionFinder;
+     }
+ 
+@@ -1202,59 +1207,122 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+    * Compute a cost of a potential cluster configuration based upon where
+    * {@link org.apache.hadoop.hbase.regionserver.StoreFile}s are located.
+    */
+-  static class LocalityCostFunction extends CostFunction {
++  static abstract class LocalityBasedCostFunction extends CostFunction {
+ 
+-    private static final String LOCALITY_COST_KEY = "hbase.master.balancer.stochastic.localityCost";
+-    private static final float DEFAULT_LOCALITY_COST = 25;
++    private final LocalityType type;
++
++    private double bestLocality; // best case locality across cluster weighted by local data size
++    private double locality; // current locality across cluster weighted by local data size
+ 
+     private MasterServices services;
+ 
+-    LocalityCostFunction(Configuration conf, MasterServices srv) {
++    LocalityBasedCostFunction(Configuration conf,
++                              MasterServices srv,
++                              LocalityType type,
++                              String localityCostKey,
++                              float defaultLocalityCost) {
+       super(conf);
+-      this.setMultiplier(conf.getFloat(LOCALITY_COST_KEY, DEFAULT_LOCALITY_COST));
++      this.type = type;
++      this.setMultiplier(conf.getFloat(localityCostKey, defaultLocalityCost));
+       this.services = srv;
++      this.locality = 0.0;
++      this.bestLocality = 0.0;
+     }
+ 
+-    void setServices(MasterServices srvc) {
++    /**
++     * Maps region to the current entity (server or rack) on which it is stored
++     */
++    abstract int regionIndexToEntityIndex(int region);
++
++    public void setServices(MasterServices srvc) {
+       this.services = srvc;
+     }
+ 
+     @Override
+-    double cost() {
+-      double max = 0;
+-      double cost = 0;
++    void init(Cluster cluster) {
++      super.init(cluster);
++      locality = 0.0;
++      bestLocality = 0.0;
+ 
+-      // If there's no master so there's no way anything else works.
++      // If no master, no computation will work, so assume 0 cost
+       if (this.services == null) {
+-        return cost;
++        return;
+       }
+ 
+-      for (int i = 0; i < cluster.regionLocations.length; i++) {
+-        max += 1;
+-        int serverIndex = cluster.regionIndexToServerIndex[i];
+-        int[] regionLocations = cluster.regionLocations[i];
+-
+-        // If we can't find where the data is getTopBlock returns null.
+-        // so count that as being the best possible.
+-        if (regionLocations == null) {
+-          continue;
+-        }
++      for (int region = 0; region < cluster.numRegions; region++) {
++        locality += getWeightedLocality(region, regionIndexToEntityIndex(region));
++        bestLocality += getWeightedLocality(region, getMostLocalEntityForRegion(region));
++      }
+ 
+-        int index = -1;
+-        for (int j = 0; j < regionLocations.length; j++) {
+-          if (regionLocations[j] >= 0 && regionLocations[j] == serverIndex) {
+-            index = j;
+-            break;
+-          }
+-        }
++      locality /= bestLocality;
++    }
+ 
+-        if (index < 0) {
+-          cost += 1;
+-        } else {
+-          cost += (1 - cluster.getLocalityOfRegion(i, serverIndex));
+-        }
++    @Override
++    protected void regionMoved(int region, int oldServer, int newServer) {
++      int oldEntity = type == LocalityType.SERVER ? oldServer : cluster.serverIndexToRackIndex[oldServer];
++      int newEntity = type == LocalityType.SERVER ? newServer : cluster.serverIndexToRackIndex[newServer];
++      if (this.services == null) {
++        return;
+       }
+-      return scale(0, max, cost);
++      double localityDelta = getWeightedLocality(region, newEntity) - getWeightedLocality(region, oldEntity);
++      double normalizedDelta = localityDelta / bestLocality;
++      locality += normalizedDelta;
++    }
++
++    @Override
++    double cost() {
++      return 1 - locality;
++    }
++
++    private int getMostLocalEntityForRegion(int region) {
++      return cluster.getOrComputeRegionsToMostLocalEntities(type)[region];
++    }
++
++    private double getWeightedLocality(int region, int entity) {
++      return cluster.getOrComputeWeightedLocality(region, entity, type);
++    }
++
++  }
++
++  static class LocalityCostFunction extends LocalityBasedCostFunction {
++
++    private static final String LOCALITY_COST_KEY = "hbase.master.balancer.stochastic.localityCost";
++    private static final float DEFAULT_LOCALITY_COST = 25;
++
++    LocalityCostFunction(Configuration conf, MasterServices srv) {
++      super(
++          conf,
++          srv,
++          LocalityType.SERVER,
++          LOCALITY_COST_KEY,
++          DEFAULT_LOCALITY_COST
++      );
++    }
++
++    @Override
++    int regionIndexToEntityIndex(int region) {
++      return cluster.regionIndexToServerIndex[region];
++    }
++  }
++
++  static class RackLocalityCostFunction extends LocalityBasedCostFunction {
++
++    private static final String RACK_LOCALITY_COST_KEY = "hbase.master.balancer.stochastic.rackLocalityCost";
++    private static final float DEFAULT_RACK_LOCALITY_COST = 15;
++
++    public RackLocalityCostFunction(Configuration conf, MasterServices services) {
++      super(
++          conf,
++          services,
++          LocalityType.RACK,
++          RACK_LOCALITY_COST_KEY,
++          DEFAULT_RACK_LOCALITY_COST
++      );
++    }
++
++    @Override
++    int regionIndexToEntityIndex(int region) {
++      return cluster.getRackForRegion(region);
+     }
+   }
+ 
+-- 
+2.11.0 (Apple Git-81)
+
+
+From 7e8d9c3df0b8396c1bbf1df0de87df0c08099ff1 Mon Sep 17 00:00:00 2001
+From: Kahlil Oppenheimer <kahliloppenheimer@gmail.com>
+Date: Tue, 6 Jun 2017 16:59:35 -0400
+Subject: [PATCH 2/3] Added mocked region size in mb for locality tests
+
+---
+ .../org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java   | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+index de4a250464..68cec01f93 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+@@ -230,6 +230,12 @@ public class BalancerTestBase {
+       // convert the locality percentage to a fraction
+       return localityValue[region][server] / 100.0f;
+     }
++
++    @Override
++    public int getRegionSizeMb(int region) {
++      return 1;
++    }
++
+   }
+ 
+   // This class is introduced because IP to rack resolution can be lengthy.
+-- 
+2.11.0 (Apple Git-81)
+
+
+From c925be72d43e833f87bb2e84a69f49cace67c105 Mon Sep 17 00:00:00 2001
+From: Kahlil Oppenheimer <kahliloppenheimer@gmail.com>
+Date: Tue, 6 Jun 2017 18:12:54 -0400
+Subject: [PATCH 3/3] Fixed locality unit tests
+
+---
+ .../hbase/master/balancer/BalancerTestBase.java    |  85 -----------------
+ .../balancer/TestStochasticLoadBalancer.java       | 101 ++++++++++++++++++++-
+ 2 files changed, 98 insertions(+), 88 deletions(-)
+
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+index 68cec01f93..7f973229be 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+@@ -22,7 +22,6 @@ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+@@ -153,90 +152,6 @@ public class BalancerTestBase {
+ 
+   };
+ 
+-  /**
+-   * Data set for testLocalityCost:
+-   *
+-   * [test][regions][0] = [serverIndex] -> number of regions
+-   * [test][regions][regionIndex+1] = {server hosting region, locality percentage, datanodes}
+-   *
+-   * For each [test], there is a list of cluster config information grouped by [regions].
+-   * - [0] - the first element of the [regions] list is a list of servers with the value
+-   *         indicating the number of regions it hosts.
+-   * - [regionIndex+1] - the remaining elements of the array are regions, where the index value
+-   *         is 1 greater than the regionIndex.  This element holds an array that identifies:
+-   *     [0] - the serverIndex of the server hosting this region
+-   *     [1] - the locality percentage returned by getLocalityOfRegion(region, server) when the
+-   *           server is hosting both region and the hdfs blocks.
+-   *     [.] - the serverIndex of servers hosting the hdfs blocks, where a value of -1 indicates
+-   *         a dfs server not in the list of region servers.
+-   */
+-  protected int[][][] clusterRegionLocationMocks = new int[][][]{
+-      // Test 1: Basic region placement with 1 region server not hosting dfs block
+-      //     Locality Calculation:
+-      //        region[0] = 1 - 80/100 = (.2)  - server[2] hosts both the region and dfs blocks
+-      //        region[1] = 1.0                - server[0] only hosts the region, not dfs blocks
+-      //        region[2] = 1 - 70/100 = (.3)  - server[1] hosts both the region and dfs blocks
+-      //
+-      //      RESULT = 0.2 + 1.0 + 0.3 / 3.0 (3.0 is max value)
+-      //             = 1.5 / 3.0
+-      //             = 0.5
+-      new int[][]{
+-          new int[]{1, 1, 1},         // 3 region servers with 1 region each
+-          new int[]{2, 80, 1, 2, 0},  // region[0] on server[2] w/ 80% locality
+-          new int[]{0, 50, 1, 2},     // region[1] on server[0] w/ 50% , but no local dfs blocks
+-          new int[]{1, 70, 2, 0, 1},  // region[2] on server[1] w/ 70% locality
+-      },
+-
+-      // Test 2: Sames as Test 1, but the last region has a datanode that isn't a region server
+-      new int[][]{
+-          new int[]{1, 1, 1},
+-          new int[]{2, 80, 1, 2, 0},
+-          new int[]{0, 50, 1, 2},
+-          new int[]{1, 70, -1, 2, 0, 1},  // the first region location is not on a region server
+-      },
+-  };
+-
+-  // This mock allows us to test the LocalityCostFunction
+-  protected class MockCluster extends BaseLoadBalancer.Cluster {
+-
+-    protected int[][] localityValue = null;   // [region][server] = percent of blocks
+-
+-    protected MockCluster(int[][] regions) {
+-
+-      // regions[0] is an array where index = serverIndex an value = number of regions
+-      super(mockClusterServers(regions[0], 1), null, null, null);
+-
+-      localityValue = new int[regions.length-1][];
+-      // the remaining elements in the regions array contain values for:
+-      //   [0] - the serverIndex of the server hosting this region
+-      //   [1] - the locality percentage (in whole numbers) for the hosting region server
+-      //   [.] - a list of servers hosting dfs blocks for the region (-1 means its not one
+-      //         of our region servers.
+-      for (int i = 1; i < regions.length; i++){
+-        int regionIndex = i - 1;
+-        int serverIndex = regions[i][0];
+-        int locality = regions[i][1];
+-        int[] locations = Arrays.copyOfRange(regions[i], 2, regions[i].length);
+-
+-        regionIndexToServerIndex[regionIndex] = serverIndex;
+-        localityValue[regionIndex] = new int[servers.length];
+-        localityValue[regionIndex][serverIndex] = (locality > 100)? locality % 100 : locality;
+-        regionLocations[regionIndex] = locations;
+-      }
+-    }
+-
+-    @Override
+-    float getLocalityOfRegion(int region, int server) {
+-      // convert the locality percentage to a fraction
+-      return localityValue[region][server] / 100.0f;
+-    }
+-
+-    @Override
+-    public int getRegionSizeMb(int region) {
+-      return 1;
+-    }
+-
+-  }
+ 
+   // This class is introduced because IP to rack resolution can be lengthy.
+   public static class MockMapping implements DNSToSwitchMapping {
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+index a20925b685..760951010f 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+@@ -60,6 +60,65 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+   public static final String REGION_KEY = "testRegion";
+   private static final Log LOG = LogFactory.getLog(TestStochasticLoadBalancer.class);
+ 
++  // Mapping of locality test -> expected locality
++  private float[] expectedLocalities = {1.0f, 0.0f, 0.50f, 0.25f, 1.0f};
++
++  /**
++   * Data set for testLocalityCost:
++   * [test][0][0] = mapping of server to number of regions it hosts
++   * [test][region + 1][0] = server that region is hosted on
++   * [test][region + 1][server + 1] = locality for region on server
++   */
++
++  private int[][][] clusterRegionLocationMocks = new int[][][]{
++
++      // Test 1: each region is entirely on server that hosts it
++      new int[][]{
++          new int[]{2, 1, 1},
++          new int[]{2, 0, 0, 100},   // region 0 is hosted and entirely local on server 2
++          new int[]{0, 100, 0, 0},   // region 1 is hosted and entirely on server 0
++          new int[]{0, 100, 0, 0},   // region 2 is hosted and entirely on server 0
++          new int[]{1, 0, 100, 0},   // region 1 is hosted and entirely on server 1
++      },
++
++      // Test 2: each region is 0% local on the server that hosts it
++      new int[][]{
++          new int[]{1, 2, 1},
++          new int[]{0, 0, 0, 100},   // region 0 is hosted and entirely local on server 2
++          new int[]{1, 100, 0, 0},   // region 1 is hosted and entirely on server 0
++          new int[]{1, 100, 0, 0},   // region 2 is hosted and entirely on server 0
++          new int[]{2, 0, 100, 0},   // region 1 is hosted and entirely on server 1
++      },
++
++      // Test 3: each region is 25% local on the server that hosts it (and 50% locality is possible)
++      new int[][]{
++          new int[]{1, 2, 1},
++          new int[]{0, 25, 0, 50},   // region 0 is hosted and entirely local on server 2
++          new int[]{1, 50, 25, 0},   // region 1 is hosted and entirely on server 0
++          new int[]{1, 50, 25, 0},   // region 2 is hosted and entirely on server 0
++          new int[]{2, 0, 50, 25},   // region 1 is hosted and entirely on server 1
++      },
++
++      // Test 4: each region is 25% local on the server that hosts it (and 100% locality is possible)
++      new int[][]{
++          new int[]{1, 2, 1},
++          new int[]{0, 25, 0, 100},   // region 0 is hosted and entirely local on server 2
++          new int[]{1, 100, 25, 0},   // region 1 is hosted and entirely on server 0
++          new int[]{1, 100, 25, 0},   // region 2 is hosted and entirely on server 0
++          new int[]{2, 0, 100, 25},   // region 1 is hosted and entirely on server 1
++      },
++
++      // Test 5: each region is 75% local on the server that hosts it (and 75% locality is possible everywhere)
++      new int[][]{
++          new int[]{1, 2, 1},
++          new int[]{0, 75, 75, 75},   // region 0 is hosted and entirely local on server 2
++          new int[]{1, 75, 75, 75},   // region 1 is hosted and entirely on server 0
++          new int[]{1, 75, 75, 75},   // region 2 is hosted and entirely on server 0
++          new int[]{2, 75, 75, 75},   // region 1 is hosted and entirely on server 1
++      },
++  };
++
++
+   @Test
+   public void testKeepRegionLoad() throws Exception {
+ 
+@@ -146,12 +205,13 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     StochasticLoadBalancer.CostFunction
+         costFunction = new StochasticLoadBalancer.LocalityCostFunction(conf, master);
+ 
+-    for (int[][] clusterRegionLocations : clusterRegionLocationMocks) {
++    for (int test = 0; test < clusterRegionLocationMocks.length; test++) {
++      int[][] clusterRegionLocations = clusterRegionLocationMocks[test];
+       MockCluster cluster = new MockCluster(clusterRegionLocations);
+       costFunction.init(cluster);
+       double cost = costFunction.cost();
+-
+-      assertEquals(0.5f, cost, 0.001);
++      double expected = 1 - expectedLocalities[test];
++      assertEquals(expected, cost, 0.001);
+     }
+   }
+ 
+@@ -587,4 +647,39 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     testWithCluster(serverMap, rm, false, true);
+   }
+ 
++  // This mock allows us to test the LocalityCostFunction
++  private class MockCluster extends BaseLoadBalancer.Cluster {
++
++    private int[][] localities = null;   // [region][server] = percent of blocks
++
++    public MockCluster(int[][] regions) {
++
++      // regions[0] is an array where index = serverIndex an value = number of regions
++      super(mockClusterServers(regions[0], 1), null, null, null);
++
++      localities = new int[regions.length - 1][];
++      for (int i = 1; i < regions.length; i++) {
++        int regionIndex = i - 1;
++        localities[regionIndex] = new int[regions[i].length - 1];
++        regionIndexToServerIndex[regionIndex] = regions[i][0];
++        for (int j = 1; j < regions[i].length; j++) {
++          int serverIndex = j - 1;
++          localities[regionIndex][serverIndex] = regions[i][j] > 100 ? regions[i][j] % 100 : regions[i][j];
++        }
++      }
++    }
++
++    @Override
++    float getLocalityOfRegion(int region, int server) {
++      // convert the locality percentage to a fraction
++      return localities[region][server] / 100.0f;
++    }
++
++    @Override
++    public int getRegionSizeMb(int region) {
++      return 1;
++    }
++
++  }
++
+ }
+-- 
+2.11.0 (Apple Git-81)
+

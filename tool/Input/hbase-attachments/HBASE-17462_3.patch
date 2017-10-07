@@ -1,0 +1,140 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+index b02aac1..1741531 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+@@ -42,7 +42,6 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.master.MasterServices;
+ import org.apache.hadoop.hbase.master.RegionPlan;
+-import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action.Type;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.AssignRegionAction;
+@@ -1300,29 +1299,47 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+ 
+     protected double getRegionLoadCost(Collection<RegionLoad> regionLoadList) {
+       double cost = 0;
+-
+       for (RegionLoad rl : regionLoadList) {
+-        double toAdd = getCostFromRl(rl);
+-
+-        if (cost == 0) {
+-          cost = toAdd;
+-        } else {
+-          cost = (.5 * cost) + (.5 * toAdd);
+-        }
++        cost += getCostFromRl(rl);
+       }
+-
+-      return cost;
++      return cost / regionLoadList.size();
+     }
+ 
+     protected abstract double getCostFromRl(RegionLoad rl);
+   }
+ 
+   /**
++   * Class to be used for the subset of RegionLoad costs that should be treated as rates.
++   * We do not compare about the actual rate in requests per second but rather the rate relative
++   * to the rest of the regions.
++   */
++  abstract static class CostFromRegionLoadAsRateFunction extends CostFromRegionLoadFunction {
++
++    CostFromRegionLoadAsRateFunction(Configuration conf) {
++      super(conf);
++    }
++
++    @Override
++    protected double getRegionLoadCost(Collection<RegionLoad> regionLoadList) {
++      double cost = 0;
++      Double previous = null;
++      for (RegionLoad rl : regionLoadList) {
++        double current = getCostFromRl(rl);
++        if (previous != null) {
++          cost += current - previous;
++        }
++        previous = current;
++      }
++      return cost / (regionLoadList.size() - 1);
++    }
++  }
++
++  /**
+    * Compute the cost of total number of read requests  The more unbalanced the higher the
+    * computed cost will be.  This uses a rolling average of regionload.
+    */
+ 
+-  static class ReadRequestCostFunction extends CostFromRegionLoadFunction {
++  static class ReadRequestCostFunction extends CostFromRegionLoadAsRateFunction {
+ 
+     private static final String READ_REQUEST_COST_KEY =
+         "hbase.master.balancer.stochastic.readRequestCost";
+@@ -1333,7 +1350,6 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       this.setMultiplier(conf.getFloat(READ_REQUEST_COST_KEY, DEFAULT_READ_REQUEST_COST));
+     }
+ 
+-
+     @Override
+     protected double getCostFromRl(RegionLoad rl) {
+       return rl.getReadRequestsCount();
+@@ -1344,7 +1360,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+    * Compute the cost of total number of write requests.  The more unbalanced the higher the
+    * computed cost will be.  This uses a rolling average of regionload.
+    */
+-  static class WriteRequestCostFunction extends CostFromRegionLoadFunction {
++  static class WriteRequestCostFunction extends CostFromRegionLoadAsRateFunction {
+ 
+     private static final String WRITE_REQUEST_COST_KEY =
+         "hbase.master.balancer.stochastic.writeRequestCost";
+@@ -1522,7 +1538,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+    * Compute the cost of total memstore size.  The more unbalanced the higher the
+    * computed cost will be.  This uses a rolling average of regionload.
+    */
+-  static class MemstoreSizeCostFunction extends CostFromRegionLoadFunction {
++  static class MemstoreSizeCostFunction extends CostFromRegionLoadAsRateFunction {
+ 
+     private static final String MEMSTORE_SIZE_COST_KEY =
+         "hbase.master.balancer.stochastic.memstoreSizeCost";
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+index 094687b..0c110be 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+@@ -48,6 +48,7 @@ import org.apache.hadoop.hbase.master.MockNoopMasterServices;
+ import org.apache.hadoop.hbase.master.RackManager;
+ import org.apache.hadoop.hbase.master.RegionPlan;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster;
++import org.apache.hadoop.hbase.regionserver.MemstoreSize;
+ import org.apache.hadoop.hbase.testclassification.FlakeyTests;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -231,6 +232,30 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+   }
+ 
+   @Test
++  public void testRegionLoadCost() {
++    List<RegionLoad> regionLoads = new ArrayList<>();
++    for (int i = 1; i < 5; i++) {
++      RegionLoad regionLoad = mock(RegionLoad.class);
++      when(regionLoad.getReadRequestsCount()).thenReturn(new Long(i));
++      when(regionLoad.getStorefileSizeMB()).thenReturn(i);
++      regionLoads.add(regionLoad);
++    }
++
++    Configuration conf = HBaseConfiguration.create();
++    StochasticLoadBalancer.ReadRequestCostFunction readCostFunction =
++        new StochasticLoadBalancer.ReadRequestCostFunction(conf);
++    double rateResult = readCostFunction.getRegionLoadCost(regionLoads);
++    // read requests are treated as a rate so the average rate here is simply 1
++    assertEquals(1, rateResult, 0.01);
++
++    StochasticLoadBalancer.StoreFileCostFunction storeFileCostFunction =
++        new StochasticLoadBalancer.StoreFileCostFunction(conf);
++    double result = storeFileCostFunction.getRegionLoadCost(regionLoads);
++    // storefile size cost is simply an average of it's value over time
++    assertEquals(2.5, result, 0.01);
++  }
++
++  @Test
+   public void testCostFromArray() {
+     Configuration conf = HBaseConfiguration.create();
+     StochasticLoadBalancer.CostFromRegionLoadFunction

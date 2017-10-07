@@ -1,0 +1,604 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+index 1d718bf..1ab3e92 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+@@ -102,7 +102,10 @@ public class Scan extends Query {
+    * s.setAttribute(Scan.HINT_LOOKAHEAD, Bytes.toBytes(2));
+    * }</pre>
+    * Default is 0 (always reseek).
++   * @deprecated without replacement
++   *             This is now a no-op, SEEKs and SKIPs are optimizated automatically.
+    */
++  @Deprecated
+   public static final String HINT_LOOKAHEAD = "_look_ahead_";
+ 
+   private byte [] startRow = HConstants.EMPTY_START_ROW;
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+index 5f78498..9704c45 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+@@ -1993,6 +1993,63 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
+       return compareFlatKey(left, 0, left.length, right, 0, right.length);
+     }
+ 
++    // compare a key against a given row/fam/qual/ts/type
++    public int compareKey(byte[] key, int koff, int klen, byte[] row, int roff, int rlen,
++        byte[] fam, int foff, int flen, byte[] col, int coff, int clen, long ts, byte type) {
++
++      short lrowlength = Bytes.toShort(key, koff);
++      int compare = compareRows(key, koff + Bytes.SIZEOF_SHORT, lrowlength, row, roff, rlen);
++      if (compare != 0) {
++        return compare;
++      }
++      // See compareWithoutRows...
++      // -------------------------
++      int commonLength = ROW_LENGTH_SIZE + FAMILY_LENGTH_SIZE + rlen;
++
++      // key's ColumnFamily + Qualifier length.
++      int lcolumnlength = klen - TIMESTAMP_TYPE_SIZE + commonLength;
++
++      byte ltype = key[koff + (klen - 1)];
++
++      // If the column is not specified, the "minimum" key type appears the
++      // latest in the sorted order, regardless of the timestamp. This is used
++      // for specifying the last key/value in a given row, because there is no
++      // "lexicographically last column" (it would be infinitely long). The
++      // "maximum" key type does not need this behavior.
++      if (lcolumnlength == 0 && ltype == Type.Minimum.getCode()) {
++        // left is "bigger", i.e. it appears later in the sorted order
++        return 1;
++      }
++      if (flen + clen == 0 && type == Type.Minimum.getCode()) {
++        return -1;
++      }
++
++      int lfamilyoffset = commonLength + koff;
++      int lfamilylength = key[lfamilyoffset - 1];
++      compare = Bytes.compareTo(key, lfamilyoffset, lfamilylength, fam, foff, flen);
++      if (compare != 0) {
++        return compare;
++      }
++      int lColOffset = lfamilyoffset + lfamilylength;
++      int lColLength = lcolumnlength - lfamilylength;
++      compare = Bytes.compareTo(key, lColOffset, lColLength, col, coff, clen);
++      if (compare != 0) {
++        return compare;
++      }
++      // Next compare timestamps.
++      long ltimestamp = Bytes.toLong(key, koff + (klen - TIMESTAMP_TYPE_SIZE));
++      compare = compareTimestamps(ltimestamp, ts);
++      if (compare != 0) {
++        return compare;
++      }
++
++      // Compare types. Let the delete types sort ahead of puts; i.e. types
++      // of higher numbers sort before those of lesser numbers. Maximum (255)
++      // appears ahead of everything, and minimum (0) appears after
++      // everything.
++      return (0xff & type) - (0xff & ltype);
++    }
++
+     /**
+      * Compares the Key of a cell -- with fields being more significant in this order:
+      * rowkey, colfam/qual, timestamp, type, mvcc
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
+index 5ce6c74..e7ed6d4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
+@@ -294,6 +294,11 @@ public class HalfStoreFileReader extends StoreFile.Reader {
+       public boolean isSeeked() {
+         return this.delegate.isSeeked();
+       }
++
++      @Override
++      public byte[] getNextIndexedKey() {
++        return null;
++      }
+     };
+   }
+   
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
+index 1c7c02b..757dc14 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
+@@ -498,6 +498,10 @@ public class HFileReaderV2 extends AbstractHFileReader {
+       extends AbstractHFileReader.Scanner {
+     protected HFileBlock block;
+ 
++    @Override
++    public byte[] getNextIndexedKey() {
++      return nextIndexedKey;
++    }
+     /**
+      * The next indexed key is to keep track of the indexed key of the next data block.
+      * If the nextIndexedKey is HConstants.NO_NEXT_INDEXED_KEY, it means that the
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileScanner.java
+index c0b2047..86b9aa3 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileScanner.java
+@@ -144,4 +144,9 @@ public interface HFileScanner {
+    * Otherwise returns false.
+    */
+   boolean isSeeked();
++
++  /**
++   * @return the next key in the index (the key to seek to the next block)
++   */
++  byte[] getNextIndexedKey();
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ExplicitColumnTracker.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ExplicitColumnTracker.java
+index b42ff25..bdd6921 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ExplicitColumnTracker.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ExplicitColumnTracker.java
+@@ -56,10 +56,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+   private final int maxVersions;
+   private final int minVersions;
+ 
+-  // hint for the tracker about how many KVs we will attempt to search via next()
+-  // before we schedule a (re)seek operation
+-  private final int lookAhead; 
+-
+  /**
+   * Contains the list of columns that the ExplicitColumnTracker is tracking.
+   * Each ColumnCount instance also tracks how many versions of the requested
+@@ -72,7 +68,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+    * Used to eliminate duplicates. */
+   private long latestTSOfCurrentColumn;
+   private long oldestStamp;
+-  private int skipCount;
+ 
+   /**
+    * Default constructor.
+@@ -81,14 +76,11 @@ public class ExplicitColumnTracker implements ColumnTracker {
+    * @param maxVersions maximum versions to return per column
+    * @param oldestUnexpiredTS the oldest timestamp we are interested in,
+    *  based on TTL 
+-   * @param lookAhead number of KeyValues to look ahead via next before
+-   *  (re)seeking
+    */
+   public ExplicitColumnTracker(NavigableSet<byte[]> columns, int minVersions,
+-      int maxVersions, long oldestUnexpiredTS, int lookAhead) {
++      int maxVersions, long oldestUnexpiredTS) {
+     this.maxVersions = maxVersions;
+     this.minVersions = minVersions;
+-    this.lookAhead = lookAhead;
+     this.oldestStamp = oldestUnexpiredTS;
+     this.columns = new ColumnCount[columns.size()];
+     int i=0;
+@@ -144,8 +136,7 @@ public class ExplicitColumnTracker implements ColumnTracker {
+       if (ret > 0) {
+         // The current KV is smaller than the column the ExplicitColumnTracker
+         // is interested in, so seek to that column of interest.
+-        return this.skipCount++ < this.lookAhead ? ScanQueryMatcher.MatchCode.SKIP
+-            : ScanQueryMatcher.MatchCode.SEEK_NEXT_COL;
++        return ScanQueryMatcher.MatchCode.SEEK_NEXT_COL;
+       }
+ 
+       // The current KV is bigger than the column the ExplicitColumnTracker
+@@ -154,7 +145,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+       // column of interest, and check again.
+       if (ret <= -1) {
+         ++this.index;
+-        this.skipCount = 0;
+         if (done()) {
+           // No more to match, do not include, done with this row.
+           return ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW; // done_row
+@@ -179,7 +169,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+     if (count >= maxVersions || (count >= minVersions && isExpired(timestamp))) {
+       // Done with versions for this column
+       ++this.index;
+-      this.skipCount = 0;
+       resetTS();
+       if (done()) {
+         // We have served all the requested columns.
+@@ -198,7 +187,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+   // Called between every row.
+   public void reset() {
+     this.index = 0;
+-    this.skipCount = 0;
+     this.column = this.columns[this.index];
+     for(ColumnCount col : this.columns) {
+       col.setCount(0);
+@@ -238,7 +226,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
+       resetTS();
+       if (compare <= 0) {
+         ++this.index;
+-        this.skipCount = 0;
+         if (done()) {
+           // Will not hit any more columns in this storefile
+           this.column = null;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
+index f8cc5b4..1ce1624 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
+@@ -396,4 +396,10 @@ public class KeyValueHeap extends NonReversedNonLazyKeyValueScanner
+   KeyValueScanner getCurrentForTesting() {
+     return current;
+   }
++
++  @Override
++  public byte[] getNextIndexedKey() {
++    // here we return the next index key from the top scanner
++    return current == null ? null : current.getNextIndexedKey();
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueScanner.java
+index babb216..90bfd11 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueScanner.java
+@@ -156,4 +156,10 @@ public interface KeyValueScanner {
+    * @throws IOException
+    */
+   public boolean seekToLastRow() throws IOException;
++
++  /**
++   * @return the next key in the index (the key to seek to the next block)
++   * if known, or null otherwise
++   */
++  public byte[] getNextIndexedKey();
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.java
+index a892637..5e7cecb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.java
+@@ -67,4 +67,8 @@ public abstract class NonLazyKeyValueScanner implements KeyValueScanner {
+     // Not a file by default.
+     return false;
+   }
++  @Override
++  public byte[] getNextIndexedKey() {
++    return null;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
+index 2b56edb..bdd3913 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.java
+@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.regionserver;
+ import java.io.IOException;
+ import java.util.NavigableSet;
+ 
++import org.apache.hadoop.hbase.KeyValue.Type;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellUtil;
+@@ -203,9 +204,8 @@ public class ScanQueryMatcher {
+ 
+       // We can share the ExplicitColumnTracker, diff is we reset
+       // between rows, not between storefiles.
+-      byte[] attr = scan.getAttribute(Scan.HINT_LOOKAHEAD);
+       this.columns = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,
+-          oldestUnexpiredTS, attr == null ? 0 : Bytes.toInt(attr));
++          oldestUnexpiredTS);
+     }
+     this.isReversed = scan.isReversed();
+   }
+@@ -504,7 +504,7 @@ public class ScanQueryMatcher {
+ 
+   public boolean moreRowsMayExistAfter(KeyValue kv) {
+     if (this.isReversed) {
+-      if (rowComparator.compareRows(kv.getBuffer(), kv.getRowOffset(),
++      if (rowComparator.compareRows(kv.getRowArray(), kv.getRowOffset(),
+           kv.getRowLength(), stopRow, 0, stopRow.length) <= 0) {
+         return false;
+       } else {
+@@ -512,7 +512,7 @@ public class ScanQueryMatcher {
+       }
+     }
+     if (!Bytes.equals(stopRow , HConstants.EMPTY_END_ROW) &&
+-        rowComparator.compareRows(kv.getBuffer(),kv.getRowOffset(),
++        rowComparator.compareRows(kv.getRowArray(),kv.getRowOffset(),
+             kv.getRowLength(), stopRow, 0, stopRow.length) >= 0) {
+       // KV >= STOPROW
+       // then NO there is nothing left.
+@@ -569,24 +569,58 @@ public class ScanQueryMatcher {
+     ColumnCount nextColumn = columns.getColumnHint();
+     if (nextColumn == null) {
+       return KeyValue.createLastOnRow(
+-          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
+-          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
+-          kv.getBuffer(), kv.getQualifierOffset(), kv.getQualifierLength());
++          kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
++          kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
++          kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength());
+     } else {
+       return KeyValue.createFirstOnRow(
+-          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
+-          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
++          kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
++          kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
+           nextColumn.getBuffer(), nextColumn.getOffset(), nextColumn.getLength());
+     }
+   }
+ 
+   public KeyValue getKeyForNextRow(KeyValue kv) {
+     return KeyValue.createLastOnRow(
+-        kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
++        kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+         null, 0, 0,
+         null, 0, 0);
+   }
+ 
++  /**
++   * @param nextIndexed the key of the next entry in the block index (if any)
++   * @param kv The Cell we're using to calculate the seek key
++   * @return result of the compare between the indexed key and the key portion of the passed cell
++   */
++  public int compareKeyForNextRow(byte[] nextIndexed, Cell kv) {
++    return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
++      kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
++      null, 0, 0, null, 0, 0,
++      HConstants.OLDEST_TIMESTAMP, Type.Minimum.getCode());
++  }
++
++  /**
++   * @param nextIndexed the key of the next entry in the block index (if any)
++   * @param kv The Cell we're using to calculate the seek key
++   * @return result of the compare between the indexed key and the key portion of the passed cell
++   */
++  public int compareKeyForNextColumn(byte[] nextIndexed, Cell kv) {
++    ColumnCount nextColumn = columns.getColumnHint();
++    if (nextColumn == null) {
++      return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
++        kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
++        kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
++        kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength(),
++        HConstants.OLDEST_TIMESTAMP, Type.Minimum.getCode());
++    } else {
++      return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
++        kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
++        kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
++        nextColumn.getBuffer(), nextColumn.getOffset(), nextColumn.getLength(),
++        HConstants.LATEST_TIMESTAMP, Type.Maximum.getCode());
++    }
++  }
++
+   //Used only for testing purposes
+   static MatchCode checkColumn(ColumnTracker columnTracker, byte[] bytes, int offset,
+       int length, long ttl, byte type, boolean ignoreCount) throws IOException {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFileScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFileScanner.java
+index e528770..ac3d12f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFileScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFileScanner.java
+@@ -475,4 +475,9 @@ public class StoreFileScanner implements KeyValueScanner {
+     }
+     return true;
+   }
++
++  @Override
++  public byte[] getNextIndexedKey() {
++    return hfs.getNextIndexedKey();
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index 853e1bf..527b084 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.client.IsolationLevel;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.executor.ExecutorService;
+ import org.apache.hadoop.hbase.filter.Filter;
++import org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode;
+ import org.apache.hadoop.hbase.regionserver.handler.ParallelSeekHandler;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+@@ -478,6 +479,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+       prevKV = kv;
+ 
+       ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
++      qcode = optimize(qcode, kv);
+       switch(qcode) {
+         case INCLUDE:
+         case INCLUDE_AND_SEEK_NEXT_ROW:
+@@ -575,6 +577,39 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+     }
+   }
+ 
++  /*
++   * See if we should actually SEEK or rather just SKIP to the next Cell.
++   * (See HBASE-13109)
++   */
++  private ScanQueryMatcher.MatchCode optimize(ScanQueryMatcher.MatchCode qcode, Cell cell) {
++    byte[] nextIndexedKey = getNextIndexedKey();
++    if (nextIndexedKey == null || nextIndexedKey == HConstants.NO_NEXT_INDEXED_KEY ||
++        store == null) {
++      return qcode;
++    }
++    switch(qcode) {
++    case INCLUDE_AND_SEEK_NEXT_COL:
++    case SEEK_NEXT_COL:
++    {
++      if (matcher.compareKeyForNextColumn(nextIndexedKey, cell) >= 0) {
++        return qcode == MatchCode.SEEK_NEXT_COL ? MatchCode.SKIP : MatchCode.INCLUDE;
++      }
++      break;
++    }
++    case INCLUDE_AND_SEEK_NEXT_ROW:
++    case SEEK_NEXT_ROW:
++    {
++      if (matcher.compareKeyForNextRow(nextIndexedKey, cell) >= 0) {
++        return qcode == MatchCode.SEEK_NEXT_ROW ? MatchCode.SKIP : MatchCode.INCLUDE;
++      }
++      break;
++    }
++    default:
++      break;
++    }
++    return qcode;
++  }
++
+   @Override
+   public boolean next(List<Cell> outResult) throws IOException {
+     return next(outResult, -1);
+@@ -778,5 +813,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+   public long getEstimatedNumberOfKvsScanned() {
+     return this.kvsScanned;
+   }
++
++  @Override
++  public byte[] getNextIndexedKey() {
++    return this.heap.getNextIndexedKey();
++  }
+ }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestBlocksRead.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestBlocksRead.java
+index b22f3ac..911f28f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestBlocksRead.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestBlocksRead.java
+@@ -353,8 +353,8 @@ public class TestBlocksRead extends HBaseTestCase {
+       putData(FAMILY, "row", "col3", 9);
+       region.flushcache();
+ 
+-      // Baseline expected blocks read: 8. [HBASE-4532]
+-      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 5);
++      // Baseline expected blocks read: 6. [HBASE-4532]
++      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 6, 7, 7);
+       assertEquals(0, kvs.length);
+  
+       // File 7: Put back new data
+@@ -364,8 +364,8 @@ public class TestBlocksRead extends HBaseTestCase {
+       region.flushcache();
+ 
+ 
+-      // Expected blocks read: 5. [HBASE-4585]
+-      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 5);
++      // Expected blocks read: 8. [HBASE-4585, HBASE-13109]
++      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 8, 9, 9);
+       assertEquals(3, kvs.length);
+       verifyData(kvs[0], "row", "col1", 11);
+       verifyData(kvs[1], "row", "col2", 12);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestExplicitColumnTracker.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestExplicitColumnTracker.java
+index 401583d..e7a9694 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestExplicitColumnTracker.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestExplicitColumnTracker.java
+@@ -47,9 +47,9 @@ public class TestExplicitColumnTracker {
+   private void runTest(int maxVersions,
+                        TreeSet<byte[]> trackColumns,
+                        List<byte[]> scannerColumns,
+-                       List<MatchCode> expected, int lookAhead) throws IOException {
++                       List<MatchCode> expected) throws IOException {
+     ColumnTracker exp = new ExplicitColumnTracker(
+-      trackColumns, 0, maxVersions, Long.MIN_VALUE, lookAhead);
++      trackColumns, 0, maxVersions, Long.MIN_VALUE);
+ 
+ 
+     //Initialize result
+@@ -91,7 +91,7 @@ public class TestExplicitColumnTracker {
+     scanner.add(col4);
+     scanner.add(col5);
+ 
+-    runTest(maxVersions, columns, scanner, expected, 0);
++    runTest(maxVersions, columns, scanner, expected);
+   }
+ 
+   @Test
+@@ -143,59 +143,7 @@ public class TestExplicitColumnTracker {
+     scanner.add(col5);
+ 
+     //Initialize result
+-    runTest(maxVersions, columns, scanner, expected, 0);
+-  }
+-
+-  @Test
+-  public void testGet_MultiVersionWithLookAhead() throws IOException{
+-    //Create tracker
+-    TreeSet<byte[]> columns = new TreeSet<byte[]>(Bytes.BYTES_COMPARATOR);
+-    //Looking for every other
+-    columns.add(col2);
+-    columns.add(col4);
+-
+-    List<ScanQueryMatcher.MatchCode> expected = new ArrayList<ScanQueryMatcher.MatchCode>();
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_COL);
+-
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE);                   // col2; 1st version
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL); // col2; 2nd version
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_COL);
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_COL);
+-
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE);                   // col4; 1st version
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW); // col4; 2nd version
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW);
+-
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW);
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW);
+-    expected.add(ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW);
+-    int maxVersions = 2;
+-
+-    //Create "Scanner"
+-    List<byte[]> scanner = new ArrayList<byte[]>();
+-    scanner.add(col1);
+-    scanner.add(col1);
+-    scanner.add(col1);
+-    scanner.add(col2);
+-    scanner.add(col2);
+-    scanner.add(col2);
+-    scanner.add(col3);
+-    scanner.add(col3);
+-    scanner.add(col3);
+-    scanner.add(col4);
+-    scanner.add(col4);
+-    scanner.add(col4);
+-    scanner.add(col5);
+-    scanner.add(col5);
+-    scanner.add(col5);
+-
+-    //Initialize result
+-    runTest(maxVersions, columns, scanner, expected, 2);
++    runTest(maxVersions, columns, scanner, expected);
+   }
+ 
+   /**
+@@ -210,7 +158,7 @@ public class TestExplicitColumnTracker {
+     }
+ 
+     ColumnTracker explicit = new ExplicitColumnTracker(columns, 0, maxVersions,
+-        Long.MIN_VALUE, 0);
++        Long.MIN_VALUE);
+     for (int i = 0; i < 100000; i+=2) {
+       byte [] col = Bytes.toBytes("col"+i);
+       ScanQueryMatcher.checkColumn(explicit, col, 0, col.length, 1, KeyValue.Type.Put.getCode(),
+@@ -239,7 +187,7 @@ public class TestExplicitColumnTracker {
+       new ScanQueryMatcher.MatchCode[] {
+         ScanQueryMatcher.MatchCode.SEEK_NEXT_COL,
+         ScanQueryMatcher.MatchCode.SEEK_NEXT_COL });
+-    runTest(1, columns, scanner, expected, 0);
++    runTest(1, columns, scanner, expected);
+   }
+ 
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQueryMatcher.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQueryMatcher.java
+index 4f07e2d..655e6fd 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQueryMatcher.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestQueryMatcher.java
+@@ -142,26 +142,6 @@ public class TestQueryMatcher extends HBaseTestCase {
+     _testMatch_ExplicitColumns(scan, expected);
+   }
+ 
+-  public void testMatch_ExplicitColumnsWithLookAhead()
+-  throws IOException {
+-    //Moving up from the Tracker by using Gets and List<KeyValue> instead
+-    //of just byte []
+-
+-    //Expected result
+-    List<MatchCode> expected = new ArrayList<ScanQueryMatcher.MatchCode>();
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL);
+-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL);
+-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW);
+-    expected.add(ScanQueryMatcher.MatchCode.DONE);
+-
+-    Scan s = new Scan(scan);
+-    s.setAttribute(Scan.HINT_LOOKAHEAD, Bytes.toBytes(2));
+-    _testMatch_ExplicitColumns(s, expected);
+-  }
+-
+-
+   public void testMatch_Wildcard()
+   throws IOException {
+     //Moving up from the Tracker by using Gets and List<KeyValue> instead

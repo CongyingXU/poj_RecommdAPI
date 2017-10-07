@@ -1,0 +1,894 @@
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/MessageContext.java	(working copy)
+@@ -21,7 +21,6 @@
+ 
+ import javax.xml.ws.Service.Mode;
+ 
+-import org.apache.axiom.om.OMElement;
+ import org.apache.axis2.jaxws.description.ServiceDescription;
+ import org.apache.axis2.jaxws.message.Message;
+ 
+@@ -45,8 +44,6 @@
+     private Message message;
+     private Mode mode;
+         
+-    private OMElement omMessage;  //FIXME: This is temporary until we integrate with the Message Model
+-    
+     public MessageContext() {
+         axisMsgCtx = new org.apache.axis2.context.MessageContext();
+         properties = new HashMap<String, Object>();
+@@ -81,8 +78,6 @@
+         return null;
+     }
+     
+-    //FIXME: This is a temporary mechanism until the Message Model 
+-    //implementation is available.
+     public void setMessage(Message msg) {
+         message = msg;
+     }
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/util/MessageContextUtils.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/util/MessageContextUtils.java	(revision 0)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/util/MessageContextUtils.java	(revision 0)
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2006 The Apache Software Foundation.
++ * Copyright 2006 International Business Machines Corp.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.axis2.jaxws.core.util;
++
++import org.apache.axis2.AxisFault;
++import org.apache.axis2.jaxws.ExceptionFactory;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.util.Utils;
++
++/**
++ * A utility class for handling some of the common issues related to 
++ * the JAX-WS MessageContext.
++ */
++public class MessageContextUtils {
++
++    /**
++     * Given a MessageContext, create a new MessageContext from there with the
++     * necessary information to make sure the new MessageContext is related
++     * to the existing one.  An example of a usage for this would be to create
++     * the MessageContext for a response based on the MessageContext of a 
++     * particular request. 
++     * 
++     * @param mc - the MessageContext to use as the source
++     * @return
++     */
++    public static MessageContext createMessageMessageContext(MessageContext mc) {
++        try {
++            org.apache.axis2.context.MessageContext sourceAxisMC = mc.getAxisMessageContext();
++            
++            // There are a number of things that need to be copied over at the
++            // Axis2 level.
++            org.apache.axis2.context.MessageContext newAxisMC = 
++                Utils.createOutMessageContext(sourceAxisMC);
++            
++            MessageContext newMC = new MessageContext(newAxisMC);
++            
++            return newMC;
++        } catch (AxisFault e) {
++            throw ExceptionFactory.makeWebServiceException(e);
++        }
++    }
++    
++}
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/ProviderDispatcher.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/ProviderDispatcher.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/ProviderDispatcher.java	(working copy)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004,2005 The Apache Software Foundation.
++ * Copyright 2006 The Apache Software Foundation.
+  * Copyright 2006 International Business Machines Corp.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -20,20 +20,48 @@
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ 
++import javax.activation.DataSource;
++import javax.xml.bind.JAXBContext;
+ import javax.xml.soap.SOAPMessage;
+ import javax.xml.transform.Source;
+ import javax.xml.ws.Provider;
+-import org.apache.axis2.jaxws.param.Parameter;
+-import javax.xml.bind.JAXBContext;
+ 
++import org.apache.axis2.jaxws.ExceptionFactory;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.core.util.MessageContextUtils;
++import org.apache.axis2.jaxws.message.Block;
++import org.apache.axis2.jaxws.message.Message;
++import org.apache.axis2.jaxws.message.Protocol;
++import org.apache.axis2.jaxws.message.factory.BlockFactory;
++import org.apache.axis2.jaxws.message.factory.MessageFactory;
++import org.apache.axis2.jaxws.message.factory.SourceBlockFactory;
++import org.apache.axis2.jaxws.message.factory.XMLStringBlockFactory;
++import org.apache.axis2.jaxws.registry.FactoryRegistry;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
+ /**
+- * From a given service class, determine and invoke the appropriate endpoint with associated parameter.
++ * The ProviderDispatcher is used to invoke instances of a target endpoint
++ * that implement the {@link javax.xml.ws.Provider} interface.
++ * 
++ * The Provider<T> is a generic class, with certain restrictions on the
++ * parameterized type T.  This implementation supports the following types:
++ * 
++ * java.lang.String
++ * javax.activation.DataSource
++ * javax.xml.soap.SOAPMessage
++ * javax.xml.transform.Source
+  *
+  */
+ public class ProviderDispatcher extends EndpointDispatcher{
+-	private Class svcImplClass = null;
+-	private Provider providerInstance = null;
+-	private Parameter parameter = null;
++	
++    private static Log log = LogFactory.getLog(ProviderDispatcher.class);
++    
++    private BlockFactory blockFactory = null;
++    private Class svcImplClass = null;
++	private Class providerType = null;
++    private Provider providerInstance = null;
++    private Message message = null;
+ 
+ 	/**
+ 	 * Constructor
+@@ -43,20 +71,57 @@
+ 	public ProviderDispatcher(Class _class) {
+ 		this.svcImplClass = _class;
+ 	}
+-	
+-	/* (non-Javadoc)
+-	 * @see org.apache.axis2.jaxws.server.EndpointDispatcher#execute()
+-	 */
+-	public Object execute()throws Exception{
+-		
+-		Class paramType = getProviderType();
+-    	Object input = paramType.cast(getParam().getValue());
++    
++    /* (non-Javadoc)
++     * @see org.apache.axis2.jaxws.server.EndpointDispatcher#execute()
++     */
++    public MessageContext invoke(MessageContext mc) throws Exception {
++        if (log.isDebugEnabled()) {
++            log.debug("Preparing to invoke javax.xml.ws.Provider based endpoint");
++        }
+ 
+-    	String input1 = getParam().getValue().getClass().getName();
+-    	System.out.println(">> invoking Provider with param [" + input1 + "]");
+-		
+-		return providerInstance.invoke(input);
+-	}
++        providerInstance = getProviderInstance();
++        
++        // First we need to know what kind of Provider instance we're going
++        // to be invoking against
++        providerType = getProviderType();
++        
++        // Now that we know what kind of Provider we have, we can create the 
++        // right type of Block for the request parameter data
++        Object requestParamValue = null;
++        Message message = mc.getMessage();
++        if (message != null) {
++            BlockFactory factory = createBlockFactory(providerType);
++            Block block = message.getBodyBlock(0, null, factory);
++            requestParamValue = block.getBusinessObject(true);
++        }
++
++        Object input = providerType.cast(requestParamValue);
++
++        if (log.isDebugEnabled()) {
++            log.debug("Invoking Provider<" + providerType.getName() + "> with " +
++                    "parameter of type " + input.getClass().getName());
++        }
++
++        // Invoke the actual Provider.invoke() method
++        Object responseParamValue = null;
++        try {
++            responseParamValue = providerInstance.invoke(input);
++        } catch (Exception e) {
++            e.printStackTrace();
++            throw ExceptionFactory.makeWebServiceException("An error occured " +
++                    "while invoking the target endpoint", e);
++        }
++
++        // Create the response MessageContext from the returned value
++        Message responseMsg = createMessageFromValue(responseParamValue);
++        MessageContext responseMsgCtx = MessageContextUtils.
++            createMessageMessageContext(mc);
++        
++        responseMsgCtx.setMessage(responseMsg);
++        
++        return responseMsgCtx;        
++    }
+ 	
+ 	/**
+ 	 * Get the endpoint provider instance
+@@ -85,8 +150,8 @@
+ 	 * @return
+ 	 * @throws Exception
+ 	 */
+-	public Parameter getParam()throws Exception {
+-		return parameter;
++	public Message getMessage()throws Exception {
++		return message;
+ 	}
+ 
+ 	/**
+@@ -94,45 +159,69 @@
+ 	 * 
+ 	 * @param _parameter
+ 	 */
+-	public void setParam(Parameter _parameter) {
+-		this.parameter = _parameter;
++	public void setMessage(Message msg) {
++		this.message = msg;
+ 	}
++    
++    /*
++     * Create a Message object out of the value object that was returned.
++     */
++    private Message createMessageFromValue(Object value) throws Exception {
++        if (log.isDebugEnabled()) {
++            log.debug("Creating response Message from value of type " + 
++                    value.getClass().getName());
++        }
++        
++        BlockFactory factory = createBlockFactory(providerType);
++        MessageFactory msgFactory = (MessageFactory) FactoryRegistry.getFactory(
++                MessageFactory.class);
++        
++        Message message = msgFactory.create(Protocol.soap11);
++            
++        // Since we know this isn't going to be a JAX-B block, it's ok if
++        // the context is null.  The QName can be null for now as well.
++        Block block = factory.createFrom(value, null, null);
++        message.setBodyBlock(0, block);
+ 
+-	/**
++        return message;
++    }
++
++	/*
+ 	 * Determine the Provider type for this instance
+-	 * 
+-	 * @return Provider
+-	 * @throws Exception
+ 	 */
+-	private Provider getProviderInstance()throws Exception{
+-    	Provider provider = null;
+-    	Class<?> clazz =getProviderType();
+-    	if(!isValidProviderType(clazz)){
++	private Provider getProviderInstance() throws Exception{
++    	Class<?> clazz = getProviderType();
++    	
++        if(!isValidProviderType(clazz)){
+     		//TODO This will change once deployment code it in place
+-    		throw new Exception("Invalid Provider Implementation, Only String, Source, SOAPMessage and JAXBContext Supported by JAX-WS ");
++    		throw new Exception("Invalid Provider implementation. Only String, " +
++                    "Source, and SOAPMessage are supported by JAX-WS ");
+     	}
++        
++        Provider provider = null;
+     	if(clazz == String.class){
+-    		return (Provider<String>) this.svcImplClass.newInstance();
++    		provider = (Provider<String>) this.svcImplClass.newInstance();
+     	}
+-    	if(clazz == Source.class){
+-    		return (Provider<Source>) this.svcImplClass.newInstance();
++        else if(clazz == Source.class){
++    		provider = (Provider<Source>) this.svcImplClass.newInstance();
+     	}
+-    	if(clazz == SOAPMessage.class){
+-    		return (Provider<SOAPMessage>) this.svcImplClass.newInstance();
++        else if(clazz == SOAPMessage.class){
++    		provider = (Provider<SOAPMessage>) this.svcImplClass.newInstance();
+     	}
+-    	if(clazz == JAXBContext.class){
+-    		return (Provider<JAXBContext>)this.svcImplClass.newInstance();
++        else if(clazz == JAXBContext.class){
++    		provider = (Provider<JAXBContext>)this.svcImplClass.newInstance();
+     	}
+     	
++        if (provider == null) {
++            throw ExceptionFactory.makeWebServiceException("Unable to create Provider instance.");
++        }
++        
+     	return provider;
+     	
+     }
+     
+-    /**
++    /*
+      * Get the provider type from a given implemention class instance
+-     * 
+-     * @return class
+-     * @throws Exception
+      */
+     private Class<?> getProviderType()throws Exception{
+ 
+@@ -159,14 +248,52 @@
+         return providerType;
+     }
+     
+-    /**
+-     * Validate provider type against require types for the Provider interface.
++    /*
++     * Validate whether or not the Class passed in is a valid type of 
++     * javax.xml.ws.Provider<T>.  Per the JAX-WS 2.0 specification, the 
++     * parameterized type of a Provider can only be: 
+      * 
+-     * @param clazz
+-     * @return boolean
++     *   javax.xml.transform.Source
++     *   javax.xml.soap.SOAPMessage
++     *   javax.activation.DataSource
++     *   
++     * We've also added support for String types which is NOT dictated
++     * by the spec.
+      */
+     private boolean isValidProviderType(Class clazz){	
+-    	return clazz == String.class || clazz == SOAPMessage.class || clazz == Source.class;
++    	boolean valid = clazz == String.class || 
++            clazz == SOAPMessage.class || 
++            clazz == Source.class ||
++            clazz == DataSource.class;
++        
++        if (log.isDebugEnabled()) {
++            log.debug("Class " + clazz.getName() + " is not a valid Provider<T> type");
++        }
++        
++        return valid; 
+     }
++    
++    /*
++     * Given a target class type for a payload, load the appropriate BlockFactory.
++     */
++    private BlockFactory createBlockFactory(Class type) {
++        if (blockFactory != null)
++            return blockFactory;
++        
++        if (type.equals(String.class)) {
++            blockFactory = (XMLStringBlockFactory) FactoryRegistry.getFactory(
++                    XMLStringBlockFactory.class);
++        }
++        else if (type.equals(Source.class)) {
++            blockFactory = (SourceBlockFactory) FactoryRegistry.getFactory(
++                    SourceBlockFactory.class);
++        }
++        else {
++            ExceptionFactory.makeWebServiceException("Unable to find BlockFactory " +
++                    "for type: " + type.getClass().getName());
++        }
++        
++        return blockFactory;
++    }
+ 
+ }
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointController.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointController.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointController.java	(working copy)
+@@ -14,132 +14,137 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.apache.axis2.jaxws.server;
+ 
+-import java.lang.reflect.ParameterizedType;
+-import java.lang.reflect.Type;
+-
+ import javax.xml.ws.Provider;
+ 
+-import org.apache.axiom.om.OMElement;
+-import org.apache.axiom.soap.SOAPBody;
+ import org.apache.axiom.soap.SOAPEnvelope;
+-import org.apache.axis2.context.MessageContext;
+ import org.apache.axis2.description.AxisService;
+ import org.apache.axis2.description.Parameter;
+-import org.apache.axis2.jaxws.param.ParameterFactory;
++import org.apache.axis2.jaxws.ExceptionFactory;
++import org.apache.axis2.jaxws.core.InvocationContext;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.message.Message;
++import org.apache.axis2.jaxws.message.factory.MessageFactory;
++import org.apache.axis2.jaxws.registry.FactoryRegistry;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ 
+-
++/**
++ * The EndpointController is the server side equivalent to the
++ * InvocationController on the client side.  It is an abstraction of the server
++ * side endpoint invocation that encapsulates all of the Axis2 semantics.
++ * 
++ * Like the InvocationController, this class is responsible for invoking the 
++ * JAX-WS application handler chain along with taking all of the provided 
++ * information and setting up what's needed to perform the actual invocation 
++ * of the endpoint.
++ *
++ */
+ public class EndpointController {
+-	private static String PARAM_SERVICE_CLASS = "ServiceClass";
+-	private MessageContext msgContext = null;
+     
++    private static final Log log = LogFactory.getLog(EndpointController.class);
++	private static final String PARAM_SERVICE_CLASS = "ServiceClass";
++
++    public EndpointController() {}
++
+     /**
+-     * @param _msgContext
++     * This method is used to start the JAX-WS invocation of a target endpoint.
++     * It takes an InvocationContext, which must have a MessageContext specied
++     * for the request.  Once the invocation is complete, the information will
++     * be stored  
+      */
+-    public EndpointController(MessageContext _msgContext) {
+-		this.msgContext = _msgContext;
+-	}
+-
+-	/**
+-     * Get OMElement from message context
+-     * 
+-     * @return ome
+-     */
+-    private OMElement getOMElement() throws Exception{
+-        SOAPEnvelope env = msgContext.getEnvelope();
+-        SOAPBody body = env.getBody();
+-        OMElement ome = body.getFirstElement();
+-       
+-        return ome;
++    public InvocationContext invoke(InvocationContext ic) {
++        try {
++            MessageContext requestMsgCtx = ic.getRequestMessageContext();
++            org.apache.axis2.context.MessageContext axisRequestMsgCtx = 
++                requestMsgCtx.getAxisMessageContext();
++            
++            // As the request comes in, the SOAP message will first exist only
++            // on the Axis2 MessageContext.  We need to get it from there and 
++            // wrap it with the JAX-WS Message model abstraction.  This will 
++            // allow us to get the params out in a number of forms later on.
++            SOAPEnvelope soapEnv = axisRequestMsgCtx.getEnvelope();
++            if (soapEnv == null) {
++                throw ExceptionFactory.makeWebServiceException("SOAP cannot be null");
++            }
++            
++            MessageFactory msgFactory = (MessageFactory) FactoryRegistry.getFactory(MessageFactory.class);
++            Message requestMsg = msgFactory.createFrom(soapEnv);
++            requestMsgCtx.setMessage(requestMsg);
++            
++            // Get the appropriate EndpointDispatcher instance based on the 
++            // information availabe in the MessageContext.
++            EndpointDispatcher dispatcher = getDispatcher(axisRequestMsgCtx);
++            
++            MessageContext responseMsgContext = dispatcher.invoke(requestMsgCtx);
++            
++            // The response MessageContext should be set on the InvocationContext
++            ic.setResponseMessageContext(responseMsgContext);
++        } catch (Exception e) {
++            throw ExceptionFactory.makeWebServiceException("Error while invoking EndpointDispather", e);
++        }
++        
++        return ic;
+     }
+     
+-    /**
+-     * Given a MessageContext, get the contents out and turn them into a Parameter
+-     * instance based on what the Provider expects.
+-     * 
+-     * @param msgContext
+-     * @return
+-     */
+-    private org.apache.axis2.jaxws.param.Parameter getParam(Class _class) throws Exception{
+-        Class<?> clazz = getClassType(_class);  
+-        org.apache.axis2.jaxws.param.Parameter param = ParameterFactory.createParameter(clazz);        
+-        return param;
+-    }
+-	
+-	/**
+-	 * Get the appropriate dispatcher for a given service endpoint.
+-	 * 
+-	 * @return EndpointDispatcher
+-	 * @throws Exception
++    /*
++	 * Get the appropriate dispatcher for a given service endpoint.  If the 
++     * target endpoint implements the javax.xml.ws.Provider<T> interface, then
++     * the ProviderDispatcher should be returned.  Other wise, it should be
++     * the JavaBeanDispatcher.
+ 	 */
+-	public EndpointDispatcher getDispatcher() throws Exception {
++	private EndpointDispatcher getDispatcher(org.apache.axis2.context.MessageContext msgContext) throws Exception {
+ 		EndpointDispatcher dispatcherInstance = null;
+-    	AxisService as = msgContext.getAxisService();
++    	
++        // The PARAM_SERVICE_CLASS property that is set on the AxisService
++        // will tell us what the implementation
++        AxisService as = msgContext.getAxisService();
+     	Parameter asp = as.getParameter(PARAM_SERVICE_CLASS);
+     	
+-    	Class cls = getImplClass(as,asp);
+-    	if(cls.getSuperclass().isInstance(Provider.class)){
++        // If there was no implementation class, we should not go any further
++        if (asp == null) {
++            throw ExceptionFactory.makeWebServiceException("No service class configured for this endpoint");
++        }
++        
++        // Load the service implementation class  
++    	Class cls = getImplClass(as.getClassLoader(), asp);
++        
++        // Check to see whether the class that was specified is an instance
++        // of the javax.xml.ws.Provider.  If not, stop processing.
++    	if(cls.getSuperclass().isInstance(Provider.class)) {
+     		ProviderDispatcher pd = new ProviderDispatcher(cls);
+-    		if(pd.getProvider() != null){
+-    			org.apache.axis2.jaxws.param.Parameter param = getParam(cls);
+-    			param.fromOM(getOMElement());
+-    			pd.setParam(param);
+-    		}
+     		dispatcherInstance = pd;
+     	}
++        else {
++            throw ExceptionFactory.makeWebServiceException("Error loading Provider " +
++                    "implementation; class must implement javax.xml.ws.Provider");
++        }
+     	
+     	return dispatcherInstance;
+     }
+ 	
+-	/**
+-	 * @param as
+-	 * @param asp
+-	 * @return Class
++	/*
++     * Tries to load the implementation class that was specified for the
++     * target endpoint using the supplied ClassLoader.  
+ 	 */
+-	private Class getImplClass(AxisService as, Parameter asp){
++	private Class getImplClass(ClassLoader cl, Parameter param){
+ 		Class _class = null;
++        
++        // TODO: What should be done if the supplied ClassLoader is null?
+ 		try{
+-			String className = ((String) asp.getValue()).trim();
+-			_class = Class.forName(className, true, as.getClassLoader());
++			String className = ((String) param.getValue()).trim();
+ 			
++            if (log.isDebugEnabled()) {
++                log.debug("Attempting to load service impl class: " + className);
++            }
++            
++            _class = Class.forName(className, true, cl);
+ 		}catch(java.lang.ClassNotFoundException cnf ){
+-			cnf.printStackTrace();
++			throw ExceptionFactory.makeWebServiceException("Unable to load service implementation class.");
+ 		}
+ 		
+ 		return _class;
+ 	}
+ 	
+-    /**
+-     * 
+-     * @param _class
+-     * @return
+-     * @throws Exception
+-     */
+-    private Class<?> getClassType(Class _class)throws Exception{
+-
+-    	Class classType = null;
+-    	
+-    	Type[] giTypes = _class.getGenericInterfaces();
+-    	for(Type giType : giTypes){
+-    		ParameterizedType paramType = null;
+-    		try{
+-    			paramType = (ParameterizedType)giType;
+-    		}catch(ClassCastException e){
+-    			throw new Exception("Provider based SEI Class has to implement javax.xml.ws.Provider as javax.xml.ws.Provider<String>, javax.xml.ws.Provider<SOAPMessage>, javax.xml.ws.Provider<Source> or javax.xml.ws.Provider<JAXBContext>");
+-    		}
+-    		Class interfaceName = (Class)paramType.getRawType();
+-    		System.out.println(">> Intereface name is [" + interfaceName.getName() + "]");
+-    		
+-    		if(interfaceName == javax.xml.ws.Provider.class){
+-    			if(paramType.getActualTypeArguments().length > 1){
+-    				throw new Exception("Provider cannot have more than one Generic Types defined as Per JAX-WS Specification");
+-    			}
+-    			classType = (Class)paramType.getActualTypeArguments()[0];
+-    		}
+-    	}
+-        return classType;
+-    }
+-
+ }
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java	(working copy)
+@@ -17,19 +17,18 @@
+ 
+ package org.apache.axis2.jaxws.server;
+ 
+-import javax.xml.ws.Provider;
+-import javax.xml.ws.Service.Mode;
+ import org.apache.axiom.soap.SOAPEnvelope;
+ import org.apache.axis2.AxisFault;
+-import org.apache.axis2.context.MessageContext;
++import org.apache.axis2.context.OperationContext;
+ import org.apache.axis2.description.AxisOperation;
+ import org.apache.axis2.description.AxisService;
+ import org.apache.axis2.engine.AxisEngine;
+ import org.apache.axis2.engine.MessageReceiver;
+-import org.apache.axis2.jaxws.param.Parameter;
+-import org.apache.axis2.jaxws.param.ParameterFactory;
+-import org.apache.axis2.util.Utils;
+-import org.apache.axis2.wsdl.WSDLConstants;
++import org.apache.axis2.jaxws.ExceptionFactory;
++import org.apache.axis2.jaxws.core.InvocationContext;
++import org.apache.axis2.jaxws.core.InvocationContextImpl;
++import org.apache.axis2.jaxws.core.MessageContext;
++import org.apache.axis2.jaxws.message.Message;
+ import org.apache.axis2.wsdl.WSDLConstants.WSDL20_2004Constants;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -51,52 +50,68 @@
+      * this point.  So now, just get the service implementation and invoke
+      * the appropriate method.
+      */
+-    public void receive(MessageContext reqMsgContext) throws AxisFault {
++    public void receive(org.apache.axis2.context.MessageContext axisRequestMsgCtx) 
++        throws AxisFault {
+     	if (log.isDebugEnabled()) {
+             log.debug("new request received");
+         }
+     	
+     	//Get the name of the service impl that was stored as a parameter
+         // inside of the services.xml.
+-        AxisService service = reqMsgContext.getAxisService();
+-        AxisOperation operation = reqMsgContext.getAxisOperation();
++        AxisService service = axisRequestMsgCtx.getAxisService();
++        AxisOperation operation = axisRequestMsgCtx.getAxisOperation();
+         String mep = operation.getMessageExchangePattern();
++        if (log.isDebugEnabled()){
++            log.debug("MEP: "+ mep);
++        }
++        
+         org.apache.axis2.description.Parameter svcClassParam = service.getParameter(PARAM_SERVICE_CLASS);
+         
+         try {
+             if (svcClassParam == null) { 
+                 throw new RuntimeException("No service class was found for this AxisService");
+             }
++            
+             //Get the appropriate endpoint dispatcher for this service
+-        	EndpointDispatcher endpointDispatcher = new EndpointController(reqMsgContext).getDispatcher();
+-        	if (log.isDebugEnabled()){
+-        		log.debug("MEP: "+ mep);
+-        	}
+-          	if (isMepInOnly(mep)){
+-            	endpointDispatcher.execute();
++        	EndpointController endpointCtlr = new EndpointController();
++          	
++            InvocationContext ic = new InvocationContextImpl();
++            MessageContext requestMsgCtx = new MessageContext(axisRequestMsgCtx);
++            ic.setRequestMessageContext(requestMsgCtx);
++            
++            if (isMepInOnly(mep)) {
++            	endpointCtlr.invoke(ic);
+             }
+             else{
+-	             Object response = endpointDispatcher.execute();
+-	             //Let's go ahead and create the MessageContext for the response and add
+-	             // it to the list.
+-	             MessageContext rspMsgContext = Utils.createOutMessageContext(reqMsgContext);
+-	             reqMsgContext.getOperationContext().addMessageContext(rspMsgContext);
+-	            	
+-	             Parameter rspParam = ParameterFactory.createParameter(response);
+-	             SOAPEnvelope rspEnvelope = rspParam.toEnvelope(Mode.PAYLOAD, null);
+-	             rspMsgContext.setEnvelope(rspEnvelope);
+-	             //Create the AxisEngine for the reponse and send it.
+-	             AxisEngine engine = new AxisEngine(rspMsgContext.getConfigurationContext());
+-	             engine.send(rspMsgContext);
++	            ic = endpointCtlr.invoke(ic);
++                
++                // If this is a two-way exchange, there should already be a 
++                // JAX-WS MessageContext for the response.  We need to pull 
++                // the Message data out of there and set it on the Axis2 
++                // MessageContext.
++                MessageContext responseMsgCtx = ic.getResponseMessageContext();
++                org.apache.axis2.context.MessageContext axisResponseMsgCtx = 
++                    responseMsgCtx.getAxisMessageContext();                
++                
++                Message responseMsg = responseMsgCtx.getMessage();
++                SOAPEnvelope responseEnv = (SOAPEnvelope) responseMsg.getAsOMElement();
++                axisResponseMsgCtx.setEnvelope(responseEnv);
++                
++                OperationContext opCtx = axisResponseMsgCtx.getOperationContext();
++                opCtx.addMessageContext(axisResponseMsgCtx);
++                
++                //Create the AxisEngine for the reponse and send it.
++                AxisEngine engine = new AxisEngine(axisResponseMsgCtx.getConfigurationContext());
++                engine.send(axisResponseMsgCtx);
+             }
+             
+         } catch (Exception e) {
+         	//TODO: This temp code for alpha till we add fault processing on client code.
+         	// TODO NLS
+-        	Exception ex = new Exception("Server Side Exception :" +e.getMessage());
+-            throw AxisFault.makeFault(ex);
++            throw ExceptionFactory.makeWebServiceException(e);
+         } 
+     }
++    
+     private boolean isMepInOnly(String mep){
+     	return mep.equals(WSDL20_2004Constants.MEP_URI_ROBUST_IN_ONLY) || mep.equals(WSDL20_2004Constants.MEP_URI_IN_ONLY) || mep.equals(WSDL20_2004Constants.MEP_CONSTANT_ROBUST_IN_ONLY) || mep.equals(WSDL20_2004Constants.MEP_CONSTANT_IN_ONLY);
+     }
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointDispatcher.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointDispatcher.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/EndpointDispatcher.java	(working copy)
+@@ -17,11 +17,21 @@
+ 
+ package org.apache.axis2.jaxws.server;
+ 
++import org.apache.axis2.jaxws.core.MessageContext;
++
+ /**
+- * All endpoint dispatcher types must extend this class
+- *
++ * The EndpointDispatcher is an abstraction for the object that will be doing
++ * the invocation of an endpoints target Java object.  
+  */
+ public abstract class EndpointDispatcher {
+-	public abstract Object execute() throws Exception;
+ 
++    /**
++     * Invoke the target endpoint synchronously 
++     * 
++     * @param mc
++     * @return
++     * @throws Exception
++     */
++    public abstract MessageContext invoke(MessageContext mc) throws Exception;
++
+ }
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/XMLDispatchAsyncListener.java	(working copy)
+@@ -5,7 +5,6 @@
+ import javax.xml.ws.Service.Mode;
+ 
+ import org.apache.axiom.om.OMElement;
+-import org.apache.axiom.soap.SOAPEnvelope;
+ import org.apache.axis2.jaxws.core.MessageContext;
+ import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.message.Block;
+@@ -13,9 +12,6 @@
+ import org.apache.axis2.jaxws.message.MessageException;
+ import org.apache.axis2.jaxws.message.factory.BlockFactory;
+ import org.apache.axis2.jaxws.message.factory.XMLStringBlockFactory;
+-import org.apache.axis2.jaxws.param.Parameter;
+-import org.apache.axis2.jaxws.param.ParameterFactory;
+-import org.apache.axis2.jaxws.param.ParameterUtils;
+ import org.apache.axis2.jaxws.registry.FactoryRegistry;
+ 
+ /**
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/JAXBDispatchAsyncListener.java	(working copy)
+@@ -19,15 +19,12 @@
+ import javax.xml.bind.JAXBContext;
+ import javax.xml.ws.Service.Mode;
+ 
+-import org.apache.axiom.soap.SOAPEnvelope;
+ import org.apache.axis2.jaxws.ExceptionFactory;
+ import org.apache.axis2.jaxws.core.MessageContext;
+ import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.message.Block;
+ import org.apache.axis2.jaxws.message.Message;
+ import org.apache.axis2.jaxws.message.factory.JAXBBlockFactory;
+-import org.apache.axis2.jaxws.param.JAXBParameter;
+-import org.apache.axis2.jaxws.param.ParameterUtils;
+ import org.apache.axis2.jaxws.registry.FactoryRegistry;
+ 
+ /**
+Index: C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java
+===================================================================
+--- C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java	(revision 426789)
++++ C:/work/apps/eclipse/workspace/axis2/modules/jaxws/src/org/apache/axis2/jaxws/client/BaseDispatch.java	(working copy)
+@@ -25,12 +25,8 @@
+ import javax.xml.ws.WebServiceException;
+ import javax.xml.ws.Service.Mode;
+ 
+-import org.apache.axiom.om.OMElement;
+-import org.apache.axiom.soap.SOAPBody;
+-import org.apache.axiom.soap.SOAPEnvelope;
+ import org.apache.axis2.jaxws.AxisController;
+ import org.apache.axis2.jaxws.BindingProvider;
+-import org.apache.axis2.jaxws.ExceptionFactory;
+ import org.apache.axis2.jaxws.core.InvocationContext;
+ import org.apache.axis2.jaxws.core.InvocationContextFactory;
+ import org.apache.axis2.jaxws.core.MessageContext;
+@@ -38,9 +34,6 @@
+ import org.apache.axis2.jaxws.core.controller.InvocationController;
+ import org.apache.axis2.jaxws.impl.AsyncListener;
+ import org.apache.axis2.jaxws.message.Message;
+-import org.apache.axis2.jaxws.param.Parameter;
+-import org.apache.axis2.jaxws.param.ParameterFactory;
+-import org.apache.axis2.jaxws.param.ParameterUtils;
+ import org.apache.axis2.jaxws.spi.ServiceDelegate;
+ import org.apache.axis2.jaxws.util.Constants;
+ import org.apache.axis2.jaxws.util.WSDLWrapper;
+@@ -207,15 +200,7 @@
+     }
+   
+     public Response invokeAsync(Object obj)throws WebServiceException{
+-        if(obj == null){
+-            throw new WebServiceException("Dispatch Cannot Invoke SEI with null object");
+-        }
+-        try{
+-            Parameter param = ParameterFactory.createParameter(obj);
+-            return axisController.invokeAsync(param, requestContext);
+-        }catch(Exception e){
+-            throw ExceptionFactory.makeWebServiceException(e);
+-        }
++        throw new UnsupportedOperationException("Async (polling) invocations are not yet supported.");
+     }
+     
+     //FIXME: This needs to be moved up to the BindingProvider and should actually
+@@ -256,31 +241,4 @@
+     public void setMode(Mode m) {
+         mode = m;
+     }    
+-    
+-    /* 
+-     * FIXME: This is temporary until more of the Message Model is available.
+-     */
+-    protected OMElement toOM(Parameter param, String soapVersion){
+-        SOAPEnvelope env = ParameterUtils.toEnvelope(mode, soapVersion, param);
+-        System.out.println(">> Generated envelope [" + env.toString() + "]");
+-        
+-        SOAPBody body = env.getBody();
+-        //SOAPHeader soapHeader = env.getHeader();
+-        //addHeadersToServiceClient(soapHeader);
+-        return body.getFirstElement();
+-    }
+-    
+-    /*
+-     * FIXME: This is temporary until more of the Message Model is available. 
+-     */
+-    protected Parameter fromOM(OMElement element, Parameter response, String soapVersion){
+-        response.fromOM(element);
+-
+-        // Convert param toEnvelope since ServiceClient always send xml string.
+-        // toEnvelope() in Parameter is coded just to handle this.
+-        SOAPEnvelope env = response.toEnvelope(null, soapVersion);
+-        
+-        response.fromEnvelope(mode, env);
+-        return response;
+-    }
+ }

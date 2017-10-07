@@ -1,0 +1,650 @@
+From 063f7925a590ff9730eb4ebeffdd8ccd5a0af648 Mon Sep 17 00:00:00 2001
+From: Jurriaan Mous <jurmous@jurmo.us>
+Date: Sat, 20 Dec 2014 15:07:54 +0100
+Subject: [PATCH] HBASE-12736
+
+---
+ .../hadoop/hbase/client/ConnectionManager.java     |  4 +-
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java |  4 +-
+ .../apache/hadoop/hbase/client/MetaScanner.java    | 52 ++++++-------
+ .../hadoop/hbase/client/TestClientNoCluster.java   |  6 +-
+ .../apache/hadoop/hbase/master/CatalogJanitor.java |  2 +-
+ .../org/apache/hadoop/hbase/master/HMaster.java    |  2 +-
+ .../org/apache/hadoop/hbase/util/HBaseFsck.java    |  4 +-
+ .../hadoop/hbase/client/TestMetaScanner.java       | 15 ++--
+ .../hadoop/hbase/master/TestRegionPlacement.java   |  9 ++-
+ .../hadoop/hbase/master/TestRestartCluster.java    |  9 ++-
+ .../regionserver/TestEndToEndSplitTransaction.java | 17 +++--
+ .../apache/hadoop/hbase/util/TestHBaseFsck.java    | 88 +++++++++++-----------
+ 12 files changed, 114 insertions(+), 98 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+index acb64c8..4770f63 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+@@ -918,7 +918,7 @@ class ConnectionManager {
+           return true;
+         }
+       };
+-      MetaScanner.metaScan(conf, this, visitor, tableName);
++      MetaScanner.metaScan(this, visitor, tableName);
+       return available.get() && (regionCount.get() > 0);
+     }
+ 
+@@ -963,7 +963,7 @@ class ConnectionManager {
+           return true;
+         }
+       };
+-      MetaScanner.metaScan(conf, this, visitor, tableName);
++      MetaScanner.metaScan(this, visitor, tableName);
+       // +1 needs to be added so that the empty start row is also taken into account
+       return available.get() && (regionCount.get() == splitKeys.length + 1);
+     }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index 0677606..5a9ca74 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -581,7 +581,7 @@ public class HBaseAdmin implements Admin {
+             return true;
+           }
+         };
+-        MetaScanner.metaScan(conf, connection, visitor, desc.getTableName());
++        MetaScanner.metaScan(connection, visitor, desc.getTableName());
+         if (actualRegCount.get() < numRegs) {
+           if (tries == this.numRetries * this.retryLongerMultiplier - 1) {
+             throw new RegionOfflineException("Only " + actualRegCount.get() +
+@@ -2257,7 +2257,7 @@ public class HBaseAdmin implements Admin {
+         }
+       };
+ 
+-      MetaScanner.metaScan(conf, connection, visitor, null);
++      MetaScanner.metaScan(connection, visitor, null);
+       pair = result.get();
+     }
+     return pair;
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java
+index e171f4a..bcb7834 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java
+@@ -63,32 +63,30 @@ public class MetaScanner {
+    * start row value as table name.
+    * 
+    * <p>Visible for testing. Use {@link
+-   * #metaScan(Configuration, Connection, MetaScannerVisitor, TableName)} instead.
++   * #metaScan(Connection, MetaScannerVisitor, TableName)} instead.
+    *
+-   * @param configuration conf
+    * @param visitor A custom visitor
+    * @throws IOException e
+    */
+   @VisibleForTesting // Do not use. Used by tests only and hbck.
+-  public static void metaScan(Configuration configuration, MetaScannerVisitor visitor)
+-  throws IOException {
+-    metaScan(configuration, visitor, null, null, Integer.MAX_VALUE);
++  public static void metaScan(Connection connection,
++      MetaScannerVisitor visitor) throws IOException {
++    metaScan(connection, visitor, null, null, Integer.MAX_VALUE);
+   }
+ 
+   /**
+    * Scans the meta table and calls a visitor on each RowResult. Uses a table
+    * name to locate meta regions.
+    *
+-   * @param configuration config
+    * @param connection connection to use internally (null to use a new instance)
+    * @param visitor visitor object
+    * @param userTableName User table name in meta table to start scan at.  Pass
+    * null if not interested in a particular table.
+    * @throws IOException e
+    */
+-  public static void metaScan(Configuration configuration, Connection connection,
++  public static void metaScan(Connection connection,
+       MetaScannerVisitor visitor, TableName userTableName) throws IOException {
+-    metaScan(configuration, connection, visitor, userTableName, null, Integer.MAX_VALUE,
++    metaScan(connection, visitor, userTableName, null, Integer.MAX_VALUE,
+         TableName.META_TABLE_NAME);
+   }
+ 
+@@ -98,9 +96,9 @@ public class MetaScanner {
+    * <code>rowLimit</code> of rows.
+    * 
+    * <p>Visible for testing. Use {@link
+-   * #metaScan(Configuration, Connection, MetaScannerVisitor, TableName)} instead.
++   * #metaScan(Connection, MetaScannerVisitor, TableName)} instead.
+    *
+-   * @param configuration HBase configuration.
++   * @param connection to scan on
+    * @param visitor Visitor object.
+    * @param userTableName User table name in meta table to start scan at.  Pass
+    * null if not interested in a particular table.
+@@ -111,11 +109,12 @@ public class MetaScanner {
+    * @throws IOException e
+    */
+   @VisibleForTesting // Do not use. Used by Master but by a method that is used testing.
+-  public static void metaScan(Configuration configuration,
++  public static void metaScan(Connection connection,
+       MetaScannerVisitor visitor, TableName userTableName, byte[] row,
+       int rowLimit)
+   throws IOException {
+-    metaScan(configuration, null, visitor, userTableName, row, rowLimit, TableName.META_TABLE_NAME);
++    metaScan(connection, visitor, userTableName, row, rowLimit, TableName
++        .META_TABLE_NAME);
+   }
+ 
+   /**
+@@ -123,7 +122,6 @@ public class MetaScanner {
+    * name and a row name to locate meta regions. And it only scans at most
+    * <code>rowLimit</code> of rows.
+    *
+-   * @param configuration HBase configuration.
+    * @param connection connection to use internally (null to use a new instance)
+    * @param visitor Visitor object. Closes the visitor before returning.
+    * @param tableName User table name in meta table to start scan at.  Pass
+@@ -135,17 +133,11 @@ public class MetaScanner {
+    * @param metaTableName Meta table to scan, root or meta.
+    * @throws IOException e
+    */
+-  static void metaScan(Configuration configuration, Connection connection,
++  static void metaScan(Connection connection,
+       final MetaScannerVisitor visitor, final TableName tableName,
+       final byte[] row, final int rowLimit, final TableName metaTableName)
+     throws IOException {
+ 
+-    boolean closeConnection = false;
+-    if (connection == null) {
+-      connection = ConnectionFactory.createConnection(configuration);
+-      closeConnection = true;
+-    }
+-
+     int rowUpperLimit = rowLimit > 0 ? rowLimit: Integer.MAX_VALUE;
+     // Calculate startrow for scan.
+     byte[] startRow;
+@@ -179,8 +171,9 @@ public class MetaScanner {
+           HConstants.ZEROES, false);
+       }
+       final Scan scan = new Scan(startRow).addFamily(HConstants.CATALOG_FAMILY);
+-      int scannerCaching = configuration.getInt(HConstants.HBASE_META_SCANNER_CACHING,
+-        HConstants.DEFAULT_HBASE_META_SCANNER_CACHING);
++      int scannerCaching = connection.getConfiguration()
++          .getInt(HConstants.HBASE_META_SCANNER_CACHING,
++              HConstants.DEFAULT_HBASE_META_SCANNER_CACHING);
+       if (rowUpperLimit <= scannerCaching) {
+           scan.setSmall(true);
+       }
+@@ -211,9 +204,6 @@ public class MetaScanner {
+           LOG.debug("Got exception in closing the meta scanner visitor", t);
+         }
+       }
+-      if (closeConnection) {
+-        if (connection != null) connection.close();
+-      }
+     }
+   }
+ 
+@@ -246,14 +236,16 @@ public class MetaScanner {
+ 
+   /**
+    * Lists all of the regions currently in META.
+-   * @param conf
++   * @param conf configuration
++   * @param connection to connect with
+    * @param offlined True if we are to include offlined regions, false and we'll
+    * leave out offlined regions from returned list.
+    * @return List of all user-space regions.
+    * @throws IOException
+    */
+   @VisibleForTesting // And for hbck.
+-  public static List<HRegionInfo> listAllRegions(Configuration conf, final boolean offlined)
++  public static List<HRegionInfo> listAllRegions(Configuration conf, Connection connection,
++      final boolean offlined)
+   throws IOException {
+     final List<HRegionInfo> regions = new ArrayList<HRegionInfo>();
+     MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+@@ -276,7 +268,7 @@ public class MetaScanner {
+           return true;
+         }
+     };
+-    metaScan(conf, visitor);
++    metaScan(connection, visitor);
+     return regions;
+   }
+ 
+@@ -321,7 +313,7 @@ public class MetaScanner {
+         return true;
+       }
+     };
+-    metaScan(conf, connection, visitor, tableName);
++    metaScan(connection, visitor, tableName);
+     return regions;
+   }
+ 
+@@ -340,7 +332,7 @@ public class MetaScanner {
+         return true;
+       }
+     };
+-    metaScan(conf, connection, visitor, tableName);
++    metaScan(connection, visitor, tableName);
+     return regions;
+   }
+ 
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
+index d855c74..da643fc 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
+@@ -170,7 +170,7 @@ public class TestClientNoCluster extends Configured implements Tool {
+    * @throws IOException
+    */
+   @Test
+-  public void testRocTimeout() throws IOException {
++  public void testRpcTimeout() throws IOException {
+     Configuration localConfig = HBaseConfiguration.create(this.conf);
+     // This override mocks up our exists/get call to throw a RegionServerStoppedException.
+     localConfig.set("hbase.client.connection.impl", RpcTimeoutConnection.class.getName());
+@@ -204,7 +204,9 @@ public class TestClientNoCluster extends Configured implements Tool {
+   public void testDoNotRetryMetaScanner() throws IOException {
+     this.conf.set("hbase.client.connection.impl",
+       RegionServerStoppedOnScannerOpenConnection.class.getName());
+-    MetaScanner.metaScan(this.conf, null);
++    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      MetaScanner.metaScan(connection, null);
++    }
+   }
+ 
+   @Test
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+index 25c405c..9f71b90 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+@@ -166,7 +166,7 @@ public class CatalogJanitor extends Chore {
+ 
+     // Run full scan of hbase:meta catalog table passing in our custom visitor with
+     // the start row
+-    MetaScanner.metaScan(server.getConfiguration(), this.connection, visitor, tableName);
++    MetaScanner.metaScan(this.connection, visitor, tableName);
+ 
+     return new Triple<Integer, Map<HRegionInfo, Result>, Map<HRegionInfo, Result>>(
+         count.get(), mergedRegions, splitParents);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index db61e95..0bb02f2 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -1627,7 +1627,7 @@ public class HMaster extends HRegionServer implements MasterServices, Server {
+         }
+     };
+ 
+-    MetaScanner.metaScan(conf, visitor, tableName, rowKey, 1);
++    MetaScanner.metaScan(clusterConnection, visitor, tableName, rowKey, 1);
+     return result.get();
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+index 7bae831..6176229 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+@@ -621,7 +621,7 @@ public class HBaseFsck extends Configured {
+   public void checkRegionBoundaries() {
+     try {
+       ByteArrayComparator comparator = new ByteArrayComparator();
+-      List<HRegionInfo> regions = MetaScanner.listAllRegions(getConf(), false);
++      List<HRegionInfo> regions = MetaScanner.listAllRegions(getConf(), connection, false);
+       final RegionBoundariesInformation currentRegionBoundariesInformation =
+           new RegionBoundariesInformation();
+       Path hbaseRoot = FSUtils.getRootDir(getConf());
+@@ -3077,7 +3077,7 @@ public class HBaseFsck extends Configured {
+     };
+     if (!checkMetaOnly) {
+       // Scan hbase:meta to pick up user regions
+-      MetaScanner.metaScan(getConf(), visitor);
++      MetaScanner.metaScan(connection, visitor);
+     }
+ 
+     errors.print("");
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java
+index 91028a9..21edae3 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java
+@@ -54,9 +54,11 @@ import org.junit.experimental.categories.Category;
+ public class TestMetaScanner {
+   final Log LOG = LogFactory.getLog(getClass());
+   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private Connection connection;
+ 
+   public void setUp() throws Exception {
+     TEST_UTIL.startMiniCluster(1);
++    this.connection = TEST_UTIL.getConnection();
+   }
+ 
+   @After
+@@ -67,6 +69,7 @@ public class TestMetaScanner {
+   @Test
+   public void testMetaScanner() throws Exception {
+     LOG.info("Starting testMetaScanner");
++
+     setUp();
+     final TableName TABLENAME =
+         TableName.valueOf("testMetaScanner");
+@@ -87,27 +90,27 @@ public class TestMetaScanner {
+     doReturn(true).when(visitor).processRow((Result)anyObject());
+ 
+     // Scanning the entire table should give us three rows
+-    MetaScanner.metaScan(conf, null, visitor, TABLENAME);
++    MetaScanner.metaScan(null, visitor, TABLENAME);
+     verify(visitor, times(3)).processRow((Result)anyObject());
+ 
+     // Scanning the table with a specified empty start row should also
+     // give us three hbase:meta rows
+     reset(visitor);
+     doReturn(true).when(visitor).processRow((Result)anyObject());
+-    MetaScanner.metaScan(conf, visitor, TABLENAME, HConstants.EMPTY_BYTE_ARRAY, 1000);
++    MetaScanner.metaScan(connection, visitor, TABLENAME, HConstants.EMPTY_BYTE_ARRAY, 1000);
+     verify(visitor, times(3)).processRow((Result)anyObject());
+ 
+     // Scanning the table starting in the middle should give us two rows:
+     // region_a and region_b
+     reset(visitor);
+     doReturn(true).when(visitor).processRow((Result)anyObject());
+-    MetaScanner.metaScan(conf, visitor, TABLENAME, Bytes.toBytes("region_ac"), 1000);
++    MetaScanner.metaScan(connection, visitor, TABLENAME, Bytes.toBytes("region_ac"), 1000);
+     verify(visitor, times(2)).processRow((Result)anyObject());
+ 
+     // Scanning with a limit of 1 should only give us one row
+     reset(visitor);
+     doReturn(true).when(visitor).processRow((Result)anyObject());
+-    MetaScanner.metaScan(conf, visitor, TABLENAME, Bytes.toBytes("region_ac"), 1);
++    MetaScanner.metaScan(connection, visitor, TABLENAME, Bytes.toBytes("region_ac"), 1);
+     verify(visitor, times(1)).processRow((Result)anyObject());
+     table.close();
+   }
+@@ -135,8 +138,8 @@ public class TestMetaScanner {
+       public void run() {
+         while (!isStopped()) {
+           try {
+-            List<HRegionInfo> regions = MetaScanner.listAllRegions(
+-              TEST_UTIL.getConfiguration(), false);
++            List<HRegionInfo> regions = MetaScanner.listAllRegions(TEST_UTIL.getConfiguration(),
++                connection, false);
+ 
+             //select a random region
+             HRegionInfo parent = regions.get(random.nextInt(regions.size()));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionPlacement.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionPlacement.java
+index 5da9d03..c552167 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionPlacement.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRegionPlacement.java
+@@ -47,6 +47,8 @@ import org.apache.hadoop.hbase.NamespaceDescriptor;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.MetaScanner;
+@@ -73,6 +75,7 @@ public class TestRegionPlacement {
+   final static Log LOG = LogFactory.getLog(TestRegionPlacement.class);
+   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+   private final static int SLAVES = 10;
++  private static Connection CONNECTION;
+   private static Admin admin;
+   private static RegionPlacementMaintainer rp;
+   private static Position[] positions = Position.values();
+@@ -89,6 +92,7 @@ public class TestRegionPlacement {
+         FavoredNodeLoadBalancer.class, LoadBalancer.class);
+     conf.setBoolean("hbase.tests.use.shortcircuit.reads", false);
+     TEST_UTIL.startMiniCluster(SLAVES);
++    CONNECTION = TEST_UTIL.getConnection();
+     admin = new HBaseAdmin(conf);
+     rp = new RegionPlacementMaintainer(conf);
+   }
+@@ -522,7 +526,7 @@ public class TestRegionPlacement {
+       @Override
+       public void close() throws IOException {}
+     };
+-    MetaScanner.metaScan(TEST_UTIL.getConfiguration(), visitor);
++    MetaScanner.metaScan(CONNECTION, visitor);
+     LOG.info("There are " + regionOnPrimaryNum.intValue() + " out of " +
+         totalRegionNum.intValue() + " regions running on the primary" +
+         " region servers" );
+@@ -549,8 +553,7 @@ public class TestRegionPlacement {
+     desc.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+     admin.createTable(desc, splitKeys);
+ 
+-    @SuppressWarnings("deprecation")
+-    HTable ht = new HTable(TEST_UTIL.getConfiguration(), tableName);
++    HTable ht = (HTable) CONNECTION.getTable(tableName);
+     @SuppressWarnings("deprecation")
+     Map<HRegionInfo, ServerName> regions = ht.getRegionLocations();
+     assertEquals("Tried to create " + expectedRegions + " regions "
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java
+index 5b6f985..ad22fe9 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java
+@@ -35,6 +35,8 @@ import org.apache.hadoop.hbase.MiniHBaseCluster;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableExistsException;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.MetaScanner;
+ import org.apache.hadoop.hbase.testclassification.LargeTests;
+ import org.apache.hadoop.hbase.testclassification.MasterTests;
+@@ -64,6 +66,8 @@ public class TestRestartCluster {
+   @Test (timeout=300000)
+   public void testClusterRestart() throws Exception {
+     UTIL.startMiniCluster(3);
++    Connection connection = UTIL.getConnection();
++
+     while (!UTIL.getMiniHBaseCluster().getMaster().isInitialized()) {
+       Threads.sleep(1);
+     }
+@@ -76,7 +80,7 @@ public class TestRestartCluster {
+     }
+ 
+     List<HRegionInfo> allRegions =
+-      MetaScanner.listAllRegions(UTIL.getConfiguration(), true);
++        MetaScanner.listAllRegions(UTIL.getConfiguration(), connection, true);
+     assertEquals(4, allRegions.size());
+ 
+     LOG.info("\n\nShutting down cluster");
+@@ -91,7 +95,8 @@ public class TestRestartCluster {
+     // Need to use a new 'Configuration' so we make a new HConnection.
+     // Otherwise we're reusing an HConnection that has gone stale because
+     // the shutdown of the cluster also called shut of the connection.
+-    allRegions = MetaScanner.listAllRegions(new Configuration(UTIL.getConfiguration()), true);
++    allRegions =
++        MetaScanner.listAllRegions(new Configuration(UTIL.getConfiguration()), connection, true);
+     assertEquals(4, allRegions.size());
+     LOG.info("\n\nWaiting for tables to be available");
+     for(TableName TABLE: TABLES) {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+index 962b408..12ae12e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+@@ -42,6 +42,8 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.Stoppable;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Get;
+ import org.apache.hadoop.hbase.client.HConnection;
+ import org.apache.hadoop.hbase.client.HConnectionManager;
+@@ -216,6 +218,7 @@ public class TestEndToEndSplitTransaction {
+   }
+ 
+   static class RegionSplitter extends Thread {
++    final Connection connection;
+     Throwable ex;
+     Table table;
+     TableName tableName;
+@@ -229,6 +232,7 @@ public class TestEndToEndSplitTransaction {
+       this.family = table.getTableDescriptor().getFamiliesKeys().iterator().next();
+       admin = TEST_UTIL.getHBaseAdmin();
+       rs = TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
++      connection = TEST_UTIL.getConnection();
+     }
+ 
+     @Override
+@@ -236,8 +240,8 @@ public class TestEndToEndSplitTransaction {
+       try {
+         Random random = new Random();
+         for (int i= 0; i< 5; i++) {
+-          NavigableMap<HRegionInfo, ServerName> regions = MetaScanner.allTableRegions(conf, null,
+-              tableName);
++          NavigableMap<HRegionInfo, ServerName> regions =
++              MetaScanner.allTableRegions(conf, connection, tableName);
+           if (regions.size() == 0) {
+             continue;
+           }
+@@ -294,27 +298,30 @@ public class TestEndToEndSplitTransaction {
+    * Checks regions using MetaScanner, MetaTableAccessor and HTable methods
+    */
+   static class RegionChecker extends Chore {
++    Connection connection;
+     Configuration conf;
+     TableName tableName;
+     Throwable ex;
+ 
+-    RegionChecker(Configuration conf, Stoppable stopper, TableName tableName) {
++    RegionChecker(Configuration conf, Stoppable stopper, TableName tableName) throws IOException {
+       super("RegionChecker", 10, stopper);
+       this.conf = conf;
+       this.tableName = tableName;
+       this.setDaemon(true);
++
++      this.connection = ConnectionFactory.createConnection(conf);
+     }
+ 
+     /** verify region boundaries obtained from MetaScanner */
+     void verifyRegionsUsingMetaScanner() throws Exception {
+ 
+       //MetaScanner.allTableRegions()
+-      NavigableMap<HRegionInfo, ServerName> regions = MetaScanner.allTableRegions(conf, null,
++      NavigableMap<HRegionInfo, ServerName> regions = MetaScanner.allTableRegions(conf, connection,
+           tableName);
+       verifyTableRegions(regions.keySet());
+ 
+       //MetaScanner.listAllRegions()
+-      List<HRegionInfo> regionList = MetaScanner.listAllRegions(conf, false);
++      List<HRegionInfo> regionList = MetaScanner.listAllRegions(conf, connection, false);
+       verifyTableRegions(Sets.newTreeSet(regionList));
+     }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+index 30600c2..d833e85 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+@@ -70,6 +70,7 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.MetaTableAccessor;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.ClusterConnection;
+ import org.apache.hadoop.hbase.client.Connection;
+ import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Delete;
+@@ -311,7 +312,7 @@ public class TestHBaseFsck {
+     dumpMeta(htd.getTableName());
+ 
+     Map<HRegionInfo, ServerName> hris = tbl.getRegionLocations();
+-    HConnection conn = (HConnection) ConnectionFactory.createConnection(conf);
++    ClusterConnection conn = (ClusterConnection) ConnectionFactory.createConnection(conf);
+     for (Entry<HRegionInfo, ServerName> e: hris.entrySet()) {
+       HRegionInfo hri = e.getKey();
+       ServerName hsa = e.getValue();
+@@ -2180,50 +2181,53 @@ public class TestHBaseFsck {
+    */
+   @Test (timeout=180000)
+   public void testMissingRegionInfoQualifier() throws Exception {
+-    TableName table =
+-        TableName.valueOf("testMissingRegionInfoQualifier");
+-    try {
+-      setupTable(table);
+-
+-      // Mess it up by removing the RegionInfo for one region.
+-      final List<Delete> deletes = new LinkedList<Delete>();
+-      Table meta = new HTable(conf, TableName.META_TABLE_NAME);
+-      MetaScanner.metaScan(conf, new MetaScanner.MetaScannerVisitor() {
+-
+-        @Override
+-        public boolean processRow(Result rowResult) throws IOException {
+-          HRegionInfo hri = MetaScanner.getHRegionInfo(rowResult);
+-          if (hri != null && !hri.getTable().isSystemTable()) {
+-            Delete delete = new Delete(rowResult.getRow());
+-            delete.deleteColumn(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER);
+-            deletes.add(delete);
+-          }
+-          return true;
+-        }
+-
+-        @Override
+-        public void close() throws IOException {
+-        }
+-      });
+-      meta.delete(deletes);
+-
+-      // Mess it up by creating a fake hbase:meta entry with no associated RegionInfo
+-      meta.put(new Put(Bytes.toBytes(table + ",,1361911384013.810e28f59a57da91c66")).add(
+-        HConstants.CATALOG_FAMILY, HConstants.SERVER_QUALIFIER, Bytes.toBytes("node1:60020")));
+-      meta.put(new Put(Bytes.toBytes(table + ",,1361911384013.810e28f59a57da91c66")).add(
+-        HConstants.CATALOG_FAMILY, HConstants.STARTCODE_QUALIFIER, Bytes.toBytes(1362150791183L)));
+-      meta.close();
++    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      TableName table = TableName.valueOf("testMissingRegionInfoQualifier");
++      try {
++        setupTable(table);
+ 
+-      HBaseFsck hbck = doFsck(conf, false);
+-      assertTrue(hbck.getErrors().getErrorList().contains(ERROR_CODE.EMPTY_META_CELL));
++        // Mess it up by removing the RegionInfo for one region.
++        final List<Delete> deletes = new LinkedList<Delete>();
++        Table meta = connection.getTable(TableName.META_TABLE_NAME);
++        MetaScanner.metaScan(connection, new MetaScanner.MetaScannerVisitor() {
+ 
+-      // fix reference file
+-      hbck = doFsck(conf, true);
++          @Override
++          public boolean processRow(Result rowResult) throws IOException {
++            HRegionInfo hri = MetaScanner.getHRegionInfo(rowResult);
++            if (hri != null && !hri.getTable().isSystemTable()) {
++              Delete delete = new Delete(rowResult.getRow());
++              delete.deleteColumn(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER);
++              deletes.add(delete);
++            }
++            return true;
++          }
+ 
+-      // check that reference file fixed
+-      assertFalse(hbck.getErrors().getErrorList().contains(ERROR_CODE.EMPTY_META_CELL));
+-    } finally {
+-      deleteTable(table);
++          @Override
++          public void close() throws IOException {
++          }
++        });
++        meta.delete(deletes);
++
++        // Mess it up by creating a fake hbase:meta entry with no associated RegionInfo
++        meta.put(new Put(Bytes.toBytes(table + ",,1361911384013.810e28f59a57da91c66"))
++            .add(HConstants.CATALOG_FAMILY, HConstants.SERVER_QUALIFIER,
++                Bytes.toBytes("node1:60020")));
++        meta.put(new Put(Bytes.toBytes(table + ",,1361911384013.810e28f59a57da91c66"))
++            .add(HConstants.CATALOG_FAMILY, HConstants.STARTCODE_QUALIFIER,
++                Bytes.toBytes(1362150791183L)));
++        meta.close();
++
++        HBaseFsck hbck = doFsck(conf, false);
++        assertTrue(hbck.getErrors().getErrorList().contains(ERROR_CODE.EMPTY_META_CELL));
++
++        // fix reference file
++        hbck = doFsck(conf, true);
++
++        // check that reference file fixed
++        assertFalse(hbck.getErrors().getErrorList().contains(ERROR_CODE.EMPTY_META_CELL));
++      } finally {
++        deleteTable(table);
++      }
+     }
+   }
+ 
+-- 
+1.9.3 (Apple Git-50)
+

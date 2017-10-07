@@ -1,0 +1,238 @@
+From 4d470b25d1ff15ef45080a1b8c081e66ff201314 Mon Sep 17 00:00:00 2001
+From: pengyuanbo <932333121@qq.com>
+Date: Wed, 17 Dec 2014 21:40:15 +0800
+Subject: [PATCH 1/2] HBASE-12223 MultiTableInputFormatBase.getSplits is too
+ slow
+
+---
+ .../hbase/mapreduce/MultiTableInputFormatBase.java | 103 +++++++++++++--------
+ 1 file changed, 62 insertions(+), 41 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
+index 5c253cb..dccd22c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
+@@ -46,6 +46,9 @@ import org.apache.hadoop.mapreduce.JobContext;
+ import org.apache.hadoop.mapreduce.RecordReader;
+ import org.apache.hadoop.mapreduce.TaskAttemptContext;
+ 
++import java.util.Map;
++import java.util.HashMap;
++import java.util.Iterator;
+ /**
+  * A base for {@link MultiTableInputFormat}s. Receives a list of
+  * {@link Scan} instances that define the input tables and
+@@ -129,67 +132,83 @@ public abstract class MultiTableInputFormatBase extends
+     if (scans.isEmpty()) {
+       throw new IOException("No scans were provided.");
+     }
+-    List<InputSplit> splits = new ArrayList<InputSplit>();
+ 
++    Map<String, List<Scan>> tableMaps = new HashMap<String, List<Scan>>();
+     for (Scan scan : scans) {
+       byte[] tableNameBytes = scan.getAttribute(Scan.SCAN_ATTRIBUTES_TABLE_NAME);
+       if (tableNameBytes == null)
+         throw new IOException("A scan object did not have a table name");
+ 
+-      TableName tableName = TableName.valueOf(tableNameBytes);
++      String tableNameStr = Bytes.toString(tableNameBytes);
++      if (!tableMaps.containsKey(tableNameStr)) {
++        List<Scan> scanList = new ArrayList<Scan>();
++        tableMaps.put(tableNameStr, scanList);
++      }
++
++      tableMaps.get(tableNameStr).add(scan);
++    }
++
++    List<InputSplit> splits = new ArrayList<InputSplit>();
++    Iterator iter = tableMaps.entrySet().iterator();
++    while (iter.hasNext()) {
++      Map.Entry<String, List<Scan>> entry = (Map.Entry<String, List<Scan>>) iter.next();
++      String tableNameStr = entry.getKey();
++      List<Scan> scanList = entry.getValue();
++      TableName tableName = TableName.valueOf(Bytes.toBytes(tableNameStr));
+       Table table = null;
+       RegionLocator regionLocator = null;
+       Connection conn = null;
+-      try {
++
++      try{
+         conn = ConnectionFactory.createConnection(context.getConfiguration());
+         table = conn.getTable(tableName);
+         regionLocator = conn.getRegionLocator(tableName);
+         regionLocator = (RegionLocator) table;
++        RegionSizeCalculator sizeCalculator = new RegionSizeCalculator(
++                regionLocator, conn.getAdmin());
+         Pair<byte[][], byte[][]> keys = regionLocator.getStartEndKeys();
+-        if (keys == null || keys.getFirst() == null ||
+-            keys.getFirst().length == 0) {
+-          throw new IOException("Expecting at least one region for table : "
+-              + tableName.getNameAsString());
+-        }
+-        int count = 0;
++        for (Scan scan : scanList) {
++          if (keys == null || keys.getFirst() == null || keys.getFirst().length == 0) {
++            throw new IOException("Expecting at least one region for table : "
++                    + tableNameStr);
++          }
++          int count = 0;
+ 
+-        byte[] startRow = scan.getStartRow();
+-        byte[] stopRow = scan.getStopRow();
++          byte[] startRow = scan.getStartRow();
++          byte[] stopRow = scan.getStopRow();
+ 
+-        RegionSizeCalculator sizeCalculator = new RegionSizeCalculator(
+-            regionLocator, conn.getAdmin());
++          for (int i = 0; i < keys.getFirst().length; i++) {
++            if (!includeRegionInSplit(keys.getFirst()[i], keys.getSecond()[i])) {
++              continue;
++            }
+ 
+-        for (int i = 0; i < keys.getFirst().length; i++) {
+-          if (!includeRegionInSplit(keys.getFirst()[i], keys.getSecond()[i])) {
+-            continue;
+-          }
+-          HRegionLocation hregionLocation = regionLocator.getRegionLocation(
+-              keys.getFirst()[i], false);
+-          String regionHostname = hregionLocation.getHostname();
+-          HRegionInfo regionInfo = hregionLocation.getRegionInfo();
++            if ((startRow.length == 0 || keys.getSecond()[i].length == 0 ||
++                    Bytes.compareTo(startRow, keys.getSecond()[i]) < 0) &&
++                    (stopRow.length == 0 || Bytes.compareTo(stopRow,
++                            keys.getFirst()[i]) > 0)) {
++              byte[] splitStart = startRow.length == 0 ||
++                      Bytes.compareTo(keys.getFirst()[i], startRow) >= 0 ?
++                      keys.getFirst()[i] : startRow;
++              byte[] splitStop = (stopRow.length == 0 ||
++                      Bytes.compareTo(keys.getSecond()[i], stopRow) <= 0) &&
++                      keys.getSecond()[i].length > 0 ?
++                      keys.getSecond()[i] : stopRow;
+ 
+-          // determine if the given start and stop keys fall into the range
+-          if ((startRow.length == 0 || keys.getSecond()[i].length == 0 ||
+-              Bytes.compareTo(startRow, keys.getSecond()[i]) < 0) &&
+-              (stopRow.length == 0 ||
+-                  Bytes.compareTo(stopRow, keys.getFirst()[i]) > 0)) {
+-            byte[] splitStart =
+-                startRow.length == 0 ||
+-                    Bytes.compareTo(keys.getFirst()[i], startRow) >= 0 ? keys
+-                    .getFirst()[i] : startRow;
+-            byte[] splitStop =
+-                (stopRow.length == 0 || Bytes.compareTo(keys.getSecond()[i],
+-                    stopRow) <= 0) && keys.getSecond()[i].length > 0 ? keys
+-                    .getSecond()[i] : stopRow;
++              HRegionLocation hregionLocation = regionLocator.getRegionLocation(
++                      keys.getFirst()[i], false);
++              String regionHostname = hregionLocation.getHostname();
++              HRegionInfo regionInfo = hregionLocation.getRegionInfo();
++              long regionSize = sizeCalculator.getRegionSize(
++                      regionInfo.getRegionName());
+ 
+-            long regionSize = sizeCalculator.getRegionSize(regionInfo.getRegionName());
+-            TableSplit split =
+-                new TableSplit(regionLocator.getName(),
+-                    scan, splitStart, splitStop, regionHostname, regionSize);
++              TableSplit split = new TableSplit(table.getName(),
++                      scan, splitStart, splitStop, regionHostname, regionSize);
+ 
+-            splits.add(split);
+-            if (LOG.isDebugEnabled())
+-              LOG.debug("getSplits: split -> " + (count++) + " -> " + split);
++              splits.add(split);
++
++              if (LOG.isDebugEnabled())
++                LOG.debug("getSplits: split -> " + (count++) + " -> " + split);
++            }
+           }
+         }
+       } finally {
+@@ -198,9 +217,11 @@ public abstract class MultiTableInputFormatBase extends
+         if (null != conn) conn.close();
+       }
+     }
++
+     return splits;
+   }
+ 
++
+   /**
+    * Test if the given region is to be included in the InputSplit while
+    * splitting the regions of a table.
+-- 
+1.8.5.2 (Apple Git-48)
+
+
+From 3ccf76dc1dc624e5c0cb95778079af283b5fb69a Mon Sep 17 00:00:00 2001
+From: pengyuanbo <932333121@qq.com>
+Date: Thu, 18 Dec 2014 10:32:30 +0800
+Subject: [PATCH 2/2] HBASE-12223 MultiTableInputFormatBase.getSplits is too
+ slow
+
+---
+ .../hbase/mapreduce/MultiTableInputFormatBase.java | 23 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 12 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
+index dccd22c..d55d81c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableInputFormatBase.java
+@@ -133,28 +133,28 @@ public abstract class MultiTableInputFormatBase extends
+       throw new IOException("No scans were provided.");
+     }
+ 
+-    Map<String, List<Scan>> tableMaps = new HashMap<String, List<Scan>>();
++    Map<TableName, List<Scan>> tableMaps = new HashMap<TableName, List<Scan>>();
+     for (Scan scan : scans) {
+       byte[] tableNameBytes = scan.getAttribute(Scan.SCAN_ATTRIBUTES_TABLE_NAME);
+       if (tableNameBytes == null)
+         throw new IOException("A scan object did not have a table name");
+ 
+-      String tableNameStr = Bytes.toString(tableNameBytes);
+-      if (!tableMaps.containsKey(tableNameStr)) {
+-        List<Scan> scanList = new ArrayList<Scan>();
+-        tableMaps.put(tableNameStr, scanList);
+-      }
++      TableName tableName = TableName.valueOf(tableNameBytes);
+ 
+-      tableMaps.get(tableNameStr).add(scan);
++      List<Scan> scanList = tableMaps.get(tableName);
++      if (scanList == null) {
++        scanList = new ArrayList<Scan>();
++        tableMaps.put(tableName, scanList);
++      }
++      scanList.add(scan);
+     }
+ 
+     List<InputSplit> splits = new ArrayList<InputSplit>();
+     Iterator iter = tableMaps.entrySet().iterator();
+     while (iter.hasNext()) {
+-      Map.Entry<String, List<Scan>> entry = (Map.Entry<String, List<Scan>>) iter.next();
+-      String tableNameStr = entry.getKey();
++      Map.Entry<TableName, List<Scan>> entry = (Map.Entry<TableName, List<Scan>>) iter.next();
++      TableName tableName = entry.getKey();
+       List<Scan> scanList = entry.getValue();
+-      TableName tableName = TableName.valueOf(Bytes.toBytes(tableNameStr));
+       Table table = null;
+       RegionLocator regionLocator = null;
+       Connection conn = null;
+@@ -162,7 +162,6 @@ public abstract class MultiTableInputFormatBase extends
+       try{
+         conn = ConnectionFactory.createConnection(context.getConfiguration());
+         table = conn.getTable(tableName);
+-        regionLocator = conn.getRegionLocator(tableName);
+         regionLocator = (RegionLocator) table;
+         RegionSizeCalculator sizeCalculator = new RegionSizeCalculator(
+                 regionLocator, conn.getAdmin());
+@@ -170,7 +169,7 @@ public abstract class MultiTableInputFormatBase extends
+         for (Scan scan : scanList) {
+           if (keys == null || keys.getFirst() == null || keys.getFirst().length == 0) {
+             throw new IOException("Expecting at least one region for table : "
+-                    + tableNameStr);
++                    + tableName.getNameAsString());
+           }
+           int count = 0;
+ 
+-- 
+1.8.5.2 (Apple Git-48)
+

@@ -1,0 +1,2009 @@
+From 384479ea4d8501a2aed9047c218485250dcb5311 Mon Sep 17 00:00:00 2001
+From: Jurriaan Mous <jurmous@jurmo.us>
+Date: Sun, 14 Dec 2014 12:08:33 +0100
+Subject: [PATCH] HBASE-12684 Add new AsyncRpcClient
+
+---
+ .../apache/hadoop/hbase/ipc/AbstractRpcClient.java |   9 +-
+ .../org/apache/hadoop/hbase/ipc/AsyncCall.java     | 135 +++++
+ .../hadoop/hbase/ipc/AsyncResponseHandler.java     |  44 ++
+ .../apache/hadoop/hbase/ipc/AsyncRpcChannel.java   | 666 +++++++++++++++++++++
+ .../apache/hadoop/hbase/ipc/AsyncRpcClient.java    | 316 ++++++++++
+ .../hbase/ipc/AsyncServerResponseHandler.java      | 139 +++++
+ .../apache/hadoop/hbase/ipc/RpcClientFactory.java  |   3 +-
+ .../org/apache/hadoop/hbase/ipc/RpcClientImpl.java |  22 +-
+ .../hadoop/hbase/security/SaslClientHandler.java   | 332 ++++++++++
+ .../java/org/apache/hadoop/hbase/ipc/TestIPC.java  | 140 ++++-
+ 10 files changed, 1770 insertions(+), 36 deletions(-)
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncCall.java
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncResponseHandler.java
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcChannel.java
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcClient.java
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncServerResponseHandler.java
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/security/SaslClientHandler.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AbstractRpcClient.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AbstractRpcClient.java
+index df43f6f..f31eca1 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AbstractRpcClient.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AbstractRpcClient.java
+@@ -187,7 +187,6 @@ public abstract class AbstractRpcClient implements RpcClient {
+     return config.getInt(HConstants.HBASE_CLIENT_IPC_POOL_SIZE, 1);
+   }
+ 
+-
+   /**
+    * Make a blocking call. Throws exceptions if there are network problems or if the remote code
+    * threw an exception.
+@@ -204,16 +203,12 @@ public abstract class AbstractRpcClient implements RpcClient {
+       startTime = EnvironmentEdgeManager.currentTime();
+     }
+     int callTimeout = 0;
+-    CellScanner cells = null;
+     if (pcrc != null) {
+       callTimeout = pcrc.getCallTimeout();
+-      cells = pcrc.cellScanner();
+-      // Clear it here so we don't by mistake try and these cells processing results.
+-      pcrc.setCellScanner(null);
+     }
+     Pair<Message, CellScanner> val;
+     try {
+-      val = call(pcrc, md, param, cells, returnType, ticket, isa, callTimeout,
++      val = call(pcrc, md, param, returnType, ticket, isa, callTimeout,
+           pcrc != null? pcrc.getPriority(): HConstants.NORMAL_QOS);
+       if (pcrc != null) {
+         // Shove the results into controller so can be carried across the proxy/pb service void.
+@@ -246,7 +241,7 @@ public abstract class AbstractRpcClient implements RpcClient {
+    * @throws java.io.IOException
+    */
+   protected abstract Pair<Message, CellScanner> call(PayloadCarryingRpcController pcrc,
+-      Descriptors.MethodDescriptor md, Message param, CellScanner cells,
++      Descriptors.MethodDescriptor md, Message param,
+       Message returnType, User ticket, InetSocketAddress addr, int callTimeout, int priority) throws
+       IOException, InterruptedException;
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncCall.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncCall.java
+new file mode 100644
+index 0000000..bab14f6
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncCall.java
+@@ -0,0 +1,135 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import com.google.protobuf.Descriptors;
++import com.google.protobuf.Message;
++import com.google.protobuf.RpcCallback;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.util.ExceptionUtil;
++import org.apache.hadoop.ipc.RemoteException;
++
++import java.io.IOException;
++
++/**
++ * Handles HBase responses
++ */
++@InterfaceAudience.Private
++public class AsyncCall {
++  public static final Log LOG = LogFactory.getLog(AsyncCall.class.getName());
++
++  final int id;
++
++  final Descriptors.MethodDescriptor method;
++  final Message param;
++  final PayloadCarryingRpcController controller;
++  final Message responseDefaultType;
++  final long startTime;
++  private final RpcCallback<Message> doneHandler;
++  private long rpcTimeout;
++
++  /**
++   * Constructor
++   *
++   * @param connectId           connection id
++   * @param md                  the method descriptor
++   * @param param               parameters to send to Server
++   * @param controller          controller for response
++   * @param responseDefaultType the default response type
++   * @param doneHandler         done handler
++   */
++  public AsyncCall(int connectId, Descriptors.MethodDescriptor md, Message param,
++      PayloadCarryingRpcController controller, Message responseDefaultType,
++      RpcCallback<Message> doneHandler) {
++
++    this.id = connectId;
++
++    this.method = md;
++    this.param = param;
++    this.controller = controller;
++    this.responseDefaultType = responseDefaultType;
++
++    this.startTime = System.currentTimeMillis();
++
++    this.doneHandler = doneHandler;
++  }
++
++  /**
++   * Get the start time
++   *
++   * @return start time for the call
++   */
++  public long getStartTime() {
++    return this.startTime;
++  }
++
++  @Override public String toString() {
++    return "callId: " + this.id + " methodName: " + this.method.getName() + " param {" +
++        (this.param != null ? ProtobufUtil.getShortTextFormat(this.param) : "") + "}";
++  }
++
++  /**
++   * Set success with a cellBlockScanner
++   *
++   * @param value            to set
++   * @param cellBlockScanner to set
++   */
++  public void setSuccess(Message value, CellScanner cellBlockScanner) {
++    if (cellBlockScanner != null) {
++      controller.setCellScanner(cellBlockScanner);
++    }
++
++    if (LOG.isTraceEnabled()) {
++      long callTime = System.currentTimeMillis() - startTime;
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("Call: " + method.getName() + ", callTime: " + callTime + "ms");
++      }
++    }
++
++    doneHandler.run(value);
++  }
++
++  /**
++   * Set failed
++   *
++   * @param exception to set
++   */
++  public void setFailed(IOException exception) {
++    if (ExceptionUtil.isInterrupt(exception)) {
++      exception = ExceptionUtil.asInterrupt(exception);
++    }
++    if (exception instanceof RemoteException) {
++      exception = ((RemoteException) exception).unwrapRemoteException();
++    }
++
++    controller.setFailed(exception);
++  }
++
++  /**
++   * Get the rpc timeout
++   *
++   * @return current timeout for this call
++   */
++  public long getRpcTimeout() {
++    return rpcTimeout;
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncResponseHandler.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncResponseHandler.java
+new file mode 100644
+index 0000000..6eecae5
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncResponseHandler.java
+@@ -0,0 +1,44 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++import java.io.IOException;
++
++/**
++ * Interface for async responses
++ *
++ * @param <T> Type of response
++ */
++@InterfaceAudience.Private
++public interface AsyncResponseHandler<T> {
++  /**
++   * Encountered success
++   *
++   * @param response on success
++   */
++  public void onSuccess(T response);
++
++  /**
++   * Encountered failure
++   *
++   * @param e describing error
++   */
++  public void onFailure(IOException e);
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcChannel.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcChannel.java
+new file mode 100644
+index 0000000..f9062bb
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcChannel.java
+@@ -0,0 +1,666 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import com.google.protobuf.Descriptors;
++import com.google.protobuf.Message;
++import com.google.protobuf.RpcCallback;
++import com.google.protobuf.RpcChannel;
++import com.google.protobuf.RpcController;
++import io.netty.bootstrap.Bootstrap;
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufOutputStream;
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelFuture;
++import io.netty.channel.ChannelFutureListener;
++import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
++import io.netty.util.Timeout;
++import io.netty.util.TimerTask;
++import io.netty.util.concurrent.GenericFutureListener;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.protobuf.generated.AuthenticationProtos;
++import org.apache.hadoop.hbase.protobuf.generated.RPCProtos;
++import org.apache.hadoop.hbase.protobuf.generated.TracingProtos;
++import org.apache.hadoop.hbase.security.AuthMethod;
++import org.apache.hadoop.hbase.security.SaslClientHandler;
++import org.apache.hadoop.hbase.security.SaslUtil;
++import org.apache.hadoop.hbase.security.SecurityInfo;
++import org.apache.hadoop.hbase.security.token.AuthenticationTokenSelector;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
++import org.apache.hadoop.security.token.TokenSelector;
++import org.htrace.Span;
++import org.htrace.Trace;
++
++import javax.security.sasl.SaslException;
++import java.io.IOException;
++import java.net.SocketException;
++import java.nio.ByteBuffer;
++import java.security.PrivilegedExceptionAction;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Random;
++import java.util.concurrent.ConcurrentSkipListMap;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Netty RPC channel
++ */
++@InterfaceAudience.Private
++public class AsyncRpcChannel implements RpcChannel {
++  public static final Log LOG = LogFactory.getLog(AsyncRpcChannel.class.getName());
++
++  private static final byte[] MAGIC = new byte[] { 'H', 'B', 'a', 's' };
++  private static final int MAX_SASL_RETRIES = 5;
++
++  final AsyncRpcClient client;
++
++  // Contains the channel to work with.
++  // Only exists when connected
++  private Channel channel;
++  // Future connection
++  // Exists when in state of connecting
++  private ChannelFuture connectFuture;
++
++  String name;
++  final ConnectionId remoteId;
++  ConcurrentSkipListMap<Integer, AsyncCall> calls = new ConcurrentSkipListMap<>();
++
++  int rpcTimeout;
++  private int ioFailureCounter = 0;
++  private int connectFailureCounter = 0;
++
++  boolean useSasl;
++  AuthMethod authMethod;
++  private int reloginMaxBackoff;
++  private Token<? extends TokenIdentifier> token;
++  private String serverPrincipal;
++
++  protected final static Map<AuthenticationProtos.TokenIdentifier.Kind, TokenSelector<? extends
++      TokenIdentifier>> tokenHandlers = new HashMap<>();
++
++  static {
++    tokenHandlers.put(AuthenticationProtos.TokenIdentifier.Kind.HBASE_AUTH_TOKEN,
++        new AuthenticationTokenSelector());
++  }
++
++  public boolean shouldCloseConnection = false;
++  private Throwable closeException;
++
++  private Timeout cleanupTimer;
++
++  /**
++   * Constructor for netty RPC channel
++   *
++   * @param bootstrap to construct channel on
++   * @param client    to connect with
++   * @param remoteId  connection id
++   */
++  public AsyncRpcChannel(Bootstrap bootstrap, final AsyncRpcClient client, ConnectionId remoteId) {
++    this.remoteId = remoteId;
++    this.client = client;
++
++    this.name = ("IPC Client connection to " +
++        remoteId.getAddress().toString() +
++        ((remoteId.getTicket() == null) ?
++            " from an unknown user" :
++            (" from " + remoteId.getTicket().getName())));
++
++    connect(bootstrap);
++  }
++
++  /**
++   * Connect to channel
++   *
++   * @param bootstrap to connect to
++   */
++  private void connect(final Bootstrap bootstrap) {
++    if (client.failedServers.isFailedServer(remoteId.getAddress())) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Not trying to connect to " + remoteId.address +
++            " this server is in the failed servers list");
++      }
++      FailedServerException e = new FailedServerException(
++          "This server is in the failed servers list: " + remoteId.address);
++      close(e);
++      return;
++    }
++
++    this.connectFuture = bootstrap.remoteAddress(remoteId.address).connect()
++        .addListener(new GenericFutureListener<ChannelFuture>() {
++          @Override public void operationComplete(final ChannelFuture f) throws Exception {
++            if (!f.isSuccess()) {
++              if (closeException instanceof SocketException) {
++                retryOrClose(bootstrap, connectFailureCounter++, closeException);
++              } else {
++                retryOrClose(bootstrap, ioFailureCounter++, closeException);
++              }
++              return;
++            }
++
++            setupAuthorization();
++
++            ByteBuf b = f.channel().alloc().buffer(6);
++            createPreamble(b, authMethod);
++            f.channel().writeAndFlush(b).addListener(new ChannelFutureListener() {
++              @Override public void operationComplete(ChannelFuture future) throws Exception {
++                if (!future.isSuccess()) {
++                  close(future.cause());
++                }
++              }
++            });
++            if (useSasl) {
++              UserGroupInformation ticket = AsyncRpcChannel.this.remoteId.getTicket().getUGI();
++              if (authMethod == AuthMethod.KERBEROS) {
++                if (ticket != null && ticket.getRealUser() != null) {
++                  ticket = ticket.getRealUser();
++                }
++              }
++              SaslClientHandler saslHandler;
++              if (ticket == null) {
++                throw new FatalConnectionException("ticket/user is null");
++              }
++              saslHandler = ticket.doAs(new PrivilegedExceptionAction<SaslClientHandler>() {
++                @Override public SaslClientHandler run() throws IOException {
++                  return getSaslHandler(bootstrap);
++                }
++              });
++              if (saslHandler != null) {
++                // Sasl connect is successful. Let's set up Sasl channel handler
++                f.channel().pipeline().addFirst(saslHandler);
++              } else {
++                // fall back to simple auth because server told us so.
++                authMethod = AuthMethod.SIMPLE;
++                useSasl = false;
++              }
++            } else {
++              startHbaseConnection(f.channel());
++            }
++          }
++        });
++  }
++
++  /**
++   * Start HBase connection
++   *
++   * @param ch channel to start connection on
++   */
++  private void startHbaseConnection(Channel ch) {
++    ch.pipeline().addLast("frameDecoder", new LengthFieldBasedFrameDecoder(1048576, 0, 4, 0, 4));
++    ch.pipeline().addLast(new AsyncServerResponseHandler(this));
++
++    try {
++      writeChannelHeader(ch).addListener(new GenericFutureListener<ChannelFuture>() {
++        @Override public void operationComplete(ChannelFuture future) throws Exception {
++          connectFuture = null;
++          channel = future.channel();
++          sendRequestsAfterConnect(channel);
++
++          name = ("IPC Client (" + channel.hashCode() + ") connection to " +
++              AsyncRpcChannel.this.remoteId.getAddress().toString() +
++              ((AsyncRpcChannel.this.remoteId.ticket == null) ?
++                  " from an unknown user" :
++                  (" from " + AsyncRpcChannel.this.remoteId.ticket.getName())));
++        }
++      });
++    } catch (IOException e) {
++      close(e);
++    }
++  }
++
++  /**
++   * Get SASL handler
++   *
++   * @param bootstrap to reconnect to
++   * @return new SASL handler
++   * @throws java.io.IOException if handler failed to create
++   */
++  private SaslClientHandler getSaslHandler(final Bootstrap bootstrap) throws IOException {
++    return new SaslClientHandler(authMethod, token, serverPrincipal, client.fallbackAllowed,
++        client.conf.get("hbase.rpc.protection",
++            SaslUtil.QualityOfProtection.AUTHENTICATION.name().toLowerCase()),
++        new SaslClientHandler.SaslExceptionHandler() {
++          @Override public void handle(int retryCount, Random random, Throwable cause) {
++            try {
++              // Handle Sasl failure. Try to potentially get new credentials
++              handleSaslConnectionFailure(retryCount, cause, remoteId.getTicket().getUGI());
++
++              // Try to reconnect
++              AsyncRpcClient.WHEEL_TIMER.newTimeout(new TimerTask() {
++                @Override public void run(Timeout timeout) throws Exception {
++                  connect(bootstrap);
++                }
++              }, random.nextInt(reloginMaxBackoff) + 1, TimeUnit.MILLISECONDS);
++            } catch (IOException | InterruptedException e) {
++              close(e);
++            }
++          }
++        }, new SaslClientHandler.SaslSuccessfulConnectHandler() {
++      @Override public void onSuccess(Channel channel) {
++        startHbaseConnection(channel);
++      }
++    });
++  }
++
++  /**
++   * Retry to connect or close
++   *
++   * @param bootstrap      to connect with
++   * @param connectCounter amount of tries
++   * @param e              exception of fail
++   */
++  private void retryOrClose(final Bootstrap bootstrap, int connectCounter, Throwable e) {
++    if (connectCounter < client.maxRetries) {
++      AsyncRpcClient.WHEEL_TIMER.newTimeout(new TimerTask() {
++        @Override public void run(Timeout timeout) throws Exception {
++          connect(bootstrap);
++        }
++      }, client.failureSleep, TimeUnit.MILLISECONDS);
++    } else {
++      client.failedServers.addToFailedServers(remoteId.address);
++      close(e);
++    }
++  }
++
++  @Override
++  public void callMethod(final Descriptors.MethodDescriptor method, final RpcController controller,
++      final com.google.protobuf.Message request, final Message responsePrototype,
++      final RpcCallback<Message> done) {
++    final AsyncCall call = new AsyncCall(client.callIdCnt.getAndIncrement(), method, request,
++        (PayloadCarryingRpcController) controller, responsePrototype, done);
++    calls.put(call.id, call);
++
++    // Add timeout for cleanup if none is present
++    if (cleanupTimer == null) {
++      cleanupTimer = AsyncRpcClient.WHEEL_TIMER.newTimeout(new TimerTask() {
++        @Override public void run(Timeout timeout) throws Exception {
++          cleanupTimer = null;
++          cleanupTimedOutCalls(call.getRpcTimeout());
++        }
++      }, rpcTimeout, TimeUnit.MILLISECONDS);
++    }
++
++    if (channel != null) {
++      writeRequest(channel, call);
++    }
++  }
++
++  /**
++   * Send all outstanding requests after connecting
++   *
++   * @param channel to write to
++   */
++  private void sendRequestsAfterConnect(Channel channel) {
++    for (AsyncCall call : calls.values()) {
++      writeRequest(channel, call);
++    }
++  }
++
++  /**
++   * Write the channel header
++   *
++   * @param channel to write to
++   * @return future of write
++   * @throws java.io.IOException on failure to write
++   */
++  private ChannelFuture writeChannelHeader(Channel channel) throws IOException {
++    RPCProtos.ConnectionHeader.Builder headerBuilder =
++        RPCProtos.ConnectionHeader.newBuilder().setServiceName(remoteId.getServiceName());
++
++    RPCProtos.ConnectionHeader.Builder builder = RPCProtos.ConnectionHeader.newBuilder();
++    builder.setServiceName(remoteId.serviceName);
++    RPCProtos.UserInformation userInfoPB;
++    if ((userInfoPB = buildUserInfo(remoteId.getTicket().getUGI(), authMethod)) != null) {
++      headerBuilder.setUserInfo(userInfoPB);
++    }
++
++    if (client.codec != null) {
++      headerBuilder.setCellBlockCodecClass(client.codec.getClass().getCanonicalName());
++    }
++    if (client.compressor != null) {
++      headerBuilder.setCellBlockCompressorClass(client.compressor.getClass().getCanonicalName());
++    }
++
++    RPCProtos.ConnectionHeader header = headerBuilder.build();
++
++    ByteBuf b = channel.alloc().buffer(IPCUtil.getTotalSizeWhenWrittenDelimited(header));
++    b.writeInt(header.getSerializedSize());
++    b.writeBytes(header.toByteArray());
++
++    return channel.writeAndFlush(b);
++  }
++
++  /**
++   * Write request to channel
++   *
++   * @param channel to write to
++   * @param call    to write
++   */
++  private void writeRequest(Channel channel, AsyncCall call) {
++    try {
++      if (shouldCloseConnection) {
++        return;
++      }
++
++      RPCProtos.RequestHeader.Builder builder =
++          RPCProtos.RequestHeader.newBuilder().setCallId(call.id)
++              .setMethodName(call.method.getName()).setRequestParam(call.param != null);
++
++      if (Trace.isTracing()) {
++        Span s = Trace.currentSpan();
++        builder.setTraceInfo(TracingProtos.RPCTInfo.newBuilder().
++            setParentId(s.getSpanId()).setTraceId(s.getTraceId()));
++      }
++
++      ByteBuffer cellBlock = client.buildCellBlock(call.controller.cellScanner());
++      if (cellBlock != null) {
++        RPCProtos.CellBlockMeta.Builder cellBlockBuilder = RPCProtos.CellBlockMeta.newBuilder();
++        cellBlockBuilder.setLength(cellBlock.limit());
++        builder.setCellBlockMeta(cellBlockBuilder.build());
++      }
++      // Only pass priority if there one.  Let zero be same as no priority.
++      if (call.controller.getPriority() != 0) {
++        builder.setPriority(call.controller.getPriority());
++      }
++
++      RPCProtos.RequestHeader rh = builder.build();
++
++      int totalSize = IPCUtil.getTotalSizeWhenWrittenDelimited(rh, call.param);
++      if (cellBlock != null)
++        totalSize += cellBlock.remaining();
++
++      ByteBuf b = channel.alloc().buffer(totalSize);
++
++      try (ByteBufOutputStream out = new ByteBufOutputStream(b)) {
++        IPCUtil.write(out, rh, call.param, cellBlock);
++      }
++
++      channel.writeAndFlush(b);
++    } catch (IOException e) {
++      if (!shouldCloseConnection) {
++        close(e);
++      }
++    }
++  }
++
++  /**
++   * Set up server authorization
++   *
++   * @throws java.io.IOException if auth setup failed
++   */
++  private void setupAuthorization() throws IOException {
++    SecurityInfo securityInfo = SecurityInfo.getInfo(remoteId.serviceName);
++    this.useSasl = client.userProvider.isHBaseSecurityEnabled();
++
++    this.token = null;
++    if (useSasl && securityInfo != null) {
++      AuthenticationProtos.TokenIdentifier.Kind tokenKind = securityInfo.getTokenKind();
++      if (tokenKind != null) {
++        TokenSelector<? extends TokenIdentifier> tokenSelector = tokenHandlers.get(tokenKind);
++        if (tokenSelector != null) {
++          token = tokenSelector
++              .selectToken(new Text(client.clusterId), remoteId.getTicket().getUGI().getTokens());
++        } else if (LOG.isDebugEnabled()) {
++          LOG.debug("No token selector found for type " + tokenKind);
++        }
++      }
++      String serverKey = securityInfo.getServerPrincipal();
++      if (serverKey == null) {
++        throw new IOException("Can't obtain server Kerberos config key from SecurityInfo");
++      }
++      this.serverPrincipal = SecurityUtil.getServerPrincipal(client.conf.get(serverKey),
++          remoteId.address.getAddress().getCanonicalHostName().toLowerCase());
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("RPC Server Kerberos principal name for service=" + remoteId.serviceName + " is "
++            + serverPrincipal);
++      }
++    }
++
++    if (!useSasl) {
++      authMethod = AuthMethod.SIMPLE;
++    } else if (token != null) {
++      authMethod = AuthMethod.DIGEST;
++    } else {
++      authMethod = AuthMethod.KERBEROS;
++    }
++
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Use " + authMethod + " authentication for service " + remoteId.serviceName +
++          ", sasl=" + useSasl);
++    }
++    reloginMaxBackoff = client.conf.getInt("hbase.security.relogin.maxbackoff", 5000);
++  }
++
++  /**
++   * Build the user information
++   *
++   * @param ugi        User Group Information
++   * @param authMethod Authorization method
++   * @return UserInformation protobuf
++   */
++  private RPCProtos.UserInformation buildUserInfo(UserGroupInformation ugi, AuthMethod authMethod) {
++    if (ugi == null || authMethod == AuthMethod.DIGEST) {
++      // Don't send user for token auth
++      return null;
++    }
++    RPCProtos.UserInformation.Builder userInfoPB = RPCProtos.UserInformation.newBuilder();
++    if (authMethod == AuthMethod.KERBEROS) {
++      // Send effective user for Kerberos auth
++      userInfoPB.setEffectiveUser(ugi.getUserName());
++    } else if (authMethod == AuthMethod.SIMPLE) {
++      //Send both effective user and real user for simple auth
++      userInfoPB.setEffectiveUser(ugi.getUserName());
++      if (ugi.getRealUser() != null) {
++        userInfoPB.setRealUser(ugi.getRealUser().getUserName());
++      }
++    }
++    return userInfoPB.build();
++  }
++
++  /**
++   * Create connection preamble
++   *
++   * @param byteBuf    to write to
++   * @param authMethod to write
++   */
++  private void createPreamble(ByteBuf byteBuf, AuthMethod authMethod) {
++    byteBuf.writeBytes(MAGIC);
++    byteBuf.writeByte(HConstants.RPC_CURRENT_VERSION);
++    byteBuf.writeByte(authMethod.code);
++  }
++
++  /**
++   * Close connection
++   *
++   * @param e exception on close
++   */
++  public void close(Throwable e) {
++    if (!shouldCloseConnection) {
++      shouldCloseConnection = true;
++      closeException = e;
++
++      client.removeConnection(remoteId);
++
++      if (channel != null) {
++        // log the info
++        if (LOG.isDebugEnabled() && closeException != null) {
++          LOG.debug(name + ": closing ipc connection to " + channel.remoteAddress() + ": " +
++              closeException.getMessage(), closeException);
++        }
++
++        if (!channel.isOpen()) {
++          channel.close();
++        }
++
++      } else if (connectFuture != null) {
++        connectFuture.cancel(true);
++      }
++
++      cleanupTimedOutCalls(-1);
++
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(name + ": closed");
++      }
++    }
++  }
++
++  /**
++   * Clean up timed out calls
++   *
++   * @param rpcTimeout for cleanup
++   */
++  public void cleanupTimedOutCalls(long rpcTimeout) {
++    // Cancel outstanding timers
++    if (cleanupTimer != null) {
++      cleanupTimer.cancel();
++      cleanupTimer = null;
++    }
++
++    for (AsyncCall call : calls.values()) {
++      long waitTime = System.currentTimeMillis() - call.getStartTime();
++      if (rpcTimeout == -1) {
++        call.setFailed(new IOException(closeException));
++        calls.remove(call.id);
++      } else if (waitTime >= call.getRpcTimeout()) {
++        closeException = new CallTimeoutException("Call id=" + call.id +
++            ", waitTime=" + waitTime + ", rpcTimeout=" + rpcTimeout);
++        call.setFailed((IOException) closeException);
++        calls.remove(call.id);
++      } else {
++        break;
++      }
++    }
++    if (!calls.isEmpty()) {
++      AsyncCall firstCall = calls.firstEntry().getValue();
++      long maxWaitTime = System.currentTimeMillis() - firstCall.getStartTime();
++      if (maxWaitTime < rpcTimeout) {
++        rpcTimeout -= maxWaitTime;
++      }
++    }
++    if (!shouldCloseConnection) {
++      closeException = null;
++      cleanupTimer = AsyncRpcClient.WHEEL_TIMER.newTimeout(new TimerTask() {
++        @Override public void run(Timeout timeout) throws Exception {
++          cleanupTimer = null;
++          cleanupTimedOutCalls(AsyncRpcChannel.this.rpcTimeout);
++        }
++      }, rpcTimeout, TimeUnit.MILLISECONDS);
++    }
++  }
++
++  /**
++   * Check if the connection is alive
++   *
++   * @return true if alive
++   */
++  public boolean isAlive() {
++    return channel != null && (channel.isOpen() || channel.isActive());
++  }
++
++  /**
++   * Check if user should authenticate over Kerberos
++   *
++   * @return true if should be authenticated over Kerberos
++   * @throws java.io.IOException on failure of check
++   */
++  private synchronized boolean shouldAuthenticateOverKrb() throws IOException {
++    UserGroupInformation loginUser = UserGroupInformation.getLoginUser();
++    UserGroupInformation currentUser = UserGroupInformation.getCurrentUser();
++    UserGroupInformation realUser = currentUser.getRealUser();
++    return authMethod == AuthMethod.KERBEROS &&
++        loginUser != null &&
++        //Make sure user logged in using Kerberos either keytab or TGT
++        loginUser.hasKerberosCredentials() &&
++        // relogin only in case it is the login user (e.g. JT)
++        // or superuser (like oozie).
++        (loginUser.equals(currentUser) || loginUser.equals(realUser));
++  }
++
++  /**
++   * If multiple clients with the same principal try to connect
++   * to the same server at the same time, the server assumes a
++   * replay attack is in progress. This is a feature of kerberos.
++   * In order to work around this, what is done is that the client
++   * backs off randomly and tries to initiate the connection
++   * again.
++   * The other problem is to do with ticket expiry. To handle that,
++   * a relogin is attempted.
++   * <p>
++   * The retry logic is governed by the {@link #shouldAuthenticateOverKrb}
++   * method. In case when the user doesn't have valid credentials, we don't
++   * need to retry (from cache or ticket). In such cases, it is prudent to
++   * throw a runtime exception when we receive a SaslException from the
++   * underlying authentication implementation, so there is no retry from
++   * other high level (for eg, HCM or HBaseAdmin).
++   * </p>
++   *
++   * @param currRetries retry count
++   * @param ex          exception describing fail
++   * @param user        which is trying to connect
++   * @throws java.io.IOException  if IO fail
++   * @throws InterruptedException if thread is interrupted
++   */
++  private void handleSaslConnectionFailure(final int currRetries, final Throwable ex,
++      final UserGroupInformation user) throws IOException, InterruptedException {
++    user.doAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws IOException, InterruptedException {
++        if (shouldAuthenticateOverKrb()) {
++          if (currRetries < MAX_SASL_RETRIES) {
++            LOG.debug("Exception encountered while connecting to the server : " + ex);
++            //try re-login
++            if (UserGroupInformation.isLoginKeytabBased()) {
++              UserGroupInformation.getLoginUser().reloginFromKeytab();
++            } else {
++              UserGroupInformation.getLoginUser().reloginFromTicketCache();
++            }
++
++            // Should reconnect
++            return null;
++          } else {
++            String msg = "Couldn't setup connection for " +
++                UserGroupInformation.getLoginUser().getUserName() +
++                " to " + serverPrincipal;
++            LOG.warn(msg);
++            throw (IOException) new IOException(msg).initCause(ex);
++          }
++        } else {
++          LOG.warn("Exception encountered while connecting to " +
++              "the server : " + ex);
++        }
++        if (ex instanceof RemoteException) {
++          throw (RemoteException) ex;
++        }
++        if (ex instanceof SaslException) {
++          String msg = "SASL authentication failed." +
++              " The most likely cause is missing or invalid credentials." +
++              " Consider 'kinit'.";
++          LOG.fatal(msg, ex);
++          throw new RuntimeException(msg, ex);
++        }
++        throw new IOException(ex);
++      }
++    });
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcClient.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcClient.java
+new file mode 100644
+index 0000000..be4f0cd
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncRpcClient.java
+@@ -0,0 +1,316 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import com.google.protobuf.BlockingRpcChannel;
++import com.google.protobuf.Descriptors;
++import com.google.protobuf.Message;
++import com.google.protobuf.RpcCallback;
++import io.netty.bootstrap.Bootstrap;
++import io.netty.channel.ChannelInitializer;
++import io.netty.channel.ChannelOption;
++import io.netty.channel.ChannelPipeline;
++import io.netty.channel.nio.NioEventLoopGroup;
++import io.netty.channel.socket.SocketChannel;
++import io.netty.channel.socket.nio.NioSocketChannel;
++import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
++import io.netty.util.HashedWheelTimer;
++import io.netty.util.concurrent.DefaultPromise;
++import io.netty.util.concurrent.EventExecutor;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
++import org.apache.hadoop.hbase.security.User;
++import org.apache.hadoop.hbase.util.Pair;
++import org.apache.hadoop.hbase.util.PoolMap;
++
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.nio.ByteBuffer;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * Netty client for the requests and responses
++ */
++@InterfaceAudience.Private
++public class AsyncRpcClient extends AbstractRpcClient {
++
++  protected final AtomicInteger callIdCnt = new AtomicInteger();
++
++  private final NioEventLoopGroup eventLoopGroup;
++  private final PoolMap<ConnectionId, AsyncRpcChannel> connections;
++
++  final FailedServers failedServers;
++
++  private final Bootstrap bootstrap;
++
++  public static final HashedWheelTimer WHEEL_TIMER =
++      new HashedWheelTimer(100, TimeUnit.MILLISECONDS);
++
++  /**
++   * Constructor for tests
++   *
++   * @param configuration to HBase
++   * @param clusterId     for the cluster
++   * @param localAddress  local address to connect to
++   * @param channelInitializer for custom channel handlers
++   */
++  AsyncRpcClient(Configuration configuration, String clusterId, SocketAddress localAddress,
++      ChannelInitializer<SocketChannel> channelInitializer) {
++    super(configuration, clusterId, localAddress);
++    LOG.info("Setting up Hbase Netty client");
++
++    this.eventLoopGroup = new NioEventLoopGroup();
++
++    this.connections = new PoolMap<>(getPoolType(configuration), getPoolSize(configuration));
++    this.failedServers = new FailedServers(configuration);
++
++    // Configure the default bootstrap.
++    this.bootstrap = new Bootstrap();
++    bootstrap.group(eventLoopGroup).channel(NioSocketChannel.class)
++        .option(ChannelOption.TCP_NODELAY, tcpNoDelay)
++        .option(ChannelOption.SO_KEEPALIVE, tcpKeepAlive)
++        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, configuration
++            .getInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,
++                HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT));
++    if (channelInitializer == null) {
++      channelInitializer = new ChannelInitializer<SocketChannel>() {
++        @Override protected void initChannel(SocketChannel ch) throws Exception {
++          //empty initializer
++        }
++      };
++    }
++    bootstrap.handler(channelInitializer);
++
++    if (localAddress != null) {
++      bootstrap.localAddress(localAddress);
++    }
++  }
++
++  /**
++   * Constructor
++   *
++   * @param configuration to HBase
++   * @param clusterId     for the cluster
++   * @param localAddress  local address to connect to
++   */
++  public AsyncRpcClient(Configuration configuration, String clusterId, SocketAddress localAddress) {
++    this(configuration, clusterId, localAddress, null);
++  }
++
++  /**
++   * Close netty
++   */
++  public void close() {
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Stopping async rpc client");
++    }
++
++    synchronized (connections) {
++      for (AsyncRpcChannel conn : connections.values()) {
++        conn.close(null);
++      }
++    }
++
++    eventLoopGroup.shutdownGracefully();
++
++    // wait until all connections are closed
++    while (!connections.isEmpty()) {
++      try {
++        Thread.sleep(100);
++      } catch (InterruptedException ignored) {
++      }
++    }
++  }
++
++  /**
++   * Get an event loop
++   *
++   * @return event executor
++   */
++  public EventExecutor getEventLoop() {
++    return eventLoopGroup.next();
++  }
++
++  /**
++   * Create a cell scanner
++   *
++   * @param cellBlock to create scanner for
++   * @return CellScanner
++   * @throws java.io.IOException on error on creation cell scanner
++   */
++  public CellScanner createCellScanner(byte[] cellBlock) throws IOException {
++    return ipcUtil.createCellScanner(this.codec, this.compressor, cellBlock);
++  }
++
++  /**
++   * Build cell block
++   *
++   * @param cells to create block with
++   * @return ByteBuffer with cells
++   * @throws java.io.IOException if block creation fails
++   */
++  public ByteBuffer buildCellBlock(CellScanner cells) throws IOException {
++    return ipcUtil.buildCellBlock(this.codec, this.compressor, cells);
++  }
++
++  /**
++   * Interrupt the connections to the given ip:port server. This should be called if the server
++   * is known as actually dead. This will not prevent current operation to be retried, and,
++   * depending on their own behavior, they may retry on the same server. This can be a feature,
++   * for example at startup. In any case, they're likely to get connection refused (if the
++   * process died) or no route to host: i.e. there next retries should be faster and with a
++   * safe exception.
++   *
++   * @param sn server to cancel connections for
++   */
++  @Override public void cancelConnections(ServerName sn) {
++    synchronized (connections) {
++      for (AsyncRpcChannel rpcChannel : connections.values()) {
++        if (rpcChannel.isAlive() &&
++            rpcChannel.remoteId.address.getPort() == sn.getPort() &&
++            rpcChannel.remoteId.address.getHostName().equals(sn.getHostname())) {
++          LOG.info("The server on " + sn.toString() +
++              " is dead - stopping the connection " + rpcChannel.remoteId);
++          rpcChannel.close(new IOException("Cancelled connections"));
++        }
++      }
++    }
++  }
++
++  /**
++   * Get a connection from the pool, or create a new one and add it to the
++   * pool.  Connections to a given host/port are reused.
++   *
++   * @param serviceDescriptor to get connection for
++   * @param location          to connect to
++   * @return Fitting NettyRpcChannel
++   * @throws java.io.IOException if connecting fails
++   */
++  public AsyncRpcChannel getConnection(Descriptors.ServiceDescriptor serviceDescriptor,
++      InetSocketAddress location) throws IOException {
++    if (this.eventLoopGroup.isShuttingDown() || this.eventLoopGroup.isShutdown()) {
++      throw new StoppedRpcClientException();
++    }
++    AsyncRpcChannel rpcChannel;
++    ConnectionId remoteId =
++        new ConnectionId(this.userProvider.getCurrent(), serviceDescriptor.getName(), location);
++    synchronized (connections) {
++      rpcChannel = connections.get(remoteId);
++      if (rpcChannel == null) {
++        rpcChannel = new AsyncRpcChannel(this.bootstrap, this, remoteId);
++        connections.put(remoteId, rpcChannel);
++      }
++    }
++
++    return rpcChannel;
++  }
++
++  /**
++   * Remove connection from pool
++   *
++   * @param remoteId of connection
++   */
++  public void removeConnection(ConnectionId remoteId) {
++    this.connections.remove(remoteId);
++  }
++
++  /**
++   * Make a call, passing <code>param</code>, to the IPC server running at
++   * <code>address</code> which is servicing the <code>protocol</code> protocol,
++   * with the <code>ticket</code> credentials, returning the value.
++   * Throws exceptions if there are network problems or if the remote code
++   * threw an exception.
++   *
++   * @param ticket Be careful which ticket you pass. A new user will mean a new Connection.
++   *               {@link org.apache.hadoop.hbase.security.UserProvider#getCurrent()} makes a new
++   *               instance of User each time so will be a new Connection each time.
++   * @return A pair with the Message response and the Cell data (if any).
++   * @throws InterruptedException if call is interrupted
++   * @throws java.io.IOException  if a connection failure is encountered
++   */
++  @Override protected Pair<Message, CellScanner> call(PayloadCarryingRpcController pcrc,
++      Descriptors.MethodDescriptor md, Message param, Message returnType,
++      User ticket, InetSocketAddress addr, int callTimeout, int priority)
++      throws IOException, InterruptedException {
++
++    final AsyncRpcChannel connection = getConnection(md.getService(), addr);
++
++    final HBaseResponsePromise<Message> promise = new HBaseResponsePromise<>(getEventLoop());
++
++    pcrc.notifyOnCancel(new RpcCallback<Object>() {
++      @Override public void run(Object parameter) {
++        promise.onFailure(new IOException("Cancelled connection"));
++      }
++    });
++    pcrc.notifyOnFail(new RpcCallback<IOException>() {
++      @Override public void run(IOException e) {
++        promise.onFailure(e);
++      }
++    });
++
++    connection.callMethod(md, pcrc, param, returnType, new RpcCallback<Message>() {
++      @Override public void run(Message response) {
++        promise.onSuccess(response);
++      }
++    });
++
++    try {
++      Message response = promise.get();
++      return new Pair<>(response, pcrc.cellScanner());
++    } catch (ExecutionException e) {
++      if (e.getCause() instanceof IOException) {
++        throw (IOException) e.getCause();
++      } else {
++        throw new IOException(e.getCause());
++      }
++    }
++  }
++
++  /**
++   * Hbase response promise
++   *
++   * @param <T> Type of response promised
++   */
++  @InterfaceAudience.Private
++  public class HBaseResponsePromise<T> extends DefaultPromise<T>
++      implements AsyncResponseHandler<T> {
++    /**
++     * Constructor
++     *
++     * @param executor for promise
++     */
++    public HBaseResponsePromise(EventExecutor executor) {
++      super(executor);
++    }
++
++    @Override public void onSuccess(T response) {
++      super.setSuccess(response);
++    }
++
++    @Override public void onFailure(IOException e) {
++      super.setFailure(e);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncServerResponseHandler.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncServerResponseHandler.java
+new file mode 100644
+index 0000000..41abdb9
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/AsyncServerResponseHandler.java
+@@ -0,0 +1,139 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import com.google.protobuf.Message;
++import com.google.protobuf.TextFormat;
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufInputStream;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInboundHandlerAdapter;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.protobuf.generated.RPCProtos;
++import org.apache.hadoop.ipc.RemoteException;
++
++import java.io.IOException;
++
++/**
++ * Handles Hbase responses
++ */
++@InterfaceAudience.Private
++public class AsyncServerResponseHandler extends ChannelInboundHandlerAdapter {
++  public static final Log LOG = LogFactory.getLog(AsyncServerResponseHandler.class.getName());
++
++  private final AsyncRpcChannel channel;
++
++  /**
++   * Constructor
++   *
++   * @param channel on which this response handler operates
++   */
++  public AsyncServerResponseHandler(AsyncRpcChannel channel) {
++    this.channel = channel;
++  }
++
++  @Override public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
++    ByteBuf inBuffer = (ByteBuf) msg;
++    ByteBufInputStream in = new ByteBufInputStream(inBuffer);
++
++    if (channel.shouldCloseConnection) {
++      return;
++    }
++    int totalSize = -1;
++    try {
++      // Read the header
++      RPCProtos.ResponseHeader responseHeader = RPCProtos.ResponseHeader.parseDelimitedFrom(in);
++      int id = responseHeader.getCallId();
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(channel.name + ": got response header " +
++            TextFormat.shortDebugString(responseHeader) + ", totalSize: " + totalSize + " bytes");
++      }
++      AsyncCall call = channel.calls.get(id);
++      if (call == null) {
++        // So we got a response for which we have no corresponding 'call' here on the client-side.
++        // We probably timed out waiting, cleaned up all references, and now the server decides
++        // to return a response.  There is nothing we can do w/ the response at this stage. Clean
++        // out the wire of the response so its out of the way and we can get other responses on
++        // this connection.
++        int readSoFar = IPCUtil.getTotalSizeWhenWrittenDelimited(responseHeader);
++        int whatIsLeftToRead = totalSize - readSoFar;
++        in.skipBytes(whatIsLeftToRead);
++      }
++
++      if (responseHeader.hasException()) {
++        RPCProtos.ExceptionResponse exceptionResponse = responseHeader.getException();
++        RemoteException re = createRemoteException(exceptionResponse);
++        if (exceptionResponse.getExceptionClassName().
++            equals(FatalConnectionException.class.getName())) {
++          channel.close(re);
++        } else {
++          if (call != null) {
++            call.setFailed(re);
++          }
++        }
++      } else {
++        Message value = null;
++        // Call may be null because it may have timedout and been cleaned up on this side already
++        if (call != null && call.responseDefaultType != null) {
++          Message.Builder builder = call.responseDefaultType.newBuilderForType();
++          builder.mergeDelimitedFrom(in);
++          value = builder.build();
++        }
++        CellScanner cellBlockScanner = null;
++        if (responseHeader.hasCellBlockMeta()) {
++          int size = responseHeader.getCellBlockMeta().getLength();
++          byte[] cellBlock = new byte[size];
++          inBuffer.readBytes(cellBlock, 0, cellBlock.length);
++          cellBlockScanner = channel.client.createCellScanner(cellBlock);
++        }
++        // it's possible that this call may have been cleaned up due to a RPC
++        // timeout, so check if it still exists before setting the value.
++        if (call != null) {
++          call.setSuccess(value, cellBlockScanner);
++        }
++      }
++      if (call != null) {
++        channel.calls.remove(id);
++      }
++    } catch (IOException e) {
++      // Treat this as a fatal condition and close this connection
++      channel.close(e);
++    } finally {
++      if (channel.rpcTimeout > 0) {
++        channel.cleanupTimedOutCalls(channel.rpcTimeout);
++      }
++    }
++  }
++
++  /**
++   * @param e Proto exception
++   * @return RemoteException made from passed <code>e</code>
++   */
++  private RemoteException createRemoteException(final RPCProtos.ExceptionResponse e) {
++    String innerExceptionClassName = e.getExceptionClassName();
++    boolean doNotRetry = e.getDoNotRetry();
++    return e.hasHostname() ?
++        // If a hostname then add it to the RemoteWithExtrasException
++        new RemoteWithExtrasException(innerExceptionClassName, e.getStackTrace(), e.getHostname(),
++            e.getPort(), doNotRetry) :
++        new RemoteWithExtrasException(innerExceptionClassName, e.getStackTrace(), doNotRetry);
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientFactory.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientFactory.java
+index 2dbb776..10ddc56 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientFactory.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientFactory.java
+@@ -59,8 +59,7 @@ public final class RpcClientFactory {
+   public static RpcClient createClient(Configuration conf, String clusterId,
+       SocketAddress localAddr) {
+     String rpcClientClass =
+-        conf.get(CUSTOM_RPC_CLIENT_IMPL_CONF_KEY,
+-          RpcClientImpl.class.getName());
++        conf.get(CUSTOM_RPC_CLIENT_IMPL_CONF_KEY, AsyncRpcClient.class.getName());
+     return ReflectionUtils.instantiateWithCustomCtor(
+         rpcClientClass,
+         new Class[] { Configuration.class, String.class, SocketAddress.class },
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
+index 97fa475..e2a3ab0 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/RpcClientImpl.java
+@@ -1120,14 +1120,6 @@ public class RpcClientImpl extends AbstractRpcClient {
+     }
+   }
+ 
+-  Pair<Message, CellScanner> call(PayloadCarryingRpcController pcrc,
+-                                  MethodDescriptor md, Message param, CellScanner cells,
+-      Message returnType, User ticket, InetSocketAddress addr, int rpcTimeout)
+-  throws InterruptedException, IOException {
+-    return
+-        call(pcrc, md, param, cells, returnType, ticket, addr, rpcTimeout, HConstants.NORMAL_QOS);
+-  }
+-
+   /** Make a call, passing <code>param</code>, to the IPC server running at
+    * <code>address</code> which is servicing the <code>protocol</code> protocol,
+    * with the <code>ticket</code> credentials, returning the value.
+@@ -1142,12 +1134,16 @@ public class RpcClientImpl extends AbstractRpcClient {
+    */
+   @Override
+   protected Pair<Message, CellScanner> call(PayloadCarryingRpcController pcrc, MethodDescriptor md,
+-                                  Message param, CellScanner cells,
+-      Message returnType, User ticket, InetSocketAddress addr, int callTimeout, int priority)
++      Message param, Message returnType, User ticket, InetSocketAddress addr, int callTimeout,
++      int priority)
+       throws IOException, InterruptedException {
+-    final Call call = new Call(
+-        this.callIdCnt.getAndIncrement(),
+-        md, param, cells, returnType, callTimeout);
++    CellScanner cells = null;
++    if (pcrc != null) {
++      cells = pcrc.cellScanner();
++    }
++
++    final Call call =
++        new Call(this.callIdCnt.getAndIncrement(), md, param, cells, returnType, callTimeout);
+ 
+     final Connection connection = getConnection(ticket, call, addr, this.codec, this.compressor);
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/SaslClientHandler.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/SaslClientHandler.java
+new file mode 100644
+index 0000000..f903fd2
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/SaslClientHandler.java
+@@ -0,0 +1,332 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.security;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelDuplexHandler;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelPromise;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
++
++import javax.security.auth.callback.CallbackHandler;
++import javax.security.sasl.Sasl;
++import javax.security.sasl.SaslClient;
++import javax.security.sasl.SaslException;
++import java.io.IOException;
++import java.nio.charset.Charset;
++import java.util.Random;
++
++/**
++ * Handles Sasl connections
++ */
++@InterfaceAudience.Private
++public class SaslClientHandler extends ChannelDuplexHandler {
++  public static final Log LOG = LogFactory.getLog(SaslClientHandler.class);
++
++  private final boolean fallbackAllowed;
++
++  /**
++   * Used for client or server's token to send or receive from each other.
++   */
++  private final SaslClient saslClient;
++  private final SaslExceptionHandler exceptionHandler;
++  private final SaslSuccessfulConnectHandler successfulConnectHandler;
++  private byte[] saslToken;
++  private boolean firstRead = true;
++
++  private int retryCount = 0;
++  private Random random;
++
++  /**
++   * Constructor
++   *
++   * @param method           auth method
++   * @param token            for Sasl
++   * @param serverPrincipal  Server's Kerberos principal name
++   * @param fallbackAllowed  True if server may also fall back to less secure connection
++   * @param rpcProtection    Quality of protection. Integrity or privacy
++   * @param exceptionHandler handler for exceptions
++   * @param successfulConnectHandler handler for succesful connects
++   * @throws java.io.IOException if handler could not be created
++   */
++  public SaslClientHandler(AuthMethod method, Token<? extends TokenIdentifier> token,
++      String serverPrincipal, boolean fallbackAllowed, String rpcProtection,
++      SaslExceptionHandler exceptionHandler, SaslSuccessfulConnectHandler successfulConnectHandler)
++      throws IOException {
++    this.fallbackAllowed = fallbackAllowed;
++
++    this.exceptionHandler = exceptionHandler;
++    this.successfulConnectHandler = successfulConnectHandler;
++
++    SaslUtil.initSaslProperties(rpcProtection);
++    switch (method) {
++    case DIGEST:
++      if (LOG.isDebugEnabled()) LOG.debug("Creating SASL " + AuthMethod.DIGEST.getMechanismName()
++          + " client to authenticate to service at " + token.getService());
++      saslClient = createDigestSaslClient(new String[] { AuthMethod.DIGEST.getMechanismName() },
++          SaslUtil.SASL_DEFAULT_REALM, new HBaseSaslRpcClient.SaslClientCallbackHandler(token));
++      break;
++    case KERBEROS:
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Creating SASL " + AuthMethod.KERBEROS.getMechanismName()
++            + " client. Server's Kerberos principal name is " + serverPrincipal);
++      }
++      if (serverPrincipal == null || serverPrincipal.isEmpty()) {
++        throw new IOException("Failed to specify server's Kerberos principal name");
++      }
++      String names[] = SaslUtil.splitKerberosName(serverPrincipal);
++      if (names.length != 3) {
++        throw new IOException(
++            "Kerberos principal does not have the expected format: " + serverPrincipal);
++      }
++      saslClient = createKerberosSaslClient(new String[] { AuthMethod.KERBEROS.getMechanismName() },
++          names[0], names[1]);
++      break;
++    default:
++      throw new IOException("Unknown authentication method " + method);
++    }
++    if (saslClient == null) throw new IOException("Unable to find SASL client implementation");
++  }
++
++  /**
++   * Create a Digest Sasl client
++   *
++   * @param mechanismNames            names of mechanisms
++   * @param saslDefaultRealm          default realm for sasl
++   * @param saslClientCallbackHandler handler for the client
++   * @return new SaslClient
++   * @throws java.io.IOException if creation went wrong
++   */
++  protected SaslClient createDigestSaslClient(String[] mechanismNames, String saslDefaultRealm,
++      CallbackHandler saslClientCallbackHandler) throws IOException {
++    return Sasl.createSaslClient(mechanismNames, null, null, saslDefaultRealm, SaslUtil.SASL_PROPS,
++        saslClientCallbackHandler);
++  }
++
++  /**
++   * Create Kerberos client
++   *
++   * @param mechanismNames names of mechanisms
++   * @param userFirstPart  first part of username
++   * @param userSecondPart second part of username
++   * @return new SaslClient
++   * @throws java.io.IOException if fails
++   */
++  protected SaslClient createKerberosSaslClient(String[] mechanismNames, String userFirstPart,
++      String userSecondPart) throws IOException {
++    return Sasl
++        .createSaslClient(mechanismNames, null, userFirstPart, userSecondPart, SaslUtil.SASL_PROPS,
++            null);
++  }
++
++  @Override public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
++    saslClient.dispose();
++  }
++
++  @Override public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
++    this.saslToken = new byte[0];
++    if (saslClient.hasInitialResponse()) {
++      saslToken = saslClient.evaluateChallenge(saslToken);
++    }
++    if (saslToken != null) {
++      writeSaslToken(ctx.channel(), saslToken);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Have sent token of size " + saslToken.length + " from initSASLContext.");
++      }
++    }
++  }
++
++  @Override public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
++    ByteBuf in = (ByteBuf) msg;
++
++    // If not complete, try to negotiate
++    if (!saslClient.isComplete()) {
++      while (!saslClient.isComplete() && in.isReadable()) {
++        readStatus(in);
++        int len = in.readInt();
++        if (firstRead) {
++          firstRead = false;
++          if (len == SaslUtil.SWITCH_TO_SIMPLE_AUTH) {
++            if (!fallbackAllowed) {
++              throw new IOException("Server asks us to fall back to SIMPLE auth, " + "but this "
++                  + "client is configured to only allow secure connections.");
++            }
++            if (LOG.isDebugEnabled()) {
++              LOG.debug("Server asks us to fall back to simple auth.");
++            }
++            saslClient.dispose();
++
++            ctx.pipeline().remove(this);
++            successfulConnectHandler.onSuccess(ctx.channel());
++            return;
++          }
++        }
++        saslToken = new byte[len];
++        if (LOG.isDebugEnabled())
++          LOG.debug("Will read input token of size " + saslToken.length
++              + " for processing by initSASLContext");
++        in.readBytes(saslToken);
++
++        saslToken = saslClient.evaluateChallenge(saslToken);
++        if (saslToken != null) {
++          if (LOG.isDebugEnabled())
++            LOG.debug("Will send token of size " + saslToken.length + " from initSASLContext.");
++          writeSaslToken(ctx.channel(), saslToken);
++        }
++      }
++
++      if (saslClient.isComplete()) {
++        String qop = (String) saslClient.getNegotiatedProperty(Sasl.QOP);
++
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("SASL client context established. Negotiated QoP: " + qop);
++        }
++
++        boolean useWrap = qop != null && !"auth".equalsIgnoreCase(qop);
++
++        if (!useWrap) {
++          ctx.pipeline().remove(this);
++        }
++        successfulConnectHandler.onSuccess(ctx.channel());
++      }
++    }
++    // Normal wrapped reading
++    else {
++      try {
++        int length = in.readInt();
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Actual length is " + length);
++        }
++        saslToken = new byte[length];
++        in.readBytes(saslToken);
++      } catch (IndexOutOfBoundsException e) {
++        return;
++      }
++      try {
++        ByteBuf b = ctx.channel().alloc().buffer(saslToken.length);
++
++        b.writeBytes(saslClient.unwrap(saslToken, 0, saslToken.length));
++        ctx.fireChannelRead(b);
++      } catch (SaslException se) {
++        try {
++          saslClient.dispose();
++        } catch (SaslException ignored) {
++        }
++        throw se;
++      }
++    }
++  }
++
++  /**
++   * Write SASL token
++   *
++   * @param channel       to write to
++   * @param saslToken to write
++   */
++  private void writeSaslToken(Channel channel, byte[] saslToken) {
++    ByteBuf b = channel.alloc().buffer(4 + saslToken.length);
++    b.writeInt(saslToken.length);
++    b.writeBytes(saslToken, 0, saslToken.length);
++    channel.writeAndFlush(b);
++  }
++
++  /**
++   * Get the read status
++   *
++   * @param inStream to read
++   * @throws org.apache.hadoop.ipc.RemoteException if status was not success
++   */
++  private static void readStatus(ByteBuf inStream) throws RemoteException {
++    int status = inStream.readInt(); // read status
++    if (status != SaslStatus.SUCCESS.state) {
++      throw new RemoteException(inStream.toString(Charset.forName("UTF-8")),
++          inStream.toString(Charset.forName("UTF-8")));
++    }
++  }
++
++  @Override public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
++      throws Exception {
++    saslClient.dispose();
++
++    ctx.close();
++
++    if (this.random == null) {
++      this.random = new Random();
++    }
++    exceptionHandler.handle(this.retryCount++, this.random, cause);
++  }
++
++  @Override public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
++      throws Exception {
++    // If not complete, try to negotiate
++    if (!saslClient.isComplete()) {
++      super.write(ctx, msg, promise);
++    } else {
++      ByteBuf in = (ByteBuf) msg;
++
++      try {
++        saslToken = saslClient.wrap(in.array(), in.readerIndex(), in.readableBytes());
++      } catch (SaslException se) {
++        try {
++          saslClient.dispose();
++        } catch (SaslException ignored) {
++        }
++        promise.setFailure(se);
++      }
++      if (saslToken != null) {
++        ByteBuf out = ctx.channel().alloc().buffer(4 + saslToken.length);
++        out.writeInt(saslToken.length);
++        out.writeBytes(saslToken, 0, saslToken.length);
++
++        saslToken = null;
++      }
++    }
++  }
++
++  /**
++   * Handler for exceptions during Sasl connection
++   */
++  public interface SaslExceptionHandler {
++    /**
++     * Handle the exception
++     *
++     * @param retryCount current retry count
++     * @param random     to create new backoff with
++     * @param cause      of fail
++     */
++    public void handle(int retryCount, Random random, Throwable cause);
++  }
++
++  /**
++   * Handler for successful connects
++   */
++  public interface SaslSuccessfulConnectHandler {
++    /**
++     * Runs on success
++     *
++     * @param channel which is successfully authenticated
++     */
++    public void onSuccess(Channel channel);
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestIPC.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestIPC.java
+index 081b5dd..fdfcb0f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestIPC.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestIPC.java
+@@ -36,6 +36,13 @@ import java.util.List;
+ 
+ import javax.net.SocketFactory;
+ 
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInboundHandlerAdapter;
++import io.netty.channel.ChannelInitializer;
++import io.netty.channel.ChannelOutboundHandlerAdapter;
++import io.netty.channel.ChannelPipeline;
++import io.netty.channel.ChannelPromise;
++import io.netty.channel.socket.SocketChannel;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -191,8 +198,41 @@ public class TestIPC {
+       MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
+       final String message = "hello";
+       EchoRequestProto param = EchoRequestProto.newBuilder().setMessage(message).build();
+-      Pair<Message, CellScanner> r = client.call(null, md, param, null,
+-        md.getOutputType().toProto(), User.getCurrent(), address, 0);
++      Pair<Message, CellScanner> r = client
++          .call(null, md, param, md.getOutputType().toProto(), User.getCurrent(), address, 0,
++              HConstants.NORMAL_QOS);
++      assertTrue(r.getSecond() == null);
++      // Silly assertion that the message is in the returned pb.
++      assertTrue(r.getFirst().toString().contains(message));
++    } finally {
++      client.close();
++      rpcServer.stop();
++    }
++  }
++
++  /**
++   * Ensure we do not HAVE TO HAVE a codec.
++   *
++   * @throws InterruptedException
++   * @throws IOException
++   */
++  @Test public void testNoCodecAsync() throws InterruptedException, IOException {
++    Configuration conf = HBaseConfiguration.create();
++    AsyncRpcClient client = new AsyncRpcClient(conf, HConstants.CLUSTER_ID_DEFAULT, null) {
++      @Override Codec getCodec() {
++        return null;
++      }
++    };
++    TestRpcServer rpcServer = new TestRpcServer();
++    try {
++      rpcServer.start();
++      InetSocketAddress address = rpcServer.getListenerAddress();
++      MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
++      final String message = "hello";
++      EchoRequestProto param = EchoRequestProto.newBuilder().setMessage(message).build();
++      Pair<Message, CellScanner> r = client
++          .call(new PayloadCarryingRpcController(), md, param, md.getOutputType().toProto(),
++              User.getCurrent(), address, 0, HConstants.NORMAL_QOS);
+       assertTrue(r.getSecond() == null);
+       // Silly assertion that the message is in the returned pb.
+       assertTrue(r.getFirst().toString().contains(message));
+@@ -216,10 +256,13 @@ public class TestIPC {
+   throws IOException, InterruptedException, SecurityException, NoSuchMethodException {
+     Configuration conf = new Configuration(HBaseConfiguration.create());
+     conf.set("hbase.client.rpc.compressor", GzipCodec.class.getCanonicalName());
+-    doSimpleTest(conf, new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT));
++    doSimpleTest(new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT));
++
++    // Another test for the async client
++    doSimpleTest(new AsyncRpcClient(conf, HConstants.CLUSTER_ID_DEFAULT, null));
+   }
+ 
+-  private void doSimpleTest(final Configuration conf, final RpcClientImpl client)
++  private void doSimpleTest(final AbstractRpcClient client)
+   throws InterruptedException, IOException {
+     TestRpcServer rpcServer = new TestRpcServer();
+     List<Cell> cells = new ArrayList<Cell>();
+@@ -230,8 +273,12 @@ public class TestIPC {
+       InetSocketAddress address = rpcServer.getListenerAddress();
+       MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
+       EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
+-      Pair<Message, CellScanner> r = client.call(null, md, param, CellUtil.createCellScanner(cells),
+-        md.getOutputType().toProto(), User.getCurrent(), address, 0);
++
++      PayloadCarryingRpcController pcrc =
++          new PayloadCarryingRpcController(CellUtil.createCellScanner(cells));
++      Pair<Message, CellScanner> r = client
++          .call(pcrc, md, param, md.getOutputType().toProto(), User.getCurrent(), address, 0,
++              HConstants.NORMAL_QOS);
+       int index = 0;
+       while (r.getSecond().advance()) {
+         assertTrue(CELL.equals(r.getSecond().current()));
+@@ -258,13 +305,49 @@ public class TestIPC {
+     }).when(spyFactory).createSocket();
+ 
+     TestRpcServer rpcServer = new TestRpcServer();
+-    RpcClientImpl client = new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT, spyFactory);
++    AbstractRpcClient client = new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT, spyFactory);
+     try {
+       rpcServer.start();
+       InetSocketAddress address = rpcServer.getListenerAddress();
+       MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
+       EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
+-      client.call(null, md, param, null, null, User.getCurrent(), address, 0);
++      client.call(null, md, param, null, User.getCurrent(), address, 0, HConstants.NORMAL_QOS);
++      fail("Expected an exception to have been thrown!");
++    } catch (Exception e) {
++      LOG.info("Caught expected exception: " + e.toString());
++      assertTrue(StringUtils.stringifyException(e).contains("Injected fault"));
++    } finally {
++      client.close();
++      rpcServer.stop();
++    }
++  }
++
++  @Test public void testRTEDuringAsyncConnectionSetup() throws Exception {
++    Configuration conf = HBaseConfiguration.create();
++
++    TestRpcServer rpcServer = new TestRpcServer();
++    AsyncRpcClient client = new AsyncRpcClient(conf, HConstants.CLUSTER_ID_DEFAULT, null,
++        new ChannelInitializer<SocketChannel>() {
++
++          @Override protected void initChannel(SocketChannel ch) throws Exception {
++            ch.pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
++              @Override
++              public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
++                  throws Exception {
++                promise.setFailure(new RuntimeException("Injected fault"));
++              }
++            });
++          }
++        });
++    try {
++      rpcServer.start();
++      InetSocketAddress address = rpcServer.getListenerAddress();
++      MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
++      EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
++      client
++          .call(new PayloadCarryingRpcController(), md, param, null, User.getCurrent(), address, 0,
++              HConstants.NORMAL_QOS);
++
+       fail("Expected an exception to have been thrown!");
+     } catch (Exception e) {
+       LOG.info("Caught expected exception: " + e.toString());
+@@ -281,15 +364,43 @@ public class TestIPC {
+     RpcScheduler scheduler = spy(new FifoRpcScheduler(CONF, 1));
+     RpcServer rpcServer = new TestRpcServer(scheduler);
+     verify(scheduler).init((RpcScheduler.Context) anyObject());
+-    RpcClientImpl client = new RpcClientImpl(CONF, HConstants.CLUSTER_ID_DEFAULT);
++    AbstractRpcClient client = new RpcClientImpl(CONF, HConstants.CLUSTER_ID_DEFAULT);
++    try {
++      rpcServer.start();
++      verify(scheduler).start();
++      MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
++      EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
++      for (int i = 0; i < 10; i++) {
++        client.call(
++            new PayloadCarryingRpcController(CellUtil.createCellScanner(ImmutableList.of(CELL))),
++            md, param, md.getOutputType().toProto(), User.getCurrent(),
++            rpcServer.getListenerAddress(), 0, HConstants.NORMAL_QOS);
++      }
++      verify(scheduler, times(10)).dispatch((CallRunner) anyObject());
++    } finally {
++      rpcServer.stop();
++      verify(scheduler).stop();
++    }
++  }
++
++  /**
++   * Tests that the rpc scheduler is called when requests arrive.
++   */
++  @Test public void testRpcSchedulerAsync() throws IOException, InterruptedException {
++    RpcScheduler scheduler = spy(new FifoRpcScheduler(CONF, 1));
++    RpcServer rpcServer = new TestRpcServer(scheduler);
++    verify(scheduler).init((RpcScheduler.Context) anyObject());
++    AbstractRpcClient client = new AsyncRpcClient(CONF, HConstants.CLUSTER_ID_DEFAULT, null);
+     try {
+       rpcServer.start();
+       verify(scheduler).start();
+       MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
+       EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
+       for (int i = 0; i < 10; i++) {
+-        client.call(null, md, param, CellUtil.createCellScanner(ImmutableList.of(CELL)),
+-            md.getOutputType().toProto(), User.getCurrent(), rpcServer.getListenerAddress(), 0);
++        client.call(
++            new PayloadCarryingRpcController(CellUtil.createCellScanner(ImmutableList.of(CELL))),
++            md, param, md.getOutputType().toProto(), User.getCurrent(),
++            rpcServer.getListenerAddress(), 0, HConstants.NORMAL_QOS);
+       }
+       verify(scheduler, times(10)).dispatch((CallRunner) anyObject());
+     } finally {
+@@ -312,7 +423,7 @@ public class TestIPC {
+     TestRpcServer rpcServer = new TestRpcServer();
+     MethodDescriptor md = SERVICE.getDescriptorForType().findMethodByName("echo");
+     EchoRequestProto param = EchoRequestProto.newBuilder().setMessage("hello").build();
+-    RpcClientImpl client = new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT);
++    AbstractRpcClient client = new RpcClientImpl(conf, HConstants.CLUSTER_ID_DEFAULT);
+     KeyValue kv = KeyValueUtil.ensureKeyValue(BIG_CELL);
+     Put p = new Put(kv.getRow());
+     for (int i = 0; i < cellcount; i++) {
+@@ -341,9 +452,10 @@ public class TestIPC {
+           // ReflectionUtils.printThreadInfo(new PrintWriter(System.out),
+           //  "Thread dump " + Thread.currentThread().getName());
+         }
+-        CellScanner cellScanner = CellUtil.createCellScanner(cells);
++        PayloadCarryingRpcController pcrc =
++            new PayloadCarryingRpcController(CellUtil.createCellScanner(cells));
+         Pair<Message, CellScanner> response =
+-            client.call(null, md, builder.build(), cellScanner, param, user, address, 0);
++            client.call(pcrc, md, builder.build(), param, user, address, 0, HConstants.NORMAL_QOS);
+         /*
+         int count = 0;
+         while (p.getSecond().advance()) {
+-- 
+1.9.3 (Apple Git-50)
+

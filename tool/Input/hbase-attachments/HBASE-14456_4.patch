@@ -1,0 +1,845 @@
+commit 20b4b034f2a402389ea64685af85ed0dd2a9f32d
+Author: Yu Li <jueding.ly@alibaba-inc.com>
+Date:   Mon Sep 21 16:57:45 2015 +0800
+
+    Add namespace based region grouping strategy
+    
+    Table regions of the same namespace will write to the same wal on each RegionServer
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 570a5ba15f643e369f385b649449ddd8c2ef2ed8..59d13fac7dbd59cf247dbee2bf08894f4a32414c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1843,9 +1843,10 @@ public class HRegionServer extends HasThread implements
+       roller = ensureMetaWALRoller();
+       wal = walFactory.getMetaWAL(regionInfo.getEncodedNameAsBytes());
+     } else if (regionInfo == null) {
+-      wal = walFactory.getWAL(UNSPECIFIED_REGION);
++      wal = walFactory.getWAL(UNSPECIFIED_REGION, null);
+     } else {
+-      wal = walFactory.getWAL(regionInfo.getEncodedNameAsBytes());
++      byte[] namespace = regionInfo.getTable().getNamespace();
++      wal = walFactory.getWAL(regionInfo.getEncodedNameAsBytes(), namespace);
+     }
+     roller.addWAL(wal);
+     return wal;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+index bbbf9aed58e53a86b20ce66bdd79715eb564f56d..498848127144a48477b093fe59690a872f30f18e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+@@ -1342,7 +1342,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     WAL wal = (new WALFactory(confForWAL,
+         Collections.<WALActionsListener>singletonList(new MetricsWAL()),
+         "hbck-meta-recovery-" + RandomStringUtils.randomNumeric(8))).
+-        getWAL(metaHRI.getEncodedNameAsBytes());
++        getWAL(metaHRI.getEncodedNameAsBytes(), metaHRI.getTable().getNamespace());
+     HRegion meta = HRegion.createHRegion(metaHRI, rootdir, c, metaDescriptor, wal);
+     MasterFileSystem.setInfoFamilyCachingForMeta(metaDescriptor, true);
+     return meta;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java
+index e29384b9a288b41899586f2490996f2ca34c4856..c37f9522dee9ada1e25634d0b1b5b884eaa148d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java
+@@ -193,11 +193,13 @@ class HMerge {
+       for (int i = 0; i < info.length - 1; i++) {
+         if (currentRegion == null) {
+           currentRegion = HRegion.openHRegion(conf, fs, this.rootDir, info[i], this.htd,
+-              walFactory.getWAL(info[i].getEncodedNameAsBytes()));
++              walFactory.getWAL(info[i].getEncodedNameAsBytes(),
++                info[i].getTable().getNamespace()));
+           currentSize = currentRegion.getLargestHStoreSize();
+         }
+         nextRegion = HRegion.openHRegion(conf, fs, this.rootDir, info[i + 1], this.htd,
+-            walFactory.getWAL(info[i+1].getEncodedNameAsBytes()));
++            walFactory.getWAL(info[i + 1].getEncodedNameAsBytes(),
++              info[i + 1].getTable().getNamespace()));
+         nextSize = nextRegion.getLargestHStoreSize();
+ 
+         if ((currentSize + nextSize) <= (maxFilesize / 2)) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java
+index 1ff4967ac14835f933912ebe7f83dd612e94d9ee..309bd4a7349540692eb91e0a4dae29bce99465dc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java
+@@ -95,7 +95,9 @@ public class MetaUtils {
+       this.walFactory = new WALFactory(walConf, null, logName);
+     }
+     final byte[] region = info.getEncodedNameAsBytes();
+-    return info.isMetaRegion() ? walFactory.getMetaWAL(region) : walFactory.getWAL(region);
++    final byte[] namespace = info.getTable().getNamespace();
++    return info.isMetaRegion() ? walFactory.getMetaWAL(region) : walFactory.getWAL(region,
++      namespace);
+   }
+ 
+   /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/BoundedGroupingStrategy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/BoundedGroupingStrategy.java
+index c8f434fefb7c00e82f2405b998342570e21657a2..65c774ea4f44f583ac80af300c626c22f92e5e7d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/BoundedGroupingStrategy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/BoundedGroupingStrategy.java
+@@ -42,7 +42,7 @@ public class BoundedGroupingStrategy implements RegionGroupingStrategy{
+   private String[] groupNames;
+ 
+   @Override
+-  public String group(byte[] identifier) {
++  public String group(byte[] identifier, byte[] namespace) {
+     String idStr = Bytes.toString(identifier);
+     String groupName = groupNameCache.get(idStr);
+     if (null == groupName) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DefaultWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DefaultWALProvider.java
+index be95e16b26425fe0ad6fb4171432d723de9f88cb..027e7a21306632f96c16f935800ba41b4f929fe9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DefaultWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DefaultWALProvider.java
+@@ -118,7 +118,7 @@ public class DefaultWALProvider implements WALProvider {
+   }
+ 
+   @Override
+-  public WAL getWAL(final byte[] identifier) throws IOException {
++  public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+     if (log == null) {
+       // only lock when need to create wal, and need to lock since
+       // creating hlog on fs is time consuming
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+index 10a097b82b5559115941e4e8a36a2a6fc8d2b29e..04045ec6d701ac59b362e0198b8fe389b06312dc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+@@ -67,7 +67,7 @@ class DisabledWALProvider implements WALProvider {
+   }
+ 
+   @Override
+-  public WAL getWAL(final byte[] identifier) throws IOException {
++  public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+     return disabled;
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/NameSpaceGroupingStrategy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/NameSpaceGroupingStrategy.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..393894df5e635a8ebd35ddc34d8cddf31ce41acc
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/NameSpaceGroupingStrategy.java
+@@ -0,0 +1,42 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.wal;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.NamespaceDescriptor;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.wal.RegionGroupingProvider.RegionGroupingStrategy;
++
++public class NameSpaceGroupingStrategy implements RegionGroupingStrategy {
++  String providerId;
++
++  @Override
++  public String group(byte[] identifier, byte[] namespace) {
++    return providerId
++        + GROUP_NAME_DELIMITER
++        + (namespace == null || namespace.length == 0 ? NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR
++            : Bytes.toString(namespace));
++  }
++
++  @Override
++  public void init(Configuration config, String providerId) {
++    this.providerId = providerId;
++  }
++
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
+index 00a5651bbb8280732a2ab88029cfc530f3066d76..54e4396dba3cfa8c604702817e3fc3899ce5735c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
+@@ -65,12 +65,11 @@ class RegionGroupingProvider implements WALProvider {
+    */
+   public static interface RegionGroupingStrategy {
+     String GROUP_NAME_DELIMITER = ".";
++
+     /**
+-     * Given an identifier, pick a group.
+-     * the byte[] returned for a given group must always use the same instance, since we
+-     * will be using it as a hash key.
++     * Given an identifier and a namespace, pick a group.
+      */
+-    String group(final byte[] identifier);
++    String group(final byte[] identifier, byte[] namespace);
+     void init(Configuration config, String providerId);
+   }
+ 
+@@ -80,7 +79,8 @@ class RegionGroupingProvider implements WALProvider {
+   static enum Strategies {
+     defaultStrategy(BoundedGroupingStrategy.class),
+     identity(IdentityGroupingStrategy.class),
+-    bounded(BoundedGroupingStrategy.class);
++    bounded(BoundedGroupingStrategy.class),
++    namespace(NameSpaceGroupingStrategy.class);
+ 
+     final Class<? extends RegionGroupingStrategy> clazz;
+     Strategies(Class<? extends RegionGroupingStrategy> clazz) {
+@@ -200,12 +200,12 @@ class RegionGroupingProvider implements WALProvider {
+   }
+ 
+   @Override
+-  public WAL getWAL(final byte[] identifier) throws IOException {
++  public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+     final String group;
+     if (META_WAL_PROVIDER_ID.equals(this.providerId)) {
+       group = META_WAL_GROUP_NAME;
+     } else {
+-      group = strategy.group(identifier);
++      group = strategy.group(identifier, namespace);
+     }
+     return getWAL(group);
+   }
+@@ -254,7 +254,7 @@ class RegionGroupingProvider implements WALProvider {
+     @Override
+     public void init(Configuration config, String providerId) {}
+     @Override
+-    public String group(final byte[] identifier) {
++    public String group(final byte[] identifier, final byte[] namespace) {
+       return Bytes.toString(identifier);
+     }
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+index e430e064c36383ef6b1109f908836aafb0384125..0317b6683fae788033953211c4c933dc43d664da 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+@@ -224,9 +224,10 @@ public class WALFactory {
+ 
+   /**
+    * @param identifier may not be null, contents will not be altered
++   * @param namespace could be null, and will use default namespace if null
+    */
+-  public WAL getWAL(final byte[] identifier) throws IOException {
+-    return provider.getWAL(identifier);
++  public WAL getWAL(final byte[] identifier, final byte[] namespace) throws IOException {
++    return provider.getWAL(identifier, namespace);
+   }
+ 
+   /**
+@@ -246,7 +247,7 @@ public class WALFactory {
+         metaProvider = this.metaProvider.get();
+       }
+     }
+-    return metaProvider.getWAL(identifier);
++    return metaProvider.getWAL(identifier, null);
+   }
+ 
+   public Reader createReader(final FileSystem fs, final Path path) throws IOException {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+index b007ad2014c89039dfc0117d0c00440ccc5bef4d..2c500dcfea489b83e8f7a8549a2ebbeb257cac02 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+@@ -53,9 +53,10 @@ public interface WALProvider {
+ 
+   /**
+    * @param identifier may not be null. contents will not be altered.
++   * @param namespace could be null, and will use default namespace if null
+    * @return a WAL for writing entries for the given region.
+    */
+-  WAL getWAL(final byte[] identifier) throws IOException;
++  WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException;
+ 
+   /**
+    * persist outstanding WALs to storage and stop accepting new appends.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+index be5df716771faad42259f5fd965e3c9cf5580d1a..d471ec9651cccfade028bbc34ff15cde5d047a69 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+@@ -2569,7 +2569,7 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
+     return (new WALFactory(confForWAL,
+         Collections.<WALActionsListener>singletonList(new MetricsWAL()),
+         "hregion-" + RandomStringUtils.randomNumeric(8))).
+-        getWAL(hri.getEncodedNameAsBytes());
++        getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace());
+   }
+ 
+   /**
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestWALObserver.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestWALObserver.java
+index a3c106dc9a4275caf31d8599a54fc4ca9a5a8b60..8993255df109a1b0076c9bef9424dad1adf77dc0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestWALObserver.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestWALObserver.java
+@@ -164,7 +164,7 @@ public class TestWALObserver {
+    */
+   @Test
+   public void testWALObserverWriteToWAL() throws Exception {
+-    final WAL log = wals.getWAL(UNSPECIFIED_REGION);
++    final WAL log = wals.getWAL(UNSPECIFIED_REGION, null);
+     verifyWritesSeen(log, getCoprocessor(log, SampleRegionWALObserver.class), false);
+   }
+ 
+@@ -175,7 +175,7 @@ public class TestWALObserver {
+    */
+   @Test
+   public void testLegacyWALObserverWriteToWAL() throws Exception {
+-    final WAL log = wals.getWAL(UNSPECIFIED_REGION);
++    final WAL log = wals.getWAL(UNSPECIFIED_REGION, null);
+     verifyWritesSeen(log, getCoprocessor(log, SampleRegionWALObserver.Legacy.class), true);
+   }
+ 
+@@ -279,7 +279,7 @@ public class TestWALObserver {
+ 
+     final Configuration newConf = HBaseConfiguration.create(this.conf);
+ 
+-    final WAL wal = wals.getWAL(UNSPECIFIED_REGION);
++    final WAL wal = wals.getWAL(UNSPECIFIED_REGION, null);
+     final SampleRegionWALObserver newApi = getCoprocessor(wal, SampleRegionWALObserver.class);
+     newApi.setTestValues(TEST_TABLE, TEST_ROW, null, null, null, null, null, null);
+     final SampleRegionWALObserver oldApi = getCoprocessor(wal,
+@@ -351,7 +351,7 @@ public class TestWALObserver {
+     final HTableDescriptor htd = createBasic3FamilyHTD(Bytes.toString(TEST_TABLE));
+     final AtomicLong sequenceId = new AtomicLong(0);
+ 
+-    WAL log = wals.getWAL(UNSPECIFIED_REGION);
++    WAL log = wals.getWAL(UNSPECIFIED_REGION, null);
+     try {
+       SampleRegionWALObserver cp = getCoprocessor(log, SampleRegionWALObserver.class);
+ 
+@@ -396,7 +396,7 @@ public class TestWALObserver {
+     final Configuration newConf = HBaseConfiguration.create(this.conf);
+ 
+     // WAL wal = new WAL(this.fs, this.dir, this.oldLogDir, this.conf);
+-    WAL wal = wals.getWAL(UNSPECIFIED_REGION);
++    WAL wal = wals.getWAL(UNSPECIFIED_REGION, null);
+     // Put p = creatPutWith2Families(TEST_ROW);
+     WALEdit edit = new WALEdit();
+     long now = EnvironmentEdgeManager.currentTime();
+@@ -421,7 +421,7 @@ public class TestWALObserver {
+         FileSystem newFS = FileSystem.get(newConf);
+         // Make a new wal for new region open.
+         final WALFactory wals2 = new WALFactory(conf, null, currentTest.getMethodName()+"2");
+-        WAL wal2 = wals2.getWAL(UNSPECIFIED_REGION);;
++        WAL wal2 = wals2.getWAL(UNSPECIFIED_REGION, null);;
+         HRegion region = HRegion.openHRegion(newConf, FileSystem.get(newConf), hbaseRootDir,
+             hri, htd, wal2, TEST_UTIL.getHBaseCluster().getRegionServer(0), null);
+         long seqid2 = region.getOpenSeqNum();
+@@ -449,7 +449,7 @@ public class TestWALObserver {
+    */
+   @Test
+   public void testWALObserverLoaded() throws Exception {
+-    WAL log = wals.getWAL(UNSPECIFIED_REGION);
++    WAL log = wals.getWAL(UNSPECIFIED_REGION, null);
+     assertNotNull(getCoprocessor(log, SampleRegionWALObserver.class));
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestWALRecordReader.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestWALRecordReader.java
+index 1fcb3668b47485ad0932de5373340d29477782d4..64ef8fdf66308350f825e2e0f2ec2817379cd3d5 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestWALRecordReader.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestWALRecordReader.java
+@@ -119,7 +119,7 @@ public class TestWALRecordReader {
+   @Test
+   public void testPartialRead() throws Exception {
+     final WALFactory walfactory = new WALFactory(conf, null, getName());
+-    WAL log = walfactory.getWAL(info.getEncodedNameAsBytes());
++    WAL log = walfactory.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace());
+     // This test depends on timestamp being millisecond based and the filename of the WAL also
+     // being millisecond based.
+     long ts = System.currentTimeMillis();
+@@ -182,7 +182,7 @@ public class TestWALRecordReader {
+   @Test
+   public void testWALRecordReader() throws Exception {
+     final WALFactory walfactory = new WALFactory(conf, null, getName());
+-    WAL log = walfactory.getWAL(info.getEncodedNameAsBytes());
++    WAL log = walfactory.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace());
+     byte [] value = Bytes.toBytes("value");
+     final AtomicLong sequenceId = new AtomicLong(0);
+     WALEdit edit = new WALEdit();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
+index b7ebd23865f28c656e9f46dda5b4947b1f300fa3..da3c17d1088872dbc4af0368bed4981fe46f63b1 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
+@@ -174,7 +174,7 @@ public class TestCacheOnWriteInSchema {
+     walFactory = new WALFactory(conf, null, id);
+ 
+     region = TEST_UTIL.createLocalHRegion(info, htd,
+-        walFactory.getWAL(info.getEncodedNameAsBytes()));
++        walFactory.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace()));
+     store = new HStore(region, hcd, conf);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultCompactSelection.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultCompactSelection.java
+index 4969a59c83a87e0a3c2130457d420abb3ac3ed34..50b172228b505cd616140fd9c6bbdea9c83c2291 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultCompactSelection.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultCompactSelection.java
+@@ -100,8 +100,8 @@ public class TestDefaultCompactSelection extends TestCase {
+     region = HBaseTestingUtility.createRegionAndWAL(info, basedir, conf, htd);
+     HBaseTestingUtility.closeRegionAndWAL(region);
+     Path tableDir = FSUtils.getTableDir(basedir, htd.getTableName());
+-    region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes()), fs, conf, info, htd,
+-        null);
++    region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes(), info.getTable()
++        .getNamespace()), fs, conf, info, htd, null);
+ 
+     store = new HStore(region, hcd, conf);
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+index e50260fcc25bf5626a5c2a6f06f412a3dccb4ceb..d9995178284f6ded9584151b979a20d53f290858 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+@@ -962,7 +962,7 @@ public class TestDefaultMemStore extends TestCase {
+     desc.addFamily(new HColumnDescriptor("foo".getBytes()));
+     HRegion r =
+         HRegion.createHRegion(hri, testDir, conf, desc,
+-            wFactory.getWAL(hri.getEncodedNameAsBytes()));
++            wFactory.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace()));
+     HRegion.addRegionToMETA(meta, r);
+     edge.setCurrentTimeMillis(1234 + 100);
+     StringBuffer sb = new StringBuffer();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHMobStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHMobStore.java
+index 4ed918cf91d95a212ff597cfaa478a88e4392630..2cb3b38f505b96cae7f54db2f9e9c285488024d3 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHMobStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHMobStore.java
+@@ -160,8 +160,8 @@ public class TestHMobStore {
+     final Configuration walConf = new Configuration(conf);
+     FSUtils.setRootDir(walConf, basedir);
+     final WALFactory wals = new WALFactory(walConf, null, methodName);
+-    region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes()), fs, conf,
+-            info, htd, null);
++    region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes(),
++            info.getTable().getNamespace()), fs, conf, info, htd, null);
+     store = new HMobStore(region, hcd, conf);
+     if(testStore) {
+       init(conf, hcd);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+index a4804f1ec78a6cb6fac64d7fdabb00ba5a1ca78b..e96c6303a9760674ec3e6b137171e0b776b826f5 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+@@ -362,7 +362,7 @@ public class TestHRegion {
+     FSUtils.setRootDir(walConf, logDir);
+     return (new WALFactory(walConf,
+         Collections.<WALActionsListener>singletonList(new MetricsWAL()), callingMethod))
+-        .getWAL(tableName.toBytes());
++        .getWAL(tableName.toBytes(), tableName.getNamespace());
+   }
+ 
+   /**
+@@ -934,7 +934,7 @@ public class TestHRegion {
+     final Configuration walConf = new Configuration(TEST_UTIL.getConfiguration());
+     FSUtils.setRootDir(walConf, logDir);
+     final WALFactory wals = new WALFactory(walConf, null, method);
+-    final WAL wal = wals.getWAL(tableName.getName());
++    final WAL wal = wals.getWAL(tableName.getName(), tableName.getNamespace());
+ 
+     this.region = initHRegion(tableName, HConstants.EMPTY_START_ROW,
+       HConstants.EMPTY_END_ROW, method, CONF, false, Durability.USE_DEFAULT, wal, family);
+@@ -4762,7 +4762,7 @@ public class TestHRegion {
+     final Configuration walConf = new Configuration(conf);
+     FSUtils.setRootDir(walConf, logDir);
+     final WALFactory wals = new WALFactory(walConf, null, UUID.randomUUID().toString());
+-    final WAL wal = spy(wals.getWAL(tableName.getName()));
++    final WAL wal = spy(wals.getWAL(tableName.getName(), tableName.getNamespace()));
+     this.region = initHRegion(tableName, HConstants.EMPTY_START_ROW,
+         HConstants.EMPTY_END_ROW, method, conf, false, tableDurability, wal,
+         new byte[][] { family });
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
+index c065ee78beb172719dc5fad64a5aa75b5098b5d2..c63f6bed2d3111c76ddc16d798f3e11dc60fdd0f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
+@@ -158,8 +158,10 @@ public class TestHRegionReplayEvents {
+       false, time, 1);
+ 
+     wals = TestHRegion.createWALFactory(CONF, rootDir);
+-    walPrimary = wals.getWAL(primaryHri.getEncodedNameAsBytes());
+-    walSecondary = wals.getWAL(secondaryHri.getEncodedNameAsBytes());
++    walPrimary = wals.getWAL(primaryHri.getEncodedNameAsBytes(),
++        primaryHri.getTable().getNamespace());
++    walSecondary = wals.getWAL(secondaryHri.getEncodedNameAsBytes(),
++        secondaryHri.getTable().getNamespace());
+ 
+     rss = mock(RegionServerServices.class);
+     when(rss.getServerName()).thenReturn(ServerName.valueOf("foo", 1, 1));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransaction.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransaction.java
+index b2115b34ea4ae3009e5da09fc5d93ce32433f0bc..f238770e5a13dc4beb6fa04bfc9f2a47de446a31 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransaction.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransaction.java
+@@ -415,8 +415,9 @@ public class TestRegionMergeTransaction {
+     HRegion a = HBaseTestingUtility.createRegionAndWAL(hri, testdir,
+         TEST_UTIL.getConfiguration(), htd);
+     HBaseTestingUtility.closeRegionAndWAL(a);
+-    return HRegion.openHRegion(testdir, hri, htd, wals.getWAL(hri.getEncodedNameAsBytes()),
+-        TEST_UTIL.getConfiguration());
++    return HRegion.openHRegion(testdir, hri, htd,
++      wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace()),
++      TEST_UTIL.getConfiguration());
+   }
+ 
+   private int countRows(final HRegion r) throws IOException {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransaction.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransaction.java
+index 4f371bdb32a1df791b88ec6b0826e5d6023a42eb..26b32934497b2a3d70dedc7cfde5cb3d7aba626e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransaction.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransaction.java
+@@ -380,7 +380,8 @@ public class TestSplitTransaction {
+     HRegion r = HBaseTestingUtility.createRegionAndWAL(hri, testdir, TEST_UTIL.getConfiguration(),
+         htd);
+     HBaseTestingUtility.closeRegionAndWAL(r);
+-    return HRegion.openHRegion(testdir, hri, htd, wals.getWAL(hri.getEncodedNameAsBytes()),
++    return HRegion.openHRegion(testdir, hri, htd,
++      wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace()),
+       TEST_UTIL.getConfiguration());
+   }
+   
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
+index a1a58bce15d6980db099c6d961f9d7ffbd0c7546..6b669a0198fb0ddd4c3f819c7123d7605f7ab44b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStore.java
+@@ -186,8 +186,8 @@ public class TestStore {
+     final Configuration walConf = new Configuration(conf);
+     FSUtils.setRootDir(walConf, basedir);
+     final WALFactory wals = new WALFactory(walConf, null, methodName);
+-    HRegion region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes()), fs, conf,
+-        info, htd, null);
++    HRegion region = new HRegion(tableDir, wals.getWAL(info.getEncodedNameAsBytes(),
++            info.getTable().getNamespace()), fs, conf, info, htd, null);
+ 
+     store = new HStore(region, hcd, conf);
+     return store;
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFileRefresherChore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFileRefresherChore.java
+index ed0ac25f16fac9a30f6d8c10ac4f169cf3e150e0..665c5468a0c6e38eb7fe70734d3dd6103170a8f6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFileRefresherChore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFileRefresherChore.java
+@@ -106,7 +106,9 @@ public class TestStoreFileRefresherChore {
+     final Configuration walConf = new Configuration(conf);
+     FSUtils.setRootDir(walConf, tableDir);
+     final WALFactory wals = new WALFactory(walConf, null, "log_" + replicaId);
+-    HRegion region = new HRegion(fs, wals.getWAL(info.getEncodedNameAsBytes()), conf, htd, null);
++    HRegion region =
++        new HRegion(fs, wals.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace()),
++            conf, htd, null);
+ 
+     region.initialize();
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestDurability.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestDurability.java
+index 94aa1069a096341c7d41e1d5e56e4ed1d7de8ffb..72e433018e3ae74be33981b3a607c19d1690ab5f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestDurability.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestDurability.java
+@@ -85,7 +85,7 @@ public class TestDurability {
+   public void testDurability() throws Exception {
+     final WALFactory wals = new WALFactory(CONF, null, "TestDurability");
+     byte[] tableName = Bytes.toBytes("TestDurability");
+-    final WAL wal = wals.getWAL(tableName);
++    final WAL wal = wals.getWAL(tableName, null);
+     HRegion region = createHRegion(tableName, "region", wal, Durability.USE_DEFAULT);
+     HRegion deferredRegion = createHRegion(tableName, "deferredRegion", wal, Durability.ASYNC_WAL);
+ 
+@@ -148,7 +148,7 @@ public class TestDurability {
+     // Setting up region
+     final WALFactory wals = new WALFactory(CONF, null, "TestIncrement");
+     byte[] tableName = Bytes.toBytes("TestIncrement");
+-    final WAL wal = wals.getWAL(tableName);
++    final WAL wal = wals.getWAL(tableName, null);
+     HRegion region = createHRegion(tableName, "increment", wal, Durability.USE_DEFAULT);
+ 
+     // col1: amount = 1, 1 write back to WAL
+@@ -206,7 +206,7 @@ public class TestDurability {
+     // Setting up region
+     final WALFactory wals = new WALFactory(CONF, null, "testIncrementWithReturnResultsSetToFalse");
+     byte[] tableName = Bytes.toBytes("testIncrementWithReturnResultsSetToFalse");
+-    final WAL wal = wals.getWAL(tableName);
++    final WAL wal = wals.getWAL(tableName, null);
+     HRegion region = createHRegion(tableName, "increment", wal, Durability.USE_DEFAULT);
+ 
+     Increment inc1 = new Increment(row1);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollAbort.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollAbort.java
+index 4e07040b97046a07863429e1189587999d39be5e..e990d836d637883d2af01ce86efb8db9fe4215a0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollAbort.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollAbort.java
+@@ -190,7 +190,8 @@ public class TestLogRollAbort {
+           TableName.valueOf(this.getClass().getName());
+       HRegionInfo regioninfo = new HRegionInfo(tableName,
+           HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+-      final WAL log = wals.getWAL(regioninfo.getEncodedNameAsBytes());
++      final WAL log = wals.getWAL(regioninfo.getEncodedNameAsBytes(),
++          regioninfo.getTable().getNamespace());
+     
+       final AtomicLong sequenceId = new AtomicLong(1);
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+index 6309e8921af8c3f4fa413f9cccc8237a91ae5b18..a5d366b0ac706ab447e1f46d8d576c092f623e70 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+@@ -199,7 +199,7 @@ public class TestLogRolling  {
+     final Configuration conf = TEST_UTIL.getConfiguration();
+     final WALFactory wals = new WALFactory(conf, null,
+         ServerName.valueOf("test.com",8080, 1).toString());
+-    final WAL newLog = wals.getWAL(new byte[]{});
++    final WAL newLog = wals.getWAL(new byte[]{}, null);
+     try {
+       // Now roll the log before we write anything.
+       newLog.rollWriter(true);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
+index bc33fc035e8d3f4d91cf5933bcfa7e3b67e6253f..ea565e15816046caec3bdaba904da7ac19cdf58d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
+@@ -65,7 +65,7 @@ public class TestLogRollingNoCluster {
+     final Configuration conf = new Configuration(TEST_UTIL.getConfiguration());
+     FSUtils.setRootDir(conf, dir);
+     final WALFactory wals = new WALFactory(conf, null, TestLogRollingNoCluster.class.getName());
+-    final WAL wal = wals.getWAL(new byte[]{});
++    final WAL wal = wals.getWAL(new byte[]{}, null);
+     
+     Appender [] appenders = null;
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
+index 69482d16018643b609ddeb03adc02e71c8a5cdbe..390587d8176abee515207586564d0ab10ca8fb9a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
+@@ -91,7 +91,7 @@ public class TestWALActionsListener {
+     final AtomicLong sequenceId = new AtomicLong(1);
+     HRegionInfo hri = new HRegionInfo(TableName.valueOf(SOME_BYTES),
+              SOME_BYTES, SOME_BYTES, false);
+-    final WAL wal = wals.getWAL(hri.getEncodedNameAsBytes());
++    final WAL wal = wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace());
+ 
+     for (int i = 0; i < 20; i++) {
+       byte[] b = Bytes.toBytes(i+"");
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+index fddee29df70c7f4182028234ad774aa45e4e15d1..bbe1495c01150fb522c424132b6daca0a579078b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+@@ -201,7 +201,7 @@ public class TestReplicationSourceManager {
+     listeners.add(replication);
+     final WALFactory wals = new WALFactory(utility.getConfiguration(), listeners,
+         URLEncoder.encode("regionserver:60020", "UTF8"));
+-    final WAL wal = wals.getWAL(hri.getEncodedNameAsBytes());
++    final WAL wal = wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace());
+     final AtomicLong sequenceId = new AtomicLong(1);
+     manager.init();
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("tableame"));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationWALReaderManager.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationWALReaderManager.java
+index 8586d33e3a187bc1af8b2056b03efb511b326e5c..41662a81b51e2210004409f2b91090715cc6da1d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationWALReaderManager.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationWALReaderManager.java
+@@ -131,7 +131,7 @@ public class TestReplicationWALReaderManager {
+     pathWatcher = new PathWatcher();
+     listeners.add(pathWatcher);
+     final WALFactory wals = new WALFactory(conf, listeners, tn.getMethodName());
+-    log = wals.getWAL(info.getEncodedNameAsBytes());
++    log = wals.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace());
+   }
+ 
+   @After
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTool.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTool.java
+index 8688c616cfbb22d901d2af48dec2015eed4b60bf..a1b2aa1c35cf816103c93d614cedc0927daabc77 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTool.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTool.java
+@@ -275,7 +275,7 @@ public class TestMergeTool extends HBaseTestCase {
+       // Close the region and delete the log
+       HBaseTestingUtility.closeRegionAndWAL(regions[i]);
+     }
+-    WAL log = wals.getWAL(new byte[]{});
++    WAL log = wals.getWAL(new byte[]{}, null);
+      // Merge Region 0 and Region 1
+     HRegion merged = mergeAndVerify("merging regions 0 and 1 ",
+       this.sourceRegions[0].getRegionNameAsString(),
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+index e06a587733d6983e2d6acbb4a5ba70fba4feef58..6b1ca037650a2368a5592a0cfe517b388becfa1f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+@@ -108,7 +108,7 @@ public class IOTestProvider implements WALProvider {
+   }
+ 
+   @Override
+-  public WAL getWAL(final byte[] identifier) throws IOException {
++  public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+    return log;
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestBoundedRegionGroupingStrategy.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestBoundedRegionGroupingStrategy.java
+index 8b15150f2803464f516b0b39bc2e731e1a0fc69b..c810f33fe0736aaedb547489d75d70a967aacae4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestBoundedRegionGroupingStrategy.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestBoundedRegionGroupingStrategy.java
+@@ -172,7 +172,7 @@ public class TestBoundedRegionGroupingStrategy {
+       int count = 0;
+       // we know that this should see one of the wals more than once
+       for (int i = 0; i < temp*8; i++) {
+-        final WAL maybeNewWAL = wals.getWAL(Bytes.toBytes(random.nextInt()));
++        final WAL maybeNewWAL = wals.getWAL(Bytes.toBytes(random.nextInt()), null);
+         LOG.info("Iteration " + i + ", checking wal " + maybeNewWAL);
+         if (seen.add(maybeNewWAL)) {
+           count++;
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestDefaultWALProvider.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestDefaultWALProvider.java
+index cf0488ad616f97ba7af21043e97e8d92975fe849..c48f60bab7d2a93f94dfe94e97b81f8fd2459dad 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestDefaultWALProvider.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestDefaultWALProvider.java
+@@ -198,7 +198,7 @@ public class TestDefaultWALProvider {
+       HRegionInfo hri2 = new HRegionInfo(htd2.getTableName(),
+           HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+       // we want to mix edits from regions, so pick our own identifier.
+-      final WAL log = wals.getWAL(UNSPECIFIED_REGION);
++      final WAL log = wals.getWAL(UNSPECIFIED_REGION, null);
+ 
+       // Add a single edit and make sure that rolling won't remove the file
+       // Before HBASE-3198 it used to delete it
+@@ -265,7 +265,7 @@ public class TestDefaultWALProvider {
+     localConf.set(WALFactory.WAL_PROVIDER, DefaultWALProvider.class.getName());
+     final WALFactory wals = new WALFactory(localConf, null, currentTest.getMethodName());
+     try {
+-      final WAL wal = wals.getWAL(UNSPECIFIED_REGION);
++      final WAL wal = wals.getWAL(UNSPECIFIED_REGION, null);
+       assertEquals(0, DefaultWALProvider.getNumRolledLogFiles(wal));
+       HRegionInfo hri1 =
+           new HRegionInfo(table1.getTableName(), HConstants.EMPTY_START_ROW,
+@@ -351,10 +351,11 @@ public class TestDefaultWALProvider {
+       final Set<WAL> seen = new HashSet<WAL>(1);
+       final Random random = new Random();
+       assertTrue("first attempt to add WAL from default provider should work.",
+-          seen.add(wals.getWAL(Bytes.toBytes(random.nextInt()))));
++          seen.add(wals.getWAL(Bytes.toBytes(random.nextInt()), null)));
+       for (int i = 0; i < 1000; i++) {
+-        assertFalse("default wal provider is only supposed to return a single wal, which should " +
+-            "compare as .equals itself.", seen.add(wals.getWAL(Bytes.toBytes(random.nextInt()))));
++        assertFalse("default wal provider is only supposed to return a single wal, which should "
++            + "compare as .equals itself.",
++          seen.add(wals.getWAL(Bytes.toBytes(random.nextInt()), null)));
+       }
+     } finally {
+       wals.close();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestSecureWAL.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestSecureWAL.java
+index 847b206d980f7b53d99e8e0fec6c364680046270..a74fd8477354b8ef0a32fded3494552308a4ff7a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestSecureWAL.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestSecureWAL.java
+@@ -91,7 +91,8 @@ public class TestSecureWAL {
+     final AtomicLong sequenceId = new AtomicLong(1);
+ 
+     // Write the WAL
+-    final WAL wal = wals.getWAL(regioninfo.getEncodedNameAsBytes());
++    final WAL wal =
++        wals.getWAL(regioninfo.getEncodedNameAsBytes(), regioninfo.getTable().getNamespace());
+ 
+     for (int i = 0; i < total; i++) {
+       WALEdit kvs = new WALEdit();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
+index e393c1365e636af167d02d8914ba45cadf519cf1..875492cacbce56dc3b8ee430c88aa1bcd30f3ab4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
+@@ -185,7 +185,8 @@ public class TestWALFactory {
+     final AtomicLong sequenceId = new AtomicLong(1);
+     for (int ii = 0; ii < howmany; ii++) {
+       for (int i = 0; i < howmany; i++) {
+-        final WAL log = wals.getWAL(infos[i].getEncodedNameAsBytes());
++        final WAL log =
++            wals.getWAL(infos[i].getEncodedNameAsBytes(), infos[i].getTable().getNamespace());
+         for (int j = 0; j < howmany; j++) {
+           WALEdit edit = new WALEdit();
+           byte [] family = Bytes.toBytes("column");
+@@ -246,7 +247,7 @@ public class TestWALFactory {
+                   null,null, false);
+       HTableDescriptor htd = new HTableDescriptor(tableName);
+       htd.addFamily(new HColumnDescriptor(tableName.getName()));
+-      final WAL wal = wals.getWAL(info.getEncodedNameAsBytes());
++      final WAL wal = wals.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace());
+ 
+       for (int i = 0; i < total; i++) {
+         WALEdit kvs = new WALEdit();
+@@ -361,7 +362,8 @@ public class TestWALFactory {
+     HRegionInfo regioninfo = new HRegionInfo(tableName,
+              HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW, false);
+ 
+-    final WAL wal = wals.getWAL(regioninfo.getEncodedNameAsBytes());
++    final WAL wal =
++        wals.getWAL(regioninfo.getEncodedNameAsBytes(), regioninfo.getTable().getNamespace());
+     final AtomicLong sequenceId = new AtomicLong(1);
+     final int total = 20;
+ 
+@@ -498,7 +500,7 @@ public class TestWALFactory {
+       }
+       HRegionInfo info = new HRegionInfo(htd.getTableName(),
+         row,Bytes.toBytes(Bytes.toString(row) + "1"), false);
+-      final WAL log = wals.getWAL(info.getEncodedNameAsBytes());
++      final WAL log = wals.getWAL(info.getEncodedNameAsBytes(), info.getTable().getNamespace());
+ 
+       final long txid = log.append(htd, info,
+         new WALKey(info.getEncodedNameAsBytes(), htd.getTableName(), System.currentTimeMillis()),
+@@ -556,7 +558,7 @@ public class TestWALFactory {
+       }
+       HRegionInfo hri = new HRegionInfo(htd.getTableName(),
+           HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+-      final WAL log = wals.getWAL(hri.getEncodedNameAsBytes());
++      final WAL log = wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace());
+       final long txid = log.append(htd, hri,
+         new WALKey(hri.getEncodedNameAsBytes(), htd.getTableName(), System.currentTimeMillis()),
+         cols, sequenceId, true, null);
+@@ -605,7 +607,7 @@ public class TestWALFactory {
+ 
+     HRegionInfo hri = new HRegionInfo(tableName,
+         HConstants.EMPTY_START_ROW, HConstants.EMPTY_END_ROW);
+-    final WAL log = wals.getWAL(hri.getEncodedNameAsBytes());
++    final WAL log = wals.getWAL(hri.getEncodedNameAsBytes(), hri.getTable().getNamespace());
+     log.registerWALActionsListener(visitor);
+     for (int i = 0; i < COL_COUNT; i++) {
+       WALEdit cols = new WALEdit();
+@@ -634,7 +636,7 @@ public class TestWALFactory {
+   @Test
+   public void testWALCoprocessorLoaded() throws Exception {
+     // test to see whether the coprocessor is loaded or not.
+-    WALCoprocessorHost host = wals.getWAL(UNSPECIFIED_REGION).getCoprocessorHost();
++    WALCoprocessorHost host = wals.getWAL(UNSPECIFIED_REGION, null).getCoprocessorHost();
+     Coprocessor c = host.findCoprocessor(SampleRegionWALObserver.class.getName());
+     assertNotNull(c);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALMethods.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALMethods.java
+index 0c03019de936a60359c85d284d8efa9c5168f1b8..bfe5d5e85ff61375c1fa554122578149a68083b2 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALMethods.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALMethods.java
+@@ -80,7 +80,7 @@ public class TestWALMethods {
+ 
+     final Configuration walConf = new Configuration(util.getConfiguration());
+     FSUtils.setRootDir(walConf, regiondir);
+-    (new WALFactory(walConf, null, "dummyLogName")).getWAL(new byte[]{});
++    (new WALFactory(walConf, null, "dummyLogName")).getWAL(new byte[] {}, null);
+ 
+     NavigableSet<Path> files = WALSplitter.getSplitEditFilesSorted(fs, regiondir);
+     assertEquals(7, files.size());
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALReaderOnSecureWAL.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALReaderOnSecureWAL.java
+index 52e28eb9bcf4c856244fc9b54f0610220e337f36..415d626b62c884fdc04dc6bdbefbc589183ad7d6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALReaderOnSecureWAL.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALReaderOnSecureWAL.java
+@@ -109,7 +109,8 @@ public class TestWALReaderOnSecureWAL {
+       final AtomicLong sequenceId = new AtomicLong(1);
+ 
+       // Write the WAL
+-      WAL wal = wals.getWAL(regioninfo.getEncodedNameAsBytes());
++      WAL wal =
++          wals.getWAL(regioninfo.getEncodedNameAsBytes(), regioninfo.getTable().getNamespace());
+       for (int i = 0; i < total; i++) {
+         WALEdit kvs = new WALEdit();
+         kvs.add(new KeyValue(row, family, Bytes.toBytes(i), value));
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
+index a32aede16c05245dede3fb95cd1ff3830b858faf..4b70ab675121afef959abb56c79cce56ebed56bc 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
+@@ -1073,7 +1073,7 @@ public class TestWALSplit {
+     REGIONS.add(regionName);
+     generateWALs(-1);
+ 
+-    wals.getWAL(Bytes.toBytes(regionName));
++    wals.getWAL(Bytes.toBytes(regionName), null);
+     FileStatus[] logfiles = fs.listStatus(WALDIR);
+     assertTrue("There should be some log file",
+       logfiles != null && logfiles.length > 0);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
+index 28c68b3818fc12ab0d3511662f7ee4937bb5a219..64bf319559cc4224ffecdc002b5169bdae74207b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
+@@ -485,7 +485,8 @@ public final class WALPerformanceEvaluation extends Configured implements Tool {
+     // Initialize HRegion
+     HRegionInfo regionInfo = new HRegionInfo(htd.getTableName());
+     // Initialize WAL
+-    final WAL wal = wals.getWAL(regionInfo.getEncodedNameAsBytes());
++    final WAL wal =
++        wals.getWAL(regionInfo.getEncodedNameAsBytes(), regionInfo.getTable().getNamespace());
+     // If we haven't already, attach a listener to this wal to handle rolls and metrics.
+     if (walsListenedTo.add(wal)) {
+       roller.addWAL(wal);

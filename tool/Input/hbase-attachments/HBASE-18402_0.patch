@@ -1,0 +1,239 @@
+From e2ccf036ed080621e95116ba12ebe475496c363d Mon Sep 17 00:00:00 2001
+From: huzheng <openinx@gmail.com>
+Date: Wed, 19 Jul 2017 18:00:11 +0800
+Subject: [PATCH] Thrift2 should support DeleteFamily and DeleteFamilyVersion
+ type
+
+---
+ .../hadoop/hbase/thrift2/ThriftUtilities.java      | 47 +++++++----
+ .../hbase/thrift2/generated/TDeleteType.java       |  8 +-
+ .../org/apache/hadoop/hbase/thrift2/hbase.thrift   |  4 +-
+ .../thrift2/TestThriftHBaseServiceHandler.java     | 91 +++++++++++++++++++++-
+ 4 files changed, 129 insertions(+), 21 deletions(-)
+
+diff --git a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java
+index 3807bec..f318f8e 100644
+--- a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java
++++ b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java
+@@ -268,27 +268,40 @@ public class ThriftUtilities {
+     if (in.isSetColumns()) {
+       out = new Delete(in.getRow());
+       for (TColumn column : in.getColumns()) {
+-        if (column.isSetQualifier()) {
+-          if (column.isSetTimestamp()) {
+-            if (in.isSetDeleteType() &&
+-                in.getDeleteType().equals(TDeleteType.DELETE_COLUMNS))
+-              out.addColumns(column.getFamily(), column.getQualifier(), column.getTimestamp());
+-            else
++        if (in.isSetDeleteType()) {
++          switch (in.getDeleteType()) {
++          case DELETE_COLUMN:
++            if (column.isSetTimestamp()) {
+               out.addColumn(column.getFamily(), column.getQualifier(), column.getTimestamp());
+-          } else {
+-            if (in.isSetDeleteType() &&
+-                in.getDeleteType().equals(TDeleteType.DELETE_COLUMNS))
+-              out.addColumns(column.getFamily(), column.getQualifier());
+-            else
++            } else {
+               out.addColumn(column.getFamily(), column.getQualifier());
++            }
++            break;
++          case DELETE_COLUMNS:
++            if (column.isSetTimestamp()) {
++              out.addColumns(column.getFamily(), column.getQualifier(), column.getTimestamp());
++            } else {
++              out.addColumns(column.getFamily(), column.getQualifier());
++            }
++            break;
++          case DELETE_FAMILY:
++            if (column.isSetTimestamp()) {
++              out.addFamily(column.getFamily(), column.getTimestamp());
++            } else {
++              out.addFamily(column.getFamily());
++            }
++            break;
++          case DELETE_FAMILY_VERSION:
++            if (column.isSetTimestamp()) {
++              out.addFamilyVersion(column.getFamily(), column.getTimestamp());
++            } else {
++              throw new IllegalArgumentException(
++                  "Timestamp is required for TDelete with DeleteFamilyVersion type");
++            }
++            break;
+           }
+-
+         } else {
+-          if (column.isSetTimestamp()) {
+-            out.addFamily(column.getFamily(), column.getTimestamp());
+-          } else {
+-            out.addFamily(column.getFamily());
+-          }
++          throw new IllegalArgumentException("DeleteType is required for TDelete");
+         }
+       }
+     } else {
+diff --git a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java
+index 5d47508..8c9aa39 100644
+--- a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java
++++ b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java
+@@ -18,7 +18,9 @@ import org.apache.thrift.TEnum;
+  */
+ public enum TDeleteType implements org.apache.thrift.TEnum {
+   DELETE_COLUMN(0),
+-  DELETE_COLUMNS(1);
++  DELETE_COLUMNS(1),
++  DELETE_FAMILY(2),
++  DELETE_FAMILY_VERSION(3);
+ 
+   private final int value;
+ 
+@@ -43,6 +45,10 @@ public enum TDeleteType implements org.apache.thrift.TEnum {
+         return DELETE_COLUMN;
+       case 1:
+         return DELETE_COLUMNS;
++      case 2:
++        return DELETE_FAMILY;
++      case 3:
++        return DELETE_FAMILY_VERSION;
+       default:
+         return null;
+     }
+diff --git a/hbase-thrift/src/main/resources/org/apache/hadoop/hbase/thrift2/hbase.thrift b/hbase-thrift/src/main/resources/org/apache/hadoop/hbase/thrift2/hbase.thrift
+index e2e5b29..8c5ef59 100644
+--- a/hbase-thrift/src/main/resources/org/apache/hadoop/hbase/thrift2/hbase.thrift
++++ b/hbase-thrift/src/main/resources/org/apache/hadoop/hbase/thrift2/hbase.thrift
+@@ -75,7 +75,9 @@ struct TResult {
+  */
+ enum TDeleteType {
+   DELETE_COLUMN = 0,
+-  DELETE_COLUMNS = 1
++  DELETE_COLUMNS = 1,
++  DELETE_FAMILY = 2,
++  DELETE_FAMILY_VERSION = 3
+ }
+ 
+ /**
+diff --git a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandler.java b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandler.java
+index c3f59f6..c26eaf5 100644
+--- a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandler.java
++++ b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandler.java
+@@ -31,8 +31,11 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Get;
+ import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.client.Increment;
+ import org.apache.hadoop.hbase.client.Delete;
+@@ -75,10 +78,8 @@ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Rule;
+ import org.junit.Test;
+-import org.junit.Rule;
+ import org.junit.rules.TestName;
+ import org.junit.experimental.categories.Category;
+-import org.junit.rules.TestName;
+ 
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+@@ -441,6 +442,92 @@ public class TestThriftHBaseServiceHandler {
+   }
+ 
+   @Test
++  public void testDeleteFamily() throws Exception {
++    ThriftHBaseServiceHandler handler = createHandler();
++    byte[] rowName = "testDeleteFamily".getBytes();
++    ByteBuffer table = wrap(tableAname);
++
++    long timestamp1 = System.currentTimeMillis() - 10;
++    long timestamp2 = System.currentTimeMillis();
++
++    List<TColumnValue> columnValues = new ArrayList<TColumnValue>();
++    TColumnValue columnValueA =
++        new TColumnValue(wrap(familyAname), wrap(qualifierAname), wrap(valueAname));
++    columnValueA.setTimestamp(timestamp1);
++    columnValues.add(columnValueA);
++    TPut put = new TPut(wrap(rowName), columnValues);
++
++    put.setColumnValues(columnValues);
++
++    handler.put(table, put);
++    columnValueA.setTimestamp(timestamp2);
++    handler.put(table, put);
++
++    TGet get = new TGet(wrap(rowName));
++    get.setMaxVersions(2);
++    TResult result = handler.get(table, get);
++    assertEquals(2, result.getColumnValuesSize());
++
++    TDelete delete = new TDelete(wrap(rowName));
++    List<TColumn> deleteColumns = new ArrayList<TColumn>();
++    TColumn deleteColumn = new TColumn(wrap(familyAname));
++    deleteColumns.add(deleteColumn);
++    delete.setColumns(deleteColumns);
++    delete.setDeleteType(TDeleteType.DELETE_FAMILY);
++
++    handler.deleteSingle(table, delete);
++
++    get = new TGet(wrap(rowName));
++    result = handler.get(table, get);
++    assertArrayEquals(null, result.getRow());
++    assertEquals(0, result.getColumnValuesSize());
++  }
++
++  @Test
++  public void testDeleteFamilyVersion() throws Exception {
++    ThriftHBaseServiceHandler handler = createHandler();
++    byte[] rowName = "testDeleteFamilyVersion".getBytes();
++    ByteBuffer table = wrap(tableAname);
++
++    long timestamp1 = System.currentTimeMillis() - 10;
++    long timestamp2 = System.currentTimeMillis();
++
++    List<TColumnValue> columnValues = new ArrayList<TColumnValue>();
++    TColumnValue columnValueA =
++        new TColumnValue(wrap(familyAname), wrap(qualifierAname), wrap(valueAname));
++    columnValueA.setTimestamp(timestamp1);
++    columnValues.add(columnValueA);
++    TPut put = new TPut(wrap(rowName), columnValues);
++
++    put.setColumnValues(columnValues);
++
++    handler.put(table, put);
++    columnValueA.setTimestamp(timestamp2);
++    handler.put(table, put);
++
++    TGet get = new TGet(wrap(rowName));
++    get.setMaxVersions(2);
++    TResult result = handler.get(table, get);
++    assertEquals(2, result.getColumnValuesSize());
++
++    TDelete delete = new TDelete(wrap(rowName));
++    List<TColumn> deleteColumns = new ArrayList<TColumn>();
++    TColumn deleteColumn = new TColumn(wrap(familyAname));
++    deleteColumn.setTimestamp(timestamp1);
++    deleteColumns.add(deleteColumn);
++    delete.setColumns(deleteColumns);
++    delete.setDeleteType(TDeleteType.DELETE_FAMILY_VERSION);
++
++    handler.deleteSingle(table, delete);
++
++    get = new TGet(wrap(rowName));
++    result = handler.get(table, get);
++    assertArrayEquals(rowName, result.getRow());
++    assertEquals(1, result.getColumnValuesSize());
++    assertEquals(timestamp2, result.getColumnValues().get(0).getTimestamp());
++  }
++
++  @Test
+   public void testIncrement() throws Exception {
+     ThriftHBaseServiceHandler handler = createHandler();
+     byte[] rowName = "testIncrement".getBytes();
+-- 
+2.7.4
+

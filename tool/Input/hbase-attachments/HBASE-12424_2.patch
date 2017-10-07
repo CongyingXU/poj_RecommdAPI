@@ -1,0 +1,154 @@
+From 5a224b68fc8c29831b65716f9832ff3ba6a5b9a6 Mon Sep 17 00:00:00 2001
+From: Andrew Purtell <apurtell@apache.org>
+Date: Thu, 6 Nov 2014 11:04:48 -0800
+Subject: [PATCH 3/3] HBASE-12424 Finer grained logging and metrics for split
+ transactions
+
+Export a RegionServer histogram metric for flush request processing
+time name "flushTime"
+---
+ .../hbase/regionserver/MetricsRegionServerSource.java |  7 +++++++
+ .../regionserver/MetricsRegionServerSourceImpl.java   |  7 +++++++
+ .../hadoop/hbase/regionserver/MemStoreFlusher.java    | 19 +++++++++++++++++--
+ .../hbase/regionserver/MetricsRegionServer.java       |  4 ++++
+ .../hadoop/hbase/regionserver/RSRpcServices.java      |  8 +++++++-
+ 5 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+index a5fd8e4..458ed01 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+@@ -118,6 +118,12 @@ public interface MetricsRegionServerSource extends BaseSource {
+    */
+   void updateSplitTime(long t);
+ 
++  /**
++   * Update the flush time histogram
++   * @param t time it took, in milliseconds
++   */
++  void updateFlushTime(long t);
++
+   // Strings used for exporting to metrics system.
+   String REGION_COUNT = "regionCount";
+   String REGION_COUNT_DESC = "Number of regions";
+@@ -247,4 +253,5 @@ public interface MetricsRegionServerSource extends BaseSource {
+       "The number of times we started a hedged read and a hedged read won";
+ 
+   String SPLIT_KEY = "splitTime";
++  String FLUSH_KEY = "flushTime";
+ }
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+index 9500e98..bc1aa07 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+@@ -50,6 +50,7 @@ public class MetricsRegionServerSourceImpl
+   private final MutableCounterLong slowAppend;
+ 
+   private final MetricHistogram splitTimeHisto;
++  private final MetricHistogram flushTimeHisto;
+ 
+   public MetricsRegionServerSourceImpl(MetricsRegionServerWrapper rsWrap) {
+     this(METRICS_NAME, METRICS_DESCRIPTION, METRICS_CONTEXT, METRICS_JMX_CONTEXT, rsWrap);
+@@ -81,6 +82,7 @@ public class MetricsRegionServerSourceImpl
+     replayHisto = getMetricsRegistry().newHistogram(REPLAY_KEY);
+ 
+     splitTimeHisto = getMetricsRegistry().newHistogram(SPLIT_KEY);
++    flushTimeHisto = getMetricsRegistry().newHistogram(FLUSH_KEY);
+   }
+ 
+   @Override
+@@ -143,6 +145,11 @@ public class MetricsRegionServerSourceImpl
+     splitTimeHisto.add(t);
+   }
+ 
++  @Override
++  public void updateFlushTime(long t) {
++    flushTimeHisto.add(t);
++  }
++
+   /**
+    * Yes this is a get function that doesn't return anything.  Thanks Hadoop for breaking all
+    * expectations of java programmers.  Instead of returning anything Hadoop metrics expects
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+index b6e0d14..34576f7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+@@ -422,18 +422,30 @@ class MemStoreFlusher implements FlushRequester {
+    * not flushed.
+    */
+   private boolean flushRegion(final HRegion region, final boolean emergencyFlush) {
++    long startTime = 0;
+     synchronized (this.regionsInQueue) {
+       FlushRegionEntry fqe = this.regionsInQueue.remove(region);
++      // Use the start time of the FlushRegionEntry if available
++      if (fqe != null) {
++        startTime = fqe.createTime;
++      }
+       if (fqe != null && emergencyFlush) {
+         // Need to remove from region from delay queue.  When NOT an
+         // emergencyFlush, then item was removed via a flushQueue.poll.
+         flushQueue.remove(fqe);
+      }
+     }
++    if (startTime == 0) {
++      // Avoid getting the system time unless we don't have a FlushRegionEntry;
++      // shame we can't capture the time also spent in the above synchronized
++      // block
++      startTime = EnvironmentEdgeManager.currentTime();
++    }
+     lock.readLock().lock();
+     try {
+       notifyFlushRequest(region, emergencyFlush);
+-      boolean shouldCompact = region.flushcache().isCompactionNeeded();
++      HRegion.FlushResult flushResult = region.flushcache();
++      boolean shouldCompact = flushResult.isCompactionNeeded();
+       // We just want to check the size
+       boolean shouldSplit = region.checkSplit() != null;
+       if (shouldSplit) {
+@@ -442,7 +454,10 @@ class MemStoreFlusher implements FlushRequester {
+         server.compactSplitThread.requestSystemCompaction(
+             region, Thread.currentThread().getName());
+       }
+-
++      if (flushResult.isFlushSucceeded()) {
++        long endTime = EnvironmentEdgeManager.currentTime();
++        server.metricsRegionServer.updateFlushTime(endTime - startTime);
++      }
+     } catch (DroppedSnapshotException ex) {
+       // Cache flush can fail in a few places. If it fails in a critical
+       // section, we get a DroppedSnapshotException and a replay of hlog
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
+index 3f369be..4596edc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
+@@ -98,4 +98,8 @@ public class MetricsRegionServer {
+   public void updateSplitTime(long t) {
+     serverSource.updateSplitTime(t);
+   }
++
++  public void updateFlushTime(long t) {
++    serverSource.updateFlushTime(t);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 9eb2c0f..079ebee 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -1080,7 +1080,13 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       }
+       FlushRegionResponse.Builder builder = FlushRegionResponse.newBuilder();
+       if (shouldFlush) {
+-        boolean result = region.flushcache().isCompactionNeeded();
++        long startTime = EnvironmentEdgeManager.currentTime();
++        HRegion.FlushResult flushResult = region.flushcache();
++        if (flushResult.isFlushSucceeded()) {
++          long endTime = EnvironmentEdgeManager.currentTime();
++          regionServer.metricsRegionServer.updateFlushTime(endTime - startTime);
++        }
++        boolean result = flushResult.isCompactionNeeded();
+         if (result) {
+           regionServer.compactSplitThread.requestSystemCompaction(region,
+             "Compaction through user triggered flush");
+-- 
+1.7.12.4 (Apple Git-37)
+

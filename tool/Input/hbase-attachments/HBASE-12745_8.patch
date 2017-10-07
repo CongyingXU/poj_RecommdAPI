@@ -1,0 +1,1158 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+index 4af28b2..a2648e9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlLists.java
+@@ -641,6 +641,13 @@ public class AccessControlLists {
+     return aclKey.substring(GROUP_PREFIX.length());
+   }
+ 
++  /**
++   * Returns the group entry with the group prefix for a group principal.
++   */
++  public static String toGroupEntry(String name) {
++    return GROUP_PREFIX + name;
++  }
++
+   public static boolean isNamespaceEntry(String entryName) {
+     return entryName.charAt(0) == NAMESPACE_PREFIX;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
+index 2d0e446..6b9a358 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefaultVisibilityLabelServiceImpl.java
+@@ -31,6 +31,7 @@ import java.util.ArrayList;
+ import java.util.BitSet;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -63,8 +64,6 @@ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+ 
+-import com.google.common.collect.Lists;
+-
+ @InterfaceAudience.Private
+ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService {
+ 
+@@ -81,6 +80,7 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   private VisibilityLabelsCache labelsCache;
+   private List<ScanLabelGenerator> scanLabelGenerators;
+   private List<String> superUsers;
++  private List<String> superGroups;
+ 
+   static {
+     ByteArrayOutputStream baos = new ByteArrayOutputStream();
+@@ -117,7 +117,10 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+       throw ioe;
+     }
+     this.scanLabelGenerators = VisibilityUtils.getScanLabelGenerators(this.conf);
+-    this.superUsers = getSystemAndSuperUsers();
++    Pair<List<String>, List<String>> superUsersAndGroups =
++        VisibilityUtils.getSystemAndSuperUsers(this.conf);
++    this.superUsers = superUsersAndGroups.getFirst();
++    this.superGroups = superUsersAndGroups.getSecond();
+     if (e.getRegion().getRegionInfo().getTable().equals(LABELS_TABLE_NAME)) {
+       this.labelsRegion = e.getRegion();
+       Pair<Map<String, Integer>, Map<String, List<Integer>>> labelsAndUserAuths =
+@@ -203,21 +206,6 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+     }
+   }
+ 
+-  protected List<String> getSystemAndSuperUsers() throws IOException {
+-    User user = User.getCurrent();
+-    if (user == null) {
+-      throw new IOException("Unable to obtain the current user, "
+-          + "authorization checks for internal operations will not work correctly!");
+-    }
+-    if (LOG.isTraceEnabled()) {
+-      LOG.trace("Current user name is " + user.getShortName());
+-    }
+-    String currentUser = user.getShortName();
+-    List<String> superUsers = Lists.asList(currentUser,
+-        this.conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+-    return superUsers;
+-  }
+-
+   @Override
+   public OperationStatus[] addLabels(List<byte[]> labels) throws IOException {
+     assert labelsRegion != null;
+@@ -276,7 +264,14 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   public OperationStatus[] clearAuths(byte[] user, List<byte[]> authLabels) throws IOException {
+     assert labelsRegion != null;
+     OperationStatus[] finalOpStatus = new OperationStatus[authLabels.size()];
+-    List<String> currentAuths = this.getAuths(user, true);
++    List<String> currentAuths;
++    if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
++      String group = AccessControlLists.getGroupName(Bytes.toString(user));
++      currentAuths = this.getGroupAuths(new String[]{group}, true);
++    }
++    else {
++      currentAuths = this.getUserAuths(user, true);
++    }
+     List<Mutation> deletes = new ArrayList<Mutation>(authLabels.size());
+     int i = 0;
+     for (byte[] authLabel : authLabels) {
+@@ -329,17 +324,20 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   }
+ 
+   @Override
+-  public List<String> getAuths(byte[] user, boolean systemCall) throws IOException {
++  public List<String> getUserAuths(byte[] user, boolean systemCall)
++      throws IOException {
+     assert (labelsRegion != null || systemCall);
+     if (systemCall || labelsRegion == null) {
+-      return this.labelsCache.getAuths(Bytes.toString(user));
++      return this.labelsCache.getUserAuths(Bytes.toString(user));
+     }
+     Scan s = new Scan();
+-    s.addColumn(LABELS_TABLE_FAMILY, user);
++    if (user != null && user.length > 0) {
++      s.addColumn(LABELS_TABLE_FAMILY, user);
++    }
+     Filter filter = VisibilityUtils.createVisibilityLabelFilter(this.labelsRegion,
+         new Authorizations(SYSTEM_LABEL));
+     s.setFilter(filter);
+-    List<String> auths = new ArrayList<String>();
++    ArrayList<String> auths = new ArrayList<String>();
+     RegionScanner scanner = this.labelsRegion.getScanner(s);
+     try {
+       List<Cell> results = new ArrayList<Cell>(1);
+@@ -361,6 +359,43 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   }
+ 
+   @Override
++  public List<String> getGroupAuths(String[] groups, boolean systemCall)
++      throws IOException {
++    assert (labelsRegion != null || systemCall);
++    if (systemCall || labelsRegion == null) {
++      return this.labelsCache.getGroupAuths(groups);
++    }
++    Scan s = new Scan();
++    if (groups != null && groups.length > 0) {
++      for (String group : groups) {
++        s.addColumn(LABELS_TABLE_FAMILY, Bytes.toBytes(AccessControlLists.toGroupEntry(group)));
++      }
++    }
++    Filter filter = VisibilityUtils.createVisibilityLabelFilter(this.labelsRegion,
++        new Authorizations(SYSTEM_LABEL));
++    s.setFilter(filter);
++    Set<String> auths = new HashSet<String>();
++    RegionScanner scanner = this.labelsRegion.getScanner(s);
++    try {
++      List<Cell> results = new ArrayList<Cell>(1);
++      while (true) {
++        scanner.next(results);
++        if (results.isEmpty()) break;
++        Cell cell = results.get(0);
++        int ordinal = Bytes.toInt(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());
++        String label = this.labelsCache.getLabel(ordinal);
++        if (label != null) {
++          auths.add(label);
++        }
++        results.clear();
++      }
++    } finally {
++      scanner.close();
++    }
++    return new ArrayList<String>(auths);
++  }
++
++  @Override
+   public List<String> listLabels(String regex) throws IOException {
+     assert (labelsRegion != null);
+     Pair<Map<String, Integer>, Map<String, List<Integer>>> labelsAndUserAuths =
+@@ -383,9 +418,11 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   @Override
+   public List<Tag> createVisibilityExpTags(String visExpression, boolean withSerializationFormat,
+       boolean checkAuths) throws IOException {
+-    Set<Integer> auths = null;
++    Set<Integer> auths = new HashSet<Integer>();
+     if (checkAuths) {
+-      auths = this.labelsCache.getAuthsAsOrdinals(VisibilityUtils.getActiveUser().getShortName());
++      User user = VisibilityUtils.getActiveUser();
++      auths.addAll(this.labelsCache.getUserAuthsAsOrdinals(user.getShortName()));
++      auths.addAll(this.labelsCache.getGroupAuthsAsOrdinals(user.getGroupNames()));
+     }
+     return VisibilityUtils.createVisibilityExpTags(visExpression, withSerializationFormat,
+         checkAuths, auths, labelsCache);
+@@ -494,26 +531,44 @@ public class DefaultVisibilityLabelServiceImpl implements VisibilityLabelService
+   }
+ 
+   protected boolean isReadFromSystemAuthUser() throws IOException {
+-    byte[] user = Bytes.toBytes(VisibilityUtils.getActiveUser().getShortName());
++    User user = VisibilityUtils.getActiveUser();
+     return havingSystemAuth(user);
+   }
+ 
+   @Override
+-  public boolean havingSystemAuth(byte[] user) throws IOException {
++  public boolean havingSystemAuth(User user) throws IOException {
+     // A super user has 'system' auth.
+     if (isSystemOrSuperUser(user)) {
+       return true;
+     }
+     // A user can also be explicitly granted 'system' auth.
+-    List<String> auths = this.getAuths(user, true);
++    List<String> auths = this.getUserAuths(Bytes.toBytes(user.getShortName()), true);
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("The auths for user " + user.getShortName() + " are " + auths);
++    }
++    if (auths.contains(SYSTEM_LABEL)) {
++      return true;
++    }
++    auths = this.getGroupAuths(user.getGroupNames(), true);
+     if (LOG.isTraceEnabled()) {
+-      LOG.trace("The auths for user " + Bytes.toString(user) + " are " + auths);
++      LOG.trace("The auths for groups of user " + user.getShortName() + " are " + auths);
+     }
+     return auths.contains(SYSTEM_LABEL);
+   }
+ 
+-  protected boolean isSystemOrSuperUser(byte[] user) throws IOException {
+-    return this.superUsers.contains(Bytes.toString(user));
++  private boolean isSystemOrSuperUser(User user) throws IOException {
++    if (this.superUsers.contains(user.getShortName())) {
++      return true;
++    }
++    String[] groups = user.getGroupNames();
++    if (groups != null && groups.length > 0) {
++      for (String group : groups) {
++        if (this.superGroups.contains(group)) {
++          return true;
++        }
++      }
++    }
++    return false;
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefinedSetFilterScanLabelGenerator.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefinedSetFilterScanLabelGenerator.java
+index a42def0..2c7d253 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefinedSetFilterScanLabelGenerator.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/DefinedSetFilterScanLabelGenerator.java
+@@ -18,7 +18,9 @@
+ package org.apache.hadoop.hbase.security.visibility;
+ 
+ import java.util.ArrayList;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -60,8 +62,10 @@ public class DefinedSetFilterScanLabelGenerator implements ScanLabelGenerator {
+     if (authorizations != null) {
+       List<String> labels = authorizations.getLabels();
+       String userName = user.getShortName();
+-      List<String> auths = this.labelsCache.getAuths(userName);
+-      return dropLabelsNotInUserAuths(labels, auths, userName);
++      Set<String> auths = new HashSet<String>();
++      auths.addAll(this.labelsCache.getUserAuths(userName));
++      auths.addAll(this.labelsCache.getGroupAuths(user.getGroupNames()));
++      return dropLabelsNotInUserAuths(labels, new ArrayList<String>(auths), userName);
+     }
+     return null;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/EnforcingScanLabelGenerator.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/EnforcingScanLabelGenerator.java
+index 00a65d9..dd0497c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/EnforcingScanLabelGenerator.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/EnforcingScanLabelGenerator.java
+@@ -17,7 +17,10 @@
+  */
+ package org.apache.hadoop.hbase.security.visibility;
+ 
++import java.util.ArrayList;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -59,7 +62,10 @@ public class EnforcingScanLabelGenerator implements ScanLabelGenerator {
+     if (authorizations != null) {
+       LOG.warn("Dropping authorizations requested by user " + userName + ": " + authorizations);
+     }
+-    return this.labelsCache.getAuths(userName);
++    Set<String> auths = new HashSet<String>();
++    auths.addAll(this.labelsCache.getUserAuths(userName));
++    auths.addAll(this.labelsCache.getGroupAuths(user.getGroupNames()));
++    return new ArrayList<String>(auths);
+   }
+ 
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/FeedUserAuthScanLabelGenerator.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/FeedUserAuthScanLabelGenerator.java
+index 3decbe8..1f90682 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/FeedUserAuthScanLabelGenerator.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/FeedUserAuthScanLabelGenerator.java
+@@ -17,7 +17,10 @@
+  */
+ package org.apache.hadoop.hbase.security.visibility;
+ 
++import java.util.ArrayList;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -62,7 +65,10 @@ public class FeedUserAuthScanLabelGenerator implements ScanLabelGenerator {
+     if (authorizations == null || authorizations.getLabels() == null
+         || authorizations.getLabels().isEmpty()) {
+       String userName = user.getShortName();
+-      return this.labelsCache.getAuths(userName);
++      Set<String> auths = new HashSet<String>();
++      auths.addAll(this.labelsCache.getUserAuths(userName));
++      auths.addAll(this.labelsCache.getGroupAuths(user.getGroupNames()));
++      return new ArrayList<String>(auths);
+     }
+     return authorizations.getLabels();
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+index 9deeca3..712dc53 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+@@ -130,7 +130,8 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+   private Map<InternalScanner,String> scannerOwners =
+       new MapMaker().weakKeys().makeMap();
+ 
+-  List<String> superUsers;
++  private List<String> superUsers;
++  private List<String> superGroups;
+   private VisibilityLabelService visibilityLabelService;
+ 
+   // Add to this list if there are any reserved tag types
+@@ -159,7 +160,10 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+       visibilityLabelService = VisibilityLabelServiceManager.getInstance()
+           .getVisibilityLabelService(this.conf);
+     }
+-    this.superUsers = getSystemAndSuperUsers();
++    Pair<List<String>, List<String>> superUsersAndGroups =
++        VisibilityUtils.getSystemAndSuperUsers(this.conf);
++    this.superUsers = superUsersAndGroups.getFirst();
++    this.superGroups = superUsersAndGroups.getSecond();
+   }
+ 
+   @Override
+@@ -632,24 +636,20 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+     }
+   }
+ 
+-  private List<String> getSystemAndSuperUsers() throws IOException {
+-    User user = User.getCurrent();
+-    if (user == null) {
+-      throw new IOException("Unable to obtain the current user, "
+-          + "authorization checks for internal operations will not work correctly!");
+-    }
+-    if (LOG.isTraceEnabled()) {
+-      LOG.trace("Current user name is "+user.getShortName());
+-    }
+-    String currentUser = user.getShortName();
+-    List<String> superUsers = Lists.asList(currentUser,
+-        this.conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+-    return superUsers;
+-  }
+-
+   private boolean isSystemOrSuperUser() throws IOException {
+     User activeUser = VisibilityUtils.getActiveUser();
+-    return this.superUsers.contains(activeUser.getShortName());
++    if (this.superUsers.contains(activeUser.getShortName())) {
++      return true;
++    }
++    String[] groups = activeUser.getGroupNames();
++    if (groups != null && groups.length > 0) {
++      for (String group : groups) {
++        if (this.superGroups.contains(group)) {
++          return true;
++        }
++      }
++    }
++    return false;
+   }
+ 
+   @Override
+@@ -825,7 +825,13 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+               + (requestingUser != null ? requestingUser.getShortName() : "null")
+               + "' is not authorized to perform this action.");
+         }
+-        labels = this.visibilityLabelService.getAuths(user, false);
++        if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
++          String group = AccessControlLists.getGroupName(Bytes.toString(user));
++          labels = this.visibilityLabelService.getGroupAuths(new String[]{group}, false);
++        }
++        else {
++          labels = this.visibilityLabelService.getUserAuths(user, false);
++        }
+       } catch (IOException e) {
+         ResponseConverter.setControllerException(controller, e);
+       }
+@@ -919,7 +925,7 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+       if (user == null) {
+         throw new IOException("Unable to retrieve calling user");
+       }
+-      if (!(this.visibilityLabelService.havingSystemAuth(Bytes.toBytes(user.getShortName())))) {
++      if (!(this.visibilityLabelService.havingSystemAuth(user))) {
+         throw new AccessDeniedException("User '" + user.getShortName()
+             + "' is not authorized to perform this action.");
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelService.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelService.java
+index 1f74a9a..8ddd47e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelService.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelService.java
+@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+ import org.apache.hadoop.hbase.regionserver.OperationStatus;
++import org.apache.hadoop.hbase.security.User;
+ 
+ /**
+  * The interface which deals with visibility labels and user auths admin service as well as the cell
+@@ -73,13 +74,24 @@ public interface VisibilityLabelService extends Configurable {
+   OperationStatus[] clearAuths(byte[] user, List<byte[]> authLabels) throws IOException;
+ 
+   /**
++   * Retrieve the visibility labels for the user.
+    * @param user
+    *          Name of the user whose authorization to be retrieved
+    * @param systemCall
+    *          Whether a system or user originated call.
+    * @return Visibility labels authorized for the given user.
+    */
+-  List<String> getAuths(byte[] user, boolean systemCall) throws IOException;
++  List<String> getUserAuths(byte[] user, boolean systemCall) throws IOException;
++
++  /**
++   * Retrieve the visibility labels for the groups.
++   * @param groups
++   *          Name of the groups whose authorization to be retrieved
++   * @param systemCall
++   *          Whether a system or user originated call.
++   * @return Visibility labels authorized for the given group.
++   */
++  List<String> getGroupAuths(String[] groups, boolean systemCall) throws IOException;
+ 
+   /**
+    * Retrieve the list of visibility labels defined in the system.
+@@ -124,7 +136,7 @@ public interface VisibilityLabelService extends Configurable {
+    *          User for whom system auth check to be done.
+    * @return true if the given user is having system/super auth
+    */
+-  boolean havingSystemAuth(byte[] user) throws IOException;
++  boolean havingSystemAuth(User user) throws IOException;
+ 
+   /**
+    * System uses this for deciding whether a Cell can be deleted by matching visibility expression
+@@ -167,4 +179,5 @@ public interface VisibilityLabelService extends Configurable {
+    */
+   byte[] encodeVisibilityForReplication(final List<Tag> visTags,
+       final Byte serializationFormat) throws IOException;
++
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
+index a5c2155..ed2998a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityLabelsCache.java
+@@ -35,6 +35,7 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.MultiUserAuthorizations;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.UserAuthorizations;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabel;
++import org.apache.hadoop.hbase.security.access.AccessControlLists;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+ import org.apache.zookeeper.KeeperException;
+@@ -57,6 +58,8 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
+   private Map<String, Integer> labels = new HashMap<String, Integer>();
+   private Map<Integer, String> ordinalVsLabels = new HashMap<Integer, String>();
+   private Map<String, Set<Integer>> userAuths = new HashMap<String, Set<Integer>>();
++  private Map<String, Set<Integer>> groupAuths = new HashMap<String, Set<Integer>>();
++
+   /**
+    * This covers the members labels, ordinalVsLabels and userAuths
+    */
+@@ -139,9 +142,15 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
+     this.lock.writeLock().lock();
+     try {
+       this.userAuths.clear();
++      this.groupAuths.clear();
+       for (UserAuthorizations userAuths : multiUserAuths.getUserAuthsList()) {
+         String user = Bytes.toString(userAuths.getUser().toByteArray());
+-        this.userAuths.put(user, new HashSet<Integer>(userAuths.getAuthList()));
++        if (AccessControlLists.isGroupPrincipal(user)) {
++          this.groupAuths.put(AccessControlLists.getGroupName(user),
++            new HashSet<Integer>(userAuths.getAuthList()));
++        } else {
++          this.userAuths.put(user, new HashSet<Integer>(userAuths.getAuthList()));
++        }
+       }
+     } finally {
+       this.lock.writeLock().unlock();
+@@ -196,30 +205,37 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
+     }
+   }
+ 
+-  public List<String> getAuths(String user) {
++  public List<String> getUserAuths(String user) {
+     List<String> auths = EMPTY_LIST;
+-    this.lock.readLock().lock();
+-    try {
+-      Set<Integer> authOrdinals = userAuths.get(user);
+-      if (authOrdinals != null) {
+-        auths = new ArrayList<String>(authOrdinals.size());
+-        for (Integer authOrdinal : authOrdinals) {
+-          auths.add(ordinalVsLabels.get(authOrdinal));
+-        }
++    Set<Integer> authOrdinals = getUserAuthsAsOrdinals(user);
++    if (!authOrdinals.equals(EMPTY_SET)) {
++      auths = new ArrayList<String>(authOrdinals.size());
++      for (Integer authOrdinal : authOrdinals) {
++        auths.add(ordinalVsLabels.get(authOrdinal));
++      }
++    }
++    return auths;
++  }
++
++  public List<String> getGroupAuths(String[] groups) {
++    List<String> auths = EMPTY_LIST;
++    Set<Integer> authOrdinals = getGroupAuthsAsOrdinals(groups);
++    if (!authOrdinals.equals(EMPTY_SET)) {
++      auths = new ArrayList<String>(authOrdinals.size());
++      for (Integer authOrdinal : authOrdinals) {
++        auths.add(ordinalVsLabels.get(authOrdinal));
+       }
+-    } finally {
+-      this.lock.readLock().unlock();
+     }
+     return auths;
+   }
+ 
+   /**
+-   * Returns the list of ordinals of authentications associated with the user
++   * Returns the list of ordinals of labels associated with the user
+    *
+    * @param user Not null value.
+    * @return the list of ordinals
+    */
+-  public Set<Integer> getAuthsAsOrdinals(String user) {
++  public Set<Integer> getUserAuthsAsOrdinals(String user) {
+     this.lock.readLock().lock();
+     try {
+       Set<Integer> auths = userAuths.get(user);
+@@ -229,6 +245,31 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
+     }
+   }
+ 
++  /**
++   * Returns the list of ordinals of labels associated with the groups
++   *
++   * @param groups
++   * @return the list of ordinals
++   */
++  public Set<Integer> getGroupAuthsAsOrdinals(String[] groups) {
++    this.lock.readLock().lock();
++    try {
++      Set<Integer> authOrdinals = new HashSet<Integer>();
++      if (groups != null && groups.length > 0) {
++        Set<Integer> groupAuthOrdinals = null;
++        for (String group : groups) {
++          groupAuthOrdinals = groupAuths.get(group);
++          if (groupAuthOrdinals != null && !groupAuthOrdinals.isEmpty()) {
++            authOrdinals.addAll(groupAuthOrdinals);
++          }
++        }
++      }
++      return (authOrdinals.isEmpty()) ? EMPTY_SET : authOrdinals;
++    } finally {
++      this.lock.readLock().unlock();
++    }
++  }
++
+   public void writeToZookeeper(byte[] data, boolean labelsOrUserAuths) {
+     this.zkVisibilityWatcher.writeToZookeeper(data, labelsOrUserAuths);
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
+index 51d6632..ebff5ff 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityUtils.java
+@@ -53,6 +53,7 @@ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.Visibil
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.security.AccessDeniedException;
+ import org.apache.hadoop.hbase.security.User;
++import org.apache.hadoop.hbase.security.access.AccessControlLists;
+ import org.apache.hadoop.hbase.security.visibility.expression.ExpressionNode;
+ import org.apache.hadoop.hbase.security.visibility.expression.LeafExpressionNode;
+ import org.apache.hadoop.hbase.security.visibility.expression.NonLeafExpressionNode;
+@@ -60,6 +61,7 @@ import org.apache.hadoop.hbase.security.visibility.expression.Operator;
+ import org.apache.hadoop.hbase.util.ByteRange;
+ import org.apache.hadoop.hbase.util.ByteStringer;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.SimpleMutableByteRange;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+@@ -101,6 +103,38 @@ public class VisibilityUtils {
+   }
+ 
+   /**
++   * Get the super users and groups defined in the configuration.
++   * The user running the hbase server is always included.
++   * @param conf
++   * @return Pair of super user list and super group list.
++   * @throws IOException
++   */
++  public static Pair<List<String>, List<String>> getSystemAndSuperUsers(Configuration conf)
++      throws IOException {
++    ArrayList<String> superUsers = new ArrayList<String>();
++    ArrayList<String> superGroups = new ArrayList<String>();
++    User user = User.getCurrent();
++    if (user == null) {
++      throw new IOException("Unable to obtain the current user, "
++          + "authorization checks for internal operations will not work correctly!");
++    }
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Current user name is " + user.getShortName());
++    }
++    String currentUser = user.getShortName();
++    String[] superUserList = conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]);
++    for (String name : superUserList) {
++      if (AccessControlLists.isGroupPrincipal(name)) {
++        superGroups.add(AccessControlLists.getGroupName(name));
++      } else {
++        superUsers.add(name);
++      }
++    }
++    superUsers.add(currentUser);
++    return new Pair<List<String>, List<String>>(superUsers, superGroups);
++  }
++
++  /**
+    * Creates the user auth data to be written to zookeeper.
+    * @param userAuths
+    * @return Bytes form of user auths details to be written to zookeeper.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
+index f8bd117..6f46fd3 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/ExpAsStringVisibilityLabelServiceImpl.java
+@@ -27,8 +27,10 @@ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -82,6 +84,7 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   private HRegion labelsRegion;
+   private List<ScanLabelGenerator> scanLabelGenerators;
+   private List<String> superUsers;
++  private List<String> superGroups;
+ 
+   @Override
+   public OperationStatus[] addLabels(List<byte[]> labels) throws IOException {
+@@ -115,7 +118,14 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   public OperationStatus[] clearAuths(byte[] user, List<byte[]> authLabels) throws IOException {
+     assert labelsRegion != null;
+     OperationStatus[] finalOpStatus = new OperationStatus[authLabels.size()];
+-    List<String> currentAuths = this.getAuths(user, true);
++    List<String> currentAuths;
++    if (AccessControlLists.isGroupPrincipal(Bytes.toString(user))) {
++      String group = AccessControlLists.getGroupName(Bytes.toString(user));
++      currentAuths = this.getGroupAuths(new String[]{group}, true);
++    }
++    else {
++      currentAuths = this.getUserAuths(user, true);
++    }
+     Delete d = new Delete(user);
+     int i = 0;
+     for (byte[] authLabel : authLabels) {
+@@ -141,7 +151,7 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   }
+ 
+   @Override
+-  public List<String> getAuths(byte[] user, boolean systemCall) throws IOException {
++  public List<String> getUserAuths(byte[] user, boolean systemCall) throws IOException {
+     assert (labelsRegion != null || systemCall);
+     List<String> auths = new ArrayList<String>();
+     Get get = new Get(user);
+@@ -168,7 +178,7 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+     if (cells != null) {
+       for (Cell cell : cells) {
+         String auth = Bytes.toString(cell.getQualifierArray(), cell.getQualifierOffset(),
+-            cell.getQualifierLength());
++          cell.getQualifierLength());
+         auths.add(auth);
+       }
+     }
+@@ -176,6 +186,40 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   }
+ 
+   @Override
++  public List<String> getGroupAuths(String[] groups, boolean systemCall) throws IOException {
++    assert (labelsRegion != null || systemCall);
++    List<String> auths = new ArrayList<String>();
++    if (groups != null && groups.length > 0) {
++      for (String group : groups) {
++        Get get = new Get(Bytes.toBytes(AccessControlLists.toGroupEntry(group)));
++        List<Cell> cells = null;
++        if (labelsRegion == null) {
++          Table table = null;
++          try {
++            table = new HTable(conf, VisibilityConstants.LABELS_TABLE_NAME);
++            Result result = table.get(get);
++            cells = result.listCells();
++          } finally {
++            if (table != null) {
++              table.close();
++            }
++          }
++        } else {
++          cells = this.labelsRegion.get(get, false);
++        }
++        if (cells != null) {
++          for (Cell cell : cells) {
++            String auth = Bytes.toString(cell.getQualifierArray(), cell.getQualifierOffset(),
++              cell.getQualifierLength());
++            auths.add(auth);
++          }
++        }
++      }
++    }
++    return auths;
++  }
++
++  @Override
+   public List<String> listLabels(String regex) throws IOException {
+     // return an empty list for this implementation.
+     return new ArrayList<String>();
+@@ -282,7 +326,7 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   }
+ 
+   protected boolean isReadFromSystemAuthUser() throws IOException {
+-    byte[] user = Bytes.toBytes(VisibilityUtils.getActiveUser().getShortName());
++    User user = VisibilityUtils.getActiveUser();
+     return havingSystemAuth(user);
+   }
+ 
+@@ -347,13 +391,15 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+   @Override
+   public void init(RegionCoprocessorEnvironment e) throws IOException {
+     this.scanLabelGenerators = VisibilityUtils.getScanLabelGenerators(this.conf);
+-    this.superUsers = getSystemAndSuperUsers();
++    initSystemAndSuperUsers();
+     if (e.getRegion().getRegionInfo().getTable().equals(LABELS_TABLE_NAME)) {
+       this.labelsRegion = e.getRegion();
+     }
+   }
+ 
+-  private List<String> getSystemAndSuperUsers() throws IOException {
++  private void initSystemAndSuperUsers() throws IOException {
++    this.superUsers = new ArrayList<String>();
++    this.superGroups = new ArrayList<String>();
+     User user = User.getCurrent();
+     if (user == null) {
+       throw new IOException("Unable to obtain the current user, "
+@@ -363,21 +409,42 @@ public class ExpAsStringVisibilityLabelServiceImpl implements VisibilityLabelSer
+       LOG.trace("Current user name is " + user.getShortName());
+     }
+     String currentUser = user.getShortName();
+-    List<String> superUsers = Lists.asList(currentUser,
++    List<String> superUserList = Lists.asList(currentUser,
+         this.conf.getStrings(AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+-    return superUsers;
++    if (superUserList != null) {
++      for (String name : superUserList) {
++        if (AccessControlLists.isGroupPrincipal(name)) {
++          this.superGroups.add(AccessControlLists.getGroupName(name));
++        } else {
++          this.superUsers.add(name);
++        }
++      }
++    };
+   }
+ 
+-  protected boolean isSystemOrSuperUser(byte[] user) throws IOException {
+-    return this.superUsers.contains(Bytes.toString(user));
++  protected boolean isSystemOrSuperUser(User user) throws IOException {
++    if (this.superUsers.contains(user.getShortName())) {
++      return true;
++    }
++    String[] groups = user.getGroupNames();
++    if (groups != null) {
++      for (String group : groups) {
++        if (this.superGroups.contains(group)) {
++          return true;
++        }
++      }
++    }
++    return false;
+   }
+ 
+   @Override
+-  public boolean havingSystemAuth(byte[] user) throws IOException {
++  public boolean havingSystemAuth(User user) throws IOException {
+     if (isSystemOrSuperUser(user)) {
+       return true;
+     }
+-    List<String> auths = this.getAuths(user, true);
++    Set<String> auths = new HashSet<String>();
++    auths.addAll(this.getUserAuths(Bytes.toBytes(user.getShortName()), true));
++    auths.addAll(this.getGroupAuths(user.getGroupNames(), true));
+     return auths.contains(SYSTEM_LABEL);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java
+new file mode 100644
+index 0000000..9e122c9
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java
+@@ -0,0 +1,346 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.security.visibility;
++
++import static org.apache.hadoop.hbase.security.visibility.VisibilityConstants.LABELS_TABLE_NAME;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import java.io.IOException;
++import java.security.PrivilegedExceptionAction;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.client.ResultScanner;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.GetAuthsResponse;
++import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsResponse;
++import org.apache.hadoop.hbase.security.User;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.hbase.testclassification.SecurityTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++import org.junit.rules.TestName;
++
++import com.google.protobuf.ByteString;
++
++@Category({SecurityTests.class, MediumTests.class})
++public class TestVisibilityLablesWithGroups {
++
++  public static final String CONFIDENTIAL = "confidential";
++  private static final String SECRET = "secret";
++  public static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private static final byte[] ROW_1 = Bytes.toBytes("row1");
++  private final static byte[] CF = Bytes.toBytes("f");
++  private final static byte[] Q1 = Bytes.toBytes("q1");
++  private final static byte[] Q2 = Bytes.toBytes("q2");
++  private final static byte[] Q3 = Bytes.toBytes("q3");
++  private final static byte[] value1 = Bytes.toBytes("value1");
++  private final static byte[] value2 = Bytes.toBytes("value2");
++  private final static byte[] value3 = Bytes.toBytes("value3");
++  public static Configuration conf;
++
++  @Rule
++  public final TestName TEST_NAME = new TestName();
++  public static User SUPERUSER;
++  public static User TESTUSER;
++
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++    // setup configuration
++    conf = TEST_UTIL.getConfiguration();
++    VisibilityTestUtil.enableVisiblityLabels(conf);
++    // Not setting any SLG class. This means to use the default behavior.
++    // Use a group as the super user.
++    conf.set("hbase.superuser", "@supergroup");
++    TEST_UTIL.startMiniCluster(1);
++    // 'admin' has super user permission because it is part of the 'supergroup'
++    SUPERUSER = User.createUserForTesting(conf, "admin", new String[] { "supergroup" });
++    // 'test' user will inherit 'testgroup' visibility labels
++    TESTUSER = User.createUserForTesting(conf, "test", new String[] {"testgroup" });
++
++    // Wait for the labels table to become available
++    TEST_UTIL.waitTableEnabled(LABELS_TABLE_NAME.getName(), 50000);
++
++    // Set up for the test
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        try {
++          VisibilityClient.addLabels(conf, new String[] { SECRET, CONFIDENTIAL });
++          // set auth for @testgroup
++          VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL }, "@testgroup");
++        } catch (Throwable t) {
++          throw new IOException(t);
++        }
++        return null;
++      }
++    });
++  }
++
++  @Test
++  public void testGroupAuths() throws Exception {
++    final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
++
++    // create the table and put data.
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        Table table = TEST_UTIL.createTable(tableName, CF);
++        try {
++          Put put = new Put(ROW_1);
++          put.add(CF, Q1, HConstants.LATEST_TIMESTAMP, value1);
++          put.setCellVisibility(new CellVisibility(SECRET));
++          table.put(put);
++          put = new Put(ROW_1);
++          put.add(CF, Q2, HConstants.LATEST_TIMESTAMP, value2);
++          put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
++          table.put(put);
++          put = new Put(ROW_1);
++          put.add(CF, Q3, HConstants.LATEST_TIMESTAMP, value3);
++          table.put(put);
++        } finally {
++          table.close();
++        }
++        return null;
++      }
++    });
++
++    // 'admin' user is part of 'supergroup', thus can see all the cells.
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        Connection connection = ConnectionFactory.createConnection(conf);
++        Table table = connection.getTable(tableName);
++        try {
++          Scan s = new Scan();
++          ResultScanner scanner = table.getScanner(s);
++          Result[] next = scanner.next(1);
++
++          // Test that super user can see all the cells.
++          assertTrue(next.length == 1);
++          CellScanner cellScanner = next[0].cellScanner();
++          cellScanner.advance();
++          Cell current = cellScanner.current();
++          assertTrue(Bytes.equals(current.getRowArray(), current.getRowOffset(),
++              current.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current.getQualifier(), Q1));
++          assertTrue(Bytes.equals(current.getValue(), value1));
++          cellScanner.advance();
++          current = cellScanner.current();
++          assertTrue(Bytes.equals(current.getRowArray(), current.getRowOffset(),
++              current.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current.getQualifier(), Q2));
++          assertTrue(Bytes.equals(current.getValue(), value2));
++          cellScanner.advance();
++          current = cellScanner.current();
++          assertTrue(Bytes.equals(current.getRowArray(), current.getRowOffset(),
++              current.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current.getQualifier(), Q3));
++          assertTrue(Bytes.equals(current.getValue(), value3));
++
++        } finally {
++          table.close();
++          connection.close();
++        }
++        return null;
++      }
++    });
++
++    // Get testgroup's labels.
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        GetAuthsResponse authsResponse = null;
++        try {
++          authsResponse = VisibilityClient.getAuths(conf, "@testgroup");
++        } catch (Throwable e) {
++          fail("Should not have failed");
++        }
++        List<String> authsList = new ArrayList<String>();
++        for (ByteString authBS : authsResponse.getAuthList()) {
++          authsList.add(Bytes.toString(authBS.toByteArray()));
++        }
++        assertEquals(1, authsList.size());
++        assertTrue(authsList.contains(CONFIDENTIAL));
++        return null;
++      }
++    });
++
++    // Test that test user can see what 'testgroup' has been authorized to.
++    TESTUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        Connection connection = ConnectionFactory.createConnection(conf);
++        Table table = connection.getTable(tableName);
++        try {
++          // Test scan with no auth attribute
++          Scan s = new Scan();
++          ResultScanner scanner = table.getScanner(s);
++          Result[] next = scanner.next(1);
++
++          assertTrue(next.length == 1);
++          CellScanner cellScanner = next[0].cellScanner();
++          cellScanner.advance();
++          Cell current = cellScanner.current();
++          // test user can see value2 (CONFIDENTIAL) and value3 (no label)
++          assertTrue(Bytes.equals(current.getRowArray(), current.getRowOffset(),
++              current.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current.getQualifier(), Q2));
++          assertTrue(Bytes.equals(current.getValue(), value2));
++          cellScanner.advance();
++          current = cellScanner.current();
++          // test user can see value2 (CONFIDENTIAL) and value3 (no label)
++          assertTrue(Bytes.equals(current.getRowArray(), current.getRowOffset(),
++              current.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current.getQualifier(), Q3));
++          assertTrue(Bytes.equals(current.getValue(), value3));
++
++          // Test scan with correct auth attribute for test user
++          Scan s1 = new Scan();
++          // test user is entitled to 'CONFIDENTIAL'.
++          // If we set both labels in the scan, 'SECRET' will be dropped by the SLGs.
++          s1.setAuthorizations(new Authorizations(new String[] { SECRET, CONFIDENTIAL }));
++          ResultScanner scanner1 = table.getScanner(s1);
++          Result[] next1 = scanner1.next(1);
++
++          assertTrue(next1.length == 1);
++          CellScanner cellScanner1 = next1[0].cellScanner();
++          cellScanner1.advance();
++          Cell current1 = cellScanner1.current();
++          // test user can see value2 (CONFIDENTIAL) and value3 (no label)
++          assertTrue(Bytes.equals(current1.getRowArray(), current1.getRowOffset(),
++            current1.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current1.getQualifier(), Q2));
++          assertTrue(Bytes.equals(current1.getValue(), value2));
++          cellScanner1.advance();
++          current1 = cellScanner1.current();
++          // test user can see value2 (CONFIDENTIAL) and value3 (no label)
++          assertTrue(Bytes.equals(current1.getRowArray(), current1.getRowOffset(),
++            current1.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current1.getQualifier(), Q3));
++          assertTrue(Bytes.equals(current1.getValue(), value3));
++
++          // Test scan with incorrect auth attribute for test user
++          Scan s2 = new Scan();
++          // test user is entitled to 'CONFIDENTIAL'.
++          // If we set 'SECRET', it will be dropped by the SLGs.
++          s2.setAuthorizations(new Authorizations(new String[] { SECRET }));
++          ResultScanner scanner2 = table.getScanner(s2);
++          Result next2 = scanner2.next();
++          CellScanner cellScanner2 = next2.cellScanner();
++          cellScanner2.advance();
++          Cell current2 = cellScanner2.current();
++          // This scan will only see value3 (no label)
++          assertTrue(Bytes.equals(current2.getRowArray(), current2.getRowOffset(),
++            current2.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current2.getQualifier(), Q3));
++          assertTrue(Bytes.equals(current2.getValue(), value3));
++
++          assertFalse(cellScanner2.advance());
++        } finally {
++          table.close();
++          connection.close();
++        }
++        return null;
++      }
++    });
++
++    // Clear 'testgroup' of CONFIDENTIAL label.
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        VisibilityLabelsResponse response = null;
++        try {
++          response = VisibilityClient.clearAuths(conf, new String[] { CONFIDENTIAL }, "@testgroup");
++        } catch (Throwable e) {
++          fail("Should not have failed");
++        }
++        return null;
++      }
++    });
++
++    // Get testgroup's labels.  No label is returned.
++    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        GetAuthsResponse authsResponse = null;
++        try {
++          authsResponse = VisibilityClient.getAuths(conf, "@testgroup");
++        } catch (Throwable e) {
++          fail("Should not have failed");
++        }
++        List<String> authsList = new ArrayList<String>();
++        for (ByteString authBS : authsResponse.getAuthList()) {
++          authsList.add(Bytes.toString(authBS.toByteArray()));
++        }
++        assertEquals(0, authsList.size());
++        return null;
++      }
++    });
++
++    // Test that test user cannot see the cells with the labels anymore.
++    TESTUSER.runAs(new PrivilegedExceptionAction<Void>() {
++      public Void run() throws Exception {
++        Connection connection = ConnectionFactory.createConnection(conf);
++        Table table = connection.getTable(tableName);
++        try {
++          Scan s1 = new Scan();
++          // test user is not entitled to 'CONFIDENTIAL' anymore since we dropped
++          // testgroup's label.  test user has no auth labels now.
++          // scan's labels will be dropped on the server side.
++          s1.setAuthorizations(new Authorizations(new String[] { SECRET, CONFIDENTIAL }));
++          ResultScanner scanner1 = table.getScanner(s1);
++          Result[] next1 = scanner1.next(1);
++
++          assertTrue(next1.length == 1);
++          CellScanner cellScanner1 = next1[0].cellScanner();
++          cellScanner1.advance();
++          Cell current1 = cellScanner1.current();
++          // test user can only see value3 (no label)
++          assertTrue(Bytes.equals(current1.getRowArray(), current1.getRowOffset(),
++            current1.getRowLength(), ROW_1, 0, ROW_1.length));
++          assertTrue(Bytes.equals(current1.getQualifier(), Q3));
++          assertTrue(Bytes.equals(current1.getValue(), value3));
++
++          assertFalse(cellScanner1.advance());
++        } finally {
++          table.close();
++          connection.close();
++        }
++        return null;
++      }
++    });
++
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++}

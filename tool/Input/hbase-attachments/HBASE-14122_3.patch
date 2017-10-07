@@ -1,0 +1,2061 @@
+From 32913488a25d430722093938e87dbc69af2214e4 Mon Sep 17 00:00:00 2001
+From: Andrew Purtell <apurtell@apache.org>
+Date: Tue, 11 Aug 2015 16:52:25 -0700
+Subject: [PATCH] HBASE-14122 Client API for determining if server side
+ supports cell level security
+
+---
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java |   24 +
+ .../hadoop/hbase/client/HConnectionManager.java    |    8 +
+ .../hbase/client/security/SecurityCapability.java  |   63 +
+ .../apache/hadoop/hbase/protobuf/ProtobufUtil.java |   21 +
+ .../hbase/security/access/AccessControlClient.java |   31 +
+ .../security/visibility/VisibilityClient.java      |   17 +
+ .../hbase/protobuf/generated/MasterProtos.java     | 1236 ++++++++++++++++++--
+ hbase-protocol/src/main/protobuf/Master.proto      |   19 +
+ .../org/apache/hadoop/hbase/master/HMaster.java    |   45 +
+ .../hbase/security/access/AccessController.java    |   13 +-
+ .../security/visibility/VisibilityController.java  |   10 +-
+ .../security/access/TestAccessController.java      |   10 +
+ .../security/visibility/TestVisibilityLabels.java  |    8 +
+ hbase-shell/src/main/ruby/hbase/admin.rb           |    5 +
+ hbase-shell/src/main/ruby/hbase/security.rb        |   19 +-
+ .../src/main/ruby/hbase/visibility_labels.rb       |   27 +-
+ hbase-shell/src/main/ruby/shell.rb                 |    1 +
+ .../shell/commands/list_security_capabilities.rb   |   47 +
+ 18 files changed, 1511 insertions(+), 93 deletions(-)
+ create mode 100644 hbase-client/src/main/java/org/apache/hadoop/hbase/client/security/SecurityCapability.java
+ create mode 100644 hbase-shell/src/main/ruby/shell/commands/list_security_capabilities.rb
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index add506d..f86dd84 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -62,6 +62,7 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+ import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.exceptions.MergeRegionException;
+ import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
+@@ -125,6 +126,7 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyTableReques
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MoveRegionRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotRequest;
+@@ -3559,4 +3561,26 @@ public class HBaseAdmin implements Abortable, Closeable {
+     });
+   }
+ 
++  /**
++   * Return the set of supported security capabilities.
++   * @throws IOException
++   * @throws UnsupportedOperationException
++   */
++  public List<SecurityCapability> getSecurityCapabilities() throws IOException {
++    try {
++      return executeCallable(new MasterCallable<List<SecurityCapability>>(getConnection()) {
++        @Override
++        public List<SecurityCapability> call() throws ServiceException {
++          SecurityCapabilitiesRequest req = SecurityCapabilitiesRequest.newBuilder().build();
++          return ProtobufUtil.toSecurityCapabilityList(
++            master.getSecurityCapabilities(null, req).getCapabilitiesList());
++        }
++      });
++    } catch (IOException e) {
++      if (e instanceof RemoteException) {
++        e = ((RemoteException)e).unwrapRemoteException();
++      }
++      throw e;
++    }
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+index a0e9996..a85bda6 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+@@ -152,6 +152,8 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRe
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanResponse;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotRequest;
+@@ -2212,6 +2214,12 @@ public class HConnectionManager {
+             TruncateTableRequest request) throws ServiceException {
+           return stub.truncateTable(controller, request);
+         }
++
++        @Override
++        public SecurityCapabilitiesResponse getSecurityCapabilities(RpcController controller,
++            SecurityCapabilitiesRequest request) throws ServiceException {
++          return stub.getSecurityCapabilities(controller, request);
++        }
+       };
+     }
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/security/SecurityCapability.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/security/SecurityCapability.java
+new file mode 100644
+index 0000000..1847b2e
+--- /dev/null
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/security/SecurityCapability.java
+@@ -0,0 +1,63 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.client.security;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.classification.InterfaceStability;
++
++/**
++ * Available security capabilities
++ */
++@InterfaceAudience.Public
++@InterfaceStability.Evolving
++public enum SecurityCapability {
++  // Note to implementors: These must match the numbering of Capability values in MasterProtos
++  SIMPLE_AUTHENTICATION(0),
++  SECURE_AUTHENTICATION(1),
++  AUTHORIZATION(2),
++  CELL_AUTHORIZATION(3),
++  CELL_VISIBILITY(4);
++
++  private int value;
++
++  public int getValue() {
++    return value;
++  }
++
++  public String getName() {
++    return toString();
++  }
++
++  private SecurityCapability(int value) {
++    this.value = value;
++  }
++
++  public static SecurityCapability valueOf(int value) {
++    switch (value) {
++      case 0: return SIMPLE_AUTHENTICATION;
++      case 1: return SECURE_AUTHENTICATION;
++      case 2: return AUTHORIZATION;
++      case 3: return CELL_AUTHORIZATION;
++      case 4: return CELL_VISIBILITY;
++      default:
++        throw new IllegalArgumentException("Unknown SecurityCapability value " + value);
++    }
++  }
++};
++
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+index 8d805a8..2b80e87 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/protobuf/ProtobufUtil.java
+@@ -57,6 +57,7 @@ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.filter.ByteArrayComparable;
+ import org.apache.hadoop.hbase.filter.Filter;
+@@ -108,6 +109,7 @@ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionInfo;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.RegionSpecifierType;
+ import org.apache.hadoop.hbase.protobuf.generated.MapReduceProtos;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateTableRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MasterService;
+@@ -2933,4 +2935,23 @@ public final class ProtobufUtil {
+     builder.setSrcChecksum(VersionInfo.getSrcChecksum());
+     return builder.build();
+   }
++
++  /**
++   * Convert SecurityCapabilitiesResponse.Capability to SecurityCapability
++   * @param caps capabilities returned in the SecurityCapabilitiesResponse message
++   * @return the converted list of SecurityCapability elements
++   */
++  public static List<SecurityCapability> toSecurityCapabilityList(
++      List<MasterProtos.SecurityCapabilitiesResponse.Capability> capabilities) {
++    List<SecurityCapability> scList = new ArrayList<SecurityCapability>(capabilities.size());
++    for (MasterProtos.SecurityCapabilitiesResponse.Capability c: capabilities) {
++      try {
++        scList.add(SecurityCapability.valueOf(c.getNumber()));
++      } catch (IllegalArgumentException e) {
++        // Unknown capability, just ignore it. We don't understand the new capability
++        // but don't care since by definition we cannot take advantage of it.
++      }
++    }
++    return scList;
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlClient.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlClient.java
+index df7a47e..08cbafe 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlClient.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/access/AccessControlClient.java
+@@ -35,6 +35,7 @@ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.coprocessor.Batch;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.ipc.BlockingRpcCallback;
+ import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
+ import org.apache.hadoop.hbase.ipc.ServerRpcController;
+@@ -64,6 +65,36 @@ public class AccessControlClient {
+     return new HTable(conf, ACL_TABLE_NAME);
+   }
+ 
++  /**
++   * Return true if authorization is supported and enabled
++   * @param conf
++   * @return true if authorization is supported and enabled, false otherwise
++   * @throws IOException
++   */
++  public static boolean isAuthorizationEnabled(Configuration conf) throws IOException {
++    HBaseAdmin admin = new HBaseAdmin(conf);
++    try {
++      return admin.getSecurityCapabilities().contains(SecurityCapability.AUTHORIZATION);
++    } finally {
++      admin.close();
++    }
++  }
++
++  /**
++   * Return true if cell authorization is supported and enabled
++   * @param conf
++   * @return true if cell authorization is supported and enabled, false otherwise
++   * @throws IOException
++   */
++  public static boolean isCellAuthorizationEnabled(Configuration conf) throws IOException {
++    HBaseAdmin admin = new HBaseAdmin(conf);
++    try {
++      return admin.getSecurityCapabilities().contains(SecurityCapability.CELL_AUTHORIZATION);
++    } finally {
++      admin.close();
++    }
++  }
++
+   private static BlockingInterface getAccessControlServiceStub(HTable ht)
+       throws IOException {
+     CoprocessorRpcChannel service = ht.coprocessorService(HConstants.EMPTY_START_ROW);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
+index 81400f0..eb00144 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
+@@ -28,8 +28,10 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.coprocessor.Batch;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.ipc.BlockingRpcCallback;
+ import org.apache.hadoop.hbase.ipc.ServerRpcController;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.GetAuthsRequest;
+@@ -53,6 +55,21 @@ import com.google.protobuf.ServiceException;
+ public class VisibilityClient {
+ 
+   /**
++   * Return true if cell visibility features are supported and enabled
++   * @param conf
++   * @return true if cell visibility features are supported and enabled, false otherwise
++   * @throws IOException
++   */
++  public static boolean isCellVisibilityEnabled(Configuration conf) throws IOException {
++    HBaseAdmin admin = new HBaseAdmin(conf);
++    try {
++      return admin.getSecurityCapabilities().contains(SecurityCapability.CELL_VISIBILITY);
++    } finally {
++      admin.close();
++    }
++  }
++
++  /**
+    * Utility method for adding label to the system.
+    * 
+    * @param conf
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/MasterProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/MasterProtos.java
+index 8530127..8297a61 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/MasterProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/MasterProtos.java
+@@ -41321,6 +41321,974 @@ public final class MasterProtos {
+     // @@protoc_insertion_point(class_scope:TruncateTableResponse)
+   }
+ 
++  public interface SecurityCapabilitiesRequestOrBuilder
++      extends com.google.protobuf.MessageOrBuilder {
++  }
++  /**
++   * Protobuf type {@code SecurityCapabilitiesRequest}
++   */
++  public static final class SecurityCapabilitiesRequest extends
++      com.google.protobuf.GeneratedMessage
++      implements SecurityCapabilitiesRequestOrBuilder {
++    // Use SecurityCapabilitiesRequest.newBuilder() to construct.
++    private SecurityCapabilitiesRequest(com.google.protobuf.GeneratedMessage.Builder<?> builder) {
++      super(builder);
++      this.unknownFields = builder.getUnknownFields();
++    }
++    private SecurityCapabilitiesRequest(boolean noInit) { this.unknownFields = com.google.protobuf.UnknownFieldSet.getDefaultInstance(); }
++
++    private static final SecurityCapabilitiesRequest defaultInstance;
++    public static SecurityCapabilitiesRequest getDefaultInstance() {
++      return defaultInstance;
++    }
++
++    public SecurityCapabilitiesRequest getDefaultInstanceForType() {
++      return defaultInstance;
++    }
++
++    private final com.google.protobuf.UnknownFieldSet unknownFields;
++    @java.lang.Override
++    public final com.google.protobuf.UnknownFieldSet
++        getUnknownFields() {
++      return this.unknownFields;
++    }
++    private SecurityCapabilitiesRequest(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      initFields();
++      com.google.protobuf.UnknownFieldSet.Builder unknownFields =
++          com.google.protobuf.UnknownFieldSet.newBuilder();
++      try {
++        boolean done = false;
++        while (!done) {
++          int tag = input.readTag();
++          switch (tag) {
++            case 0:
++              done = true;
++              break;
++            default: {
++              if (!parseUnknownField(input, unknownFields,
++                                     extensionRegistry, tag)) {
++                done = true;
++              }
++              break;
++            }
++          }
++        }
++      } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++        throw e.setUnfinishedMessage(this);
++      } catch (java.io.IOException e) {
++        throw new com.google.protobuf.InvalidProtocolBufferException(
++            e.getMessage()).setUnfinishedMessage(this);
++      } finally {
++        this.unknownFields = unknownFields.build();
++        makeExtensionsImmutable();
++      }
++    }
++    public static final com.google.protobuf.Descriptors.Descriptor
++        getDescriptor() {
++      return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesRequest_descriptor;
++    }
++
++    protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++        internalGetFieldAccessorTable() {
++      return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesRequest_fieldAccessorTable
++          .ensureFieldAccessorsInitialized(
++              org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.class, org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.Builder.class);
++    }
++
++    public static com.google.protobuf.Parser<SecurityCapabilitiesRequest> PARSER =
++        new com.google.protobuf.AbstractParser<SecurityCapabilitiesRequest>() {
++      public SecurityCapabilitiesRequest parsePartialFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws com.google.protobuf.InvalidProtocolBufferException {
++        return new SecurityCapabilitiesRequest(input, extensionRegistry);
++      }
++    };
++
++    @java.lang.Override
++    public com.google.protobuf.Parser<SecurityCapabilitiesRequest> getParserForType() {
++      return PARSER;
++    }
++
++    private void initFields() {
++    }
++    private byte memoizedIsInitialized = -1;
++    public final boolean isInitialized() {
++      byte isInitialized = memoizedIsInitialized;
++      if (isInitialized != -1) return isInitialized == 1;
++
++      memoizedIsInitialized = 1;
++      return true;
++    }
++
++    public void writeTo(com.google.protobuf.CodedOutputStream output)
++                        throws java.io.IOException {
++      getSerializedSize();
++      getUnknownFields().writeTo(output);
++    }
++
++    private int memoizedSerializedSize = -1;
++    public int getSerializedSize() {
++      int size = memoizedSerializedSize;
++      if (size != -1) return size;
++
++      size = 0;
++      size += getUnknownFields().getSerializedSize();
++      memoizedSerializedSize = size;
++      return size;
++    }
++
++    private static final long serialVersionUID = 0L;
++    @java.lang.Override
++    protected java.lang.Object writeReplace()
++        throws java.io.ObjectStreamException {
++      return super.writeReplace();
++    }
++
++    @java.lang.Override
++    public boolean equals(final java.lang.Object obj) {
++      if (obj == this) {
++       return true;
++      }
++      if (!(obj instanceof org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest)) {
++        return super.equals(obj);
++      }
++      org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest other = (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest) obj;
++
++      boolean result = true;
++      result = result &&
++          getUnknownFields().equals(other.getUnknownFields());
++      return result;
++    }
++
++    private int memoizedHashCode = 0;
++    @java.lang.Override
++    public int hashCode() {
++      if (memoizedHashCode != 0) {
++        return memoizedHashCode;
++      }
++      int hash = 41;
++      hash = (19 * hash) + getDescriptorForType().hashCode();
++      hash = (29 * hash) + getUnknownFields().hashCode();
++      memoizedHashCode = hash;
++      return hash;
++    }
++
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        com.google.protobuf.ByteString data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        com.google.protobuf.ByteString data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(byte[] data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        byte[] data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseDelimitedFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseDelimitedFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        com.google.protobuf.CodedInputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parseFrom(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++
++    public static Builder newBuilder() { return Builder.create(); }
++    public Builder newBuilderForType() { return newBuilder(); }
++    public static Builder newBuilder(org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest prototype) {
++      return newBuilder().mergeFrom(prototype);
++    }
++    public Builder toBuilder() { return newBuilder(this); }
++
++    @java.lang.Override
++    protected Builder newBuilderForType(
++        com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++      Builder builder = new Builder(parent);
++      return builder;
++    }
++    /**
++     * Protobuf type {@code SecurityCapabilitiesRequest}
++     */
++    public static final class Builder extends
++        com.google.protobuf.GeneratedMessage.Builder<Builder>
++       implements org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequestOrBuilder {
++      public static final com.google.protobuf.Descriptors.Descriptor
++          getDescriptor() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesRequest_descriptor;
++      }
++
++      protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++          internalGetFieldAccessorTable() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesRequest_fieldAccessorTable
++            .ensureFieldAccessorsInitialized(
++                org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.class, org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.Builder.class);
++      }
++
++      // Construct using org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.newBuilder()
++      private Builder() {
++        maybeForceBuilderInitialization();
++      }
++
++      private Builder(
++          com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++        super(parent);
++        maybeForceBuilderInitialization();
++      }
++      private void maybeForceBuilderInitialization() {
++        if (com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders) {
++        }
++      }
++      private static Builder create() {
++        return new Builder();
++      }
++
++      public Builder clear() {
++        super.clear();
++        return this;
++      }
++
++      public Builder clone() {
++        return create().mergeFrom(buildPartial());
++      }
++
++      public com.google.protobuf.Descriptors.Descriptor
++          getDescriptorForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesRequest_descriptor;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest getDefaultInstanceForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.getDefaultInstance();
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest build() {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest result = buildPartial();
++        if (!result.isInitialized()) {
++          throw newUninitializedMessageException(result);
++        }
++        return result;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest buildPartial() {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest result = new org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest(this);
++        onBuilt();
++        return result;
++      }
++
++      public Builder mergeFrom(com.google.protobuf.Message other) {
++        if (other instanceof org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest) {
++          return mergeFrom((org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest)other);
++        } else {
++          super.mergeFrom(other);
++          return this;
++        }
++      }
++
++      public Builder mergeFrom(org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest other) {
++        if (other == org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.getDefaultInstance()) return this;
++        this.mergeUnknownFields(other.getUnknownFields());
++        return this;
++      }
++
++      public final boolean isInitialized() {
++        return true;
++      }
++
++      public Builder mergeFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws java.io.IOException {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest parsedMessage = null;
++        try {
++          parsedMessage = PARSER.parsePartialFrom(input, extensionRegistry);
++        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++          parsedMessage = (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest) e.getUnfinishedMessage();
++          throw e;
++        } finally {
++          if (parsedMessage != null) {
++            mergeFrom(parsedMessage);
++          }
++        }
++        return this;
++      }
++
++      // @@protoc_insertion_point(builder_scope:SecurityCapabilitiesRequest)
++    }
++
++    static {
++      defaultInstance = new SecurityCapabilitiesRequest(true);
++      defaultInstance.initFields();
++    }
++
++    // @@protoc_insertion_point(class_scope:SecurityCapabilitiesRequest)
++  }
++
++  public interface SecurityCapabilitiesResponseOrBuilder
++      extends com.google.protobuf.MessageOrBuilder {
++
++    // repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    java.util.List<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> getCapabilitiesList();
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    int getCapabilitiesCount();
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability getCapabilities(int index);
++  }
++  /**
++   * Protobuf type {@code SecurityCapabilitiesResponse}
++   */
++  public static final class SecurityCapabilitiesResponse extends
++      com.google.protobuf.GeneratedMessage
++      implements SecurityCapabilitiesResponseOrBuilder {
++    // Use SecurityCapabilitiesResponse.newBuilder() to construct.
++    private SecurityCapabilitiesResponse(com.google.protobuf.GeneratedMessage.Builder<?> builder) {
++      super(builder);
++      this.unknownFields = builder.getUnknownFields();
++    }
++    private SecurityCapabilitiesResponse(boolean noInit) { this.unknownFields = com.google.protobuf.UnknownFieldSet.getDefaultInstance(); }
++
++    private static final SecurityCapabilitiesResponse defaultInstance;
++    public static SecurityCapabilitiesResponse getDefaultInstance() {
++      return defaultInstance;
++    }
++
++    public SecurityCapabilitiesResponse getDefaultInstanceForType() {
++      return defaultInstance;
++    }
++
++    private final com.google.protobuf.UnknownFieldSet unknownFields;
++    @java.lang.Override
++    public final com.google.protobuf.UnknownFieldSet
++        getUnknownFields() {
++      return this.unknownFields;
++    }
++    private SecurityCapabilitiesResponse(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      initFields();
++      int mutable_bitField0_ = 0;
++      com.google.protobuf.UnknownFieldSet.Builder unknownFields =
++          com.google.protobuf.UnknownFieldSet.newBuilder();
++      try {
++        boolean done = false;
++        while (!done) {
++          int tag = input.readTag();
++          switch (tag) {
++            case 0:
++              done = true;
++              break;
++            default: {
++              if (!parseUnknownField(input, unknownFields,
++                                     extensionRegistry, tag)) {
++                done = true;
++              }
++              break;
++            }
++            case 8: {
++              int rawValue = input.readEnum();
++              org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability value = org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability.valueOf(rawValue);
++              if (value == null) {
++                unknownFields.mergeVarintField(1, rawValue);
++              } else {
++                if (!((mutable_bitField0_ & 0x00000001) == 0x00000001)) {
++                  capabilities_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability>();
++                  mutable_bitField0_ |= 0x00000001;
++                }
++                capabilities_.add(value);
++              }
++              break;
++            }
++            case 10: {
++              int length = input.readRawVarint32();
++              int oldLimit = input.pushLimit(length);
++              while(input.getBytesUntilLimit() > 0) {
++                int rawValue = input.readEnum();
++                org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability value = org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability.valueOf(rawValue);
++                if (value == null) {
++                  unknownFields.mergeVarintField(1, rawValue);
++                } else {
++                  if (!((mutable_bitField0_ & 0x00000001) == 0x00000001)) {
++                    capabilities_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability>();
++                    mutable_bitField0_ |= 0x00000001;
++                  }
++                  capabilities_.add(value);
++                }
++              }
++              input.popLimit(oldLimit);
++              break;
++            }
++          }
++        }
++      } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++        throw e.setUnfinishedMessage(this);
++      } catch (java.io.IOException e) {
++        throw new com.google.protobuf.InvalidProtocolBufferException(
++            e.getMessage()).setUnfinishedMessage(this);
++      } finally {
++        if (((mutable_bitField0_ & 0x00000001) == 0x00000001)) {
++          capabilities_ = java.util.Collections.unmodifiableList(capabilities_);
++        }
++        this.unknownFields = unknownFields.build();
++        makeExtensionsImmutable();
++      }
++    }
++    public static final com.google.protobuf.Descriptors.Descriptor
++        getDescriptor() {
++      return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesResponse_descriptor;
++    }
++
++    protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++        internalGetFieldAccessorTable() {
++      return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesResponse_fieldAccessorTable
++          .ensureFieldAccessorsInitialized(
++              org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.class, org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Builder.class);
++    }
++
++    public static com.google.protobuf.Parser<SecurityCapabilitiesResponse> PARSER =
++        new com.google.protobuf.AbstractParser<SecurityCapabilitiesResponse>() {
++      public SecurityCapabilitiesResponse parsePartialFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws com.google.protobuf.InvalidProtocolBufferException {
++        return new SecurityCapabilitiesResponse(input, extensionRegistry);
++      }
++    };
++
++    @java.lang.Override
++    public com.google.protobuf.Parser<SecurityCapabilitiesResponse> getParserForType() {
++      return PARSER;
++    }
++
++    /**
++     * Protobuf enum {@code SecurityCapabilitiesResponse.Capability}
++     */
++    public enum Capability
++        implements com.google.protobuf.ProtocolMessageEnum {
++      /**
++       * <code>SIMPLE_AUTHENTICATION = 0;</code>
++       */
++      SIMPLE_AUTHENTICATION(0, 0),
++      /**
++       * <code>SECURE_AUTHENTICATION = 1;</code>
++       */
++      SECURE_AUTHENTICATION(1, 1),
++      /**
++       * <code>AUTHORIZATION = 2;</code>
++       */
++      AUTHORIZATION(2, 2),
++      /**
++       * <code>CELL_AUTHORIZATION = 3;</code>
++       */
++      CELL_AUTHORIZATION(3, 3),
++      /**
++       * <code>CELL_VISIBILITY = 4;</code>
++       */
++      CELL_VISIBILITY(4, 4),
++      ;
++
++      /**
++       * <code>SIMPLE_AUTHENTICATION = 0;</code>
++       */
++      public static final int SIMPLE_AUTHENTICATION_VALUE = 0;
++      /**
++       * <code>SECURE_AUTHENTICATION = 1;</code>
++       */
++      public static final int SECURE_AUTHENTICATION_VALUE = 1;
++      /**
++       * <code>AUTHORIZATION = 2;</code>
++       */
++      public static final int AUTHORIZATION_VALUE = 2;
++      /**
++       * <code>CELL_AUTHORIZATION = 3;</code>
++       */
++      public static final int CELL_AUTHORIZATION_VALUE = 3;
++      /**
++       * <code>CELL_VISIBILITY = 4;</code>
++       */
++      public static final int CELL_VISIBILITY_VALUE = 4;
++
++
++      public final int getNumber() { return value; }
++
++      public static Capability valueOf(int value) {
++        switch (value) {
++          case 0: return SIMPLE_AUTHENTICATION;
++          case 1: return SECURE_AUTHENTICATION;
++          case 2: return AUTHORIZATION;
++          case 3: return CELL_AUTHORIZATION;
++          case 4: return CELL_VISIBILITY;
++          default: return null;
++        }
++      }
++
++      public static com.google.protobuf.Internal.EnumLiteMap<Capability>
++          internalGetValueMap() {
++        return internalValueMap;
++      }
++      private static com.google.protobuf.Internal.EnumLiteMap<Capability>
++          internalValueMap =
++            new com.google.protobuf.Internal.EnumLiteMap<Capability>() {
++              public Capability findValueByNumber(int number) {
++                return Capability.valueOf(number);
++              }
++            };
++
++      public final com.google.protobuf.Descriptors.EnumValueDescriptor
++          getValueDescriptor() {
++        return getDescriptor().getValues().get(index);
++      }
++      public final com.google.protobuf.Descriptors.EnumDescriptor
++          getDescriptorForType() {
++        return getDescriptor();
++      }
++      public static final com.google.protobuf.Descriptors.EnumDescriptor
++          getDescriptor() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDescriptor().getEnumTypes().get(0);
++      }
++
++      private static final Capability[] VALUES = values();
++
++      public static Capability valueOf(
++          com.google.protobuf.Descriptors.EnumValueDescriptor desc) {
++        if (desc.getType() != getDescriptor()) {
++          throw new java.lang.IllegalArgumentException(
++            "EnumValueDescriptor is not for this type.");
++        }
++        return VALUES[desc.getIndex()];
++      }
++
++      private final int index;
++      private final int value;
++
++      private Capability(int index, int value) {
++        this.index = index;
++        this.value = value;
++      }
++
++      // @@protoc_insertion_point(enum_scope:SecurityCapabilitiesResponse.Capability)
++    }
++
++    // repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;
++    public static final int CAPABILITIES_FIELD_NUMBER = 1;
++    private java.util.List<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> capabilities_;
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    public java.util.List<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> getCapabilitiesList() {
++      return capabilities_;
++    }
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    public int getCapabilitiesCount() {
++      return capabilities_.size();
++    }
++    /**
++     * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++     */
++    public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability getCapabilities(int index) {
++      return capabilities_.get(index);
++    }
++
++    private void initFields() {
++      capabilities_ = java.util.Collections.emptyList();
++    }
++    private byte memoizedIsInitialized = -1;
++    public final boolean isInitialized() {
++      byte isInitialized = memoizedIsInitialized;
++      if (isInitialized != -1) return isInitialized == 1;
++
++      memoizedIsInitialized = 1;
++      return true;
++    }
++
++    public void writeTo(com.google.protobuf.CodedOutputStream output)
++                        throws java.io.IOException {
++      getSerializedSize();
++      for (int i = 0; i < capabilities_.size(); i++) {
++        output.writeEnum(1, capabilities_.get(i).getNumber());
++      }
++      getUnknownFields().writeTo(output);
++    }
++
++    private int memoizedSerializedSize = -1;
++    public int getSerializedSize() {
++      int size = memoizedSerializedSize;
++      if (size != -1) return size;
++
++      size = 0;
++      {
++        int dataSize = 0;
++        for (int i = 0; i < capabilities_.size(); i++) {
++          dataSize += com.google.protobuf.CodedOutputStream
++            .computeEnumSizeNoTag(capabilities_.get(i).getNumber());
++        }
++        size += dataSize;
++        size += 1 * capabilities_.size();
++      }
++      size += getUnknownFields().getSerializedSize();
++      memoizedSerializedSize = size;
++      return size;
++    }
++
++    private static final long serialVersionUID = 0L;
++    @java.lang.Override
++    protected java.lang.Object writeReplace()
++        throws java.io.ObjectStreamException {
++      return super.writeReplace();
++    }
++
++    @java.lang.Override
++    public boolean equals(final java.lang.Object obj) {
++      if (obj == this) {
++       return true;
++      }
++      if (!(obj instanceof org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse)) {
++        return super.equals(obj);
++      }
++      org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse other = (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse) obj;
++
++      boolean result = true;
++      result = result && getCapabilitiesList()
++          .equals(other.getCapabilitiesList());
++      result = result &&
++          getUnknownFields().equals(other.getUnknownFields());
++      return result;
++    }
++
++    private int memoizedHashCode = 0;
++    @java.lang.Override
++    public int hashCode() {
++      if (memoizedHashCode != 0) {
++        return memoizedHashCode;
++      }
++      int hash = 41;
++      hash = (19 * hash) + getDescriptorForType().hashCode();
++      if (getCapabilitiesCount() > 0) {
++        hash = (37 * hash) + CAPABILITIES_FIELD_NUMBER;
++        hash = (53 * hash) + hashEnumList(getCapabilitiesList());
++      }
++      hash = (29 * hash) + getUnknownFields().hashCode();
++      memoizedHashCode = hash;
++      return hash;
++    }
++
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        com.google.protobuf.ByteString data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        com.google.protobuf.ByteString data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(byte[] data)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        byte[] data,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws com.google.protobuf.InvalidProtocolBufferException {
++      return PARSER.parseFrom(data, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseDelimitedFrom(java.io.InputStream input)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseDelimitedFrom(
++        java.io.InputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseDelimitedFrom(input, extensionRegistry);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        com.google.protobuf.CodedInputStream input)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input);
++    }
++    public static org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parseFrom(
++        com.google.protobuf.CodedInputStream input,
++        com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++        throws java.io.IOException {
++      return PARSER.parseFrom(input, extensionRegistry);
++    }
++
++    public static Builder newBuilder() { return Builder.create(); }
++    public Builder newBuilderForType() { return newBuilder(); }
++    public static Builder newBuilder(org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse prototype) {
++      return newBuilder().mergeFrom(prototype);
++    }
++    public Builder toBuilder() { return newBuilder(this); }
++
++    @java.lang.Override
++    protected Builder newBuilderForType(
++        com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++      Builder builder = new Builder(parent);
++      return builder;
++    }
++    /**
++     * Protobuf type {@code SecurityCapabilitiesResponse}
++     */
++    public static final class Builder extends
++        com.google.protobuf.GeneratedMessage.Builder<Builder>
++       implements org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponseOrBuilder {
++      public static final com.google.protobuf.Descriptors.Descriptor
++          getDescriptor() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesResponse_descriptor;
++      }
++
++      protected com.google.protobuf.GeneratedMessage.FieldAccessorTable
++          internalGetFieldAccessorTable() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesResponse_fieldAccessorTable
++            .ensureFieldAccessorsInitialized(
++                org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.class, org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Builder.class);
++      }
++
++      // Construct using org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.newBuilder()
++      private Builder() {
++        maybeForceBuilderInitialization();
++      }
++
++      private Builder(
++          com.google.protobuf.GeneratedMessage.BuilderParent parent) {
++        super(parent);
++        maybeForceBuilderInitialization();
++      }
++      private void maybeForceBuilderInitialization() {
++        if (com.google.protobuf.GeneratedMessage.alwaysUseFieldBuilders) {
++        }
++      }
++      private static Builder create() {
++        return new Builder();
++      }
++
++      public Builder clear() {
++        super.clear();
++        capabilities_ = java.util.Collections.emptyList();
++        bitField0_ = (bitField0_ & ~0x00000001);
++        return this;
++      }
++
++      public Builder clone() {
++        return create().mergeFrom(buildPartial());
++      }
++
++      public com.google.protobuf.Descriptors.Descriptor
++          getDescriptorForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.internal_static_SecurityCapabilitiesResponse_descriptor;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse getDefaultInstanceForType() {
++        return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance();
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse build() {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse result = buildPartial();
++        if (!result.isInitialized()) {
++          throw newUninitializedMessageException(result);
++        }
++        return result;
++      }
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse buildPartial() {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse result = new org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse(this);
++        int from_bitField0_ = bitField0_;
++        if (((bitField0_ & 0x00000001) == 0x00000001)) {
++          capabilities_ = java.util.Collections.unmodifiableList(capabilities_);
++          bitField0_ = (bitField0_ & ~0x00000001);
++        }
++        result.capabilities_ = capabilities_;
++        onBuilt();
++        return result;
++      }
++
++      public Builder mergeFrom(com.google.protobuf.Message other) {
++        if (other instanceof org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse) {
++          return mergeFrom((org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse)other);
++        } else {
++          super.mergeFrom(other);
++          return this;
++        }
++      }
++
++      public Builder mergeFrom(org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse other) {
++        if (other == org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance()) return this;
++        if (!other.capabilities_.isEmpty()) {
++          if (capabilities_.isEmpty()) {
++            capabilities_ = other.capabilities_;
++            bitField0_ = (bitField0_ & ~0x00000001);
++          } else {
++            ensureCapabilitiesIsMutable();
++            capabilities_.addAll(other.capabilities_);
++          }
++          onChanged();
++        }
++        this.mergeUnknownFields(other.getUnknownFields());
++        return this;
++      }
++
++      public final boolean isInitialized() {
++        return true;
++      }
++
++      public Builder mergeFrom(
++          com.google.protobuf.CodedInputStream input,
++          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
++          throws java.io.IOException {
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse parsedMessage = null;
++        try {
++          parsedMessage = PARSER.parsePartialFrom(input, extensionRegistry);
++        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
++          parsedMessage = (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse) e.getUnfinishedMessage();
++          throw e;
++        } finally {
++          if (parsedMessage != null) {
++            mergeFrom(parsedMessage);
++          }
++        }
++        return this;
++      }
++      private int bitField0_;
++
++      // repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;
++      private java.util.List<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> capabilities_ =
++        java.util.Collections.emptyList();
++      private void ensureCapabilitiesIsMutable() {
++        if (!((bitField0_ & 0x00000001) == 0x00000001)) {
++          capabilities_ = new java.util.ArrayList<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability>(capabilities_);
++          bitField0_ |= 0x00000001;
++        }
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public java.util.List<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> getCapabilitiesList() {
++        return java.util.Collections.unmodifiableList(capabilities_);
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public int getCapabilitiesCount() {
++        return capabilities_.size();
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability getCapabilities(int index) {
++        return capabilities_.get(index);
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public Builder setCapabilities(
++          int index, org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability value) {
++        if (value == null) {
++          throw new NullPointerException();
++        }
++        ensureCapabilitiesIsMutable();
++        capabilities_.set(index, value);
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public Builder addCapabilities(org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability value) {
++        if (value == null) {
++          throw new NullPointerException();
++        }
++        ensureCapabilitiesIsMutable();
++        capabilities_.add(value);
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public Builder addAllCapabilities(
++          java.lang.Iterable<? extends org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability> values) {
++        ensureCapabilitiesIsMutable();
++        super.addAll(values, capabilities_);
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>repeated .SecurityCapabilitiesResponse.Capability capabilities = 1;</code>
++       */
++      public Builder clearCapabilities() {
++        capabilities_ = java.util.Collections.emptyList();
++        bitField0_ = (bitField0_ & ~0x00000001);
++        onChanged();
++        return this;
++      }
++
++      // @@protoc_insertion_point(builder_scope:SecurityCapabilitiesResponse)
++    }
++
++    static {
++      defaultInstance = new SecurityCapabilitiesResponse(true);
++      defaultInstance.initFields();
++    }
++
++    // @@protoc_insertion_point(class_scope:SecurityCapabilitiesResponse)
++  }
++
+   /**
+    * Protobuf service {@code MasterService}
+    */
+@@ -41871,6 +42839,18 @@ public final class MasterProtos {
+           org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest request,
+           com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse> done);
+ 
++      /**
++       * <code>rpc getSecurityCapabilities(.SecurityCapabilitiesRequest) returns (.SecurityCapabilitiesResponse);</code>
++       *
++       * <pre>
++       ** Returns the security capabilities in effect on the cluster 
++       * </pre>
++       */
++      public abstract void getSecurityCapabilities(
++          com.google.protobuf.RpcController controller,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request,
++          com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse> done);
++
+     }
+ 
+     public static com.google.protobuf.Service newReflectiveService(
+@@ -42220,6 +43200,14 @@ public final class MasterProtos {
+           impl.truncateTable(controller, request, done);
+         }
+ 
++        @java.lang.Override
++        public  void getSecurityCapabilities(
++            com.google.protobuf.RpcController controller,
++            org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request,
++            com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse> done) {
++          impl.getSecurityCapabilities(controller, request, done);
++        }
++
+       };
+     }
+ 
+@@ -42328,6 +43316,8 @@ public final class MasterProtos {
+               return impl.listTableNamesByNamespace(controller, (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest)request);
+             case 42:
+               return impl.truncateTable(controller, (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest)request);
++            case 43:
++              return impl.getSecurityCapabilities(controller, (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest)request);
+             default:
+               throw new java.lang.AssertionError("Can't get here.");
+           }
+@@ -42428,6 +43418,8 @@ public final class MasterProtos {
+               return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest.getDefaultInstance();
+             case 42:
+               return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest.getDefaultInstance();
++            case 43:
++              return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.getDefaultInstance();
+             default:
+               throw new java.lang.AssertionError("Can't get here.");
+           }
+@@ -42528,6 +43520,8 @@ public final class MasterProtos {
+               return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceResponse.getDefaultInstance();
+             case 42:
+               return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse.getDefaultInstance();
++            case 43:
++              return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance();
+             default:
+               throw new java.lang.AssertionError("Can't get here.");
+           }
+@@ -43078,6 +44072,18 @@ public final class MasterProtos {
+         org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest request,
+         com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse> done);
+ 
++    /**
++     * <code>rpc getSecurityCapabilities(.SecurityCapabilitiesRequest) returns (.SecurityCapabilitiesResponse);</code>
++     *
++     * <pre>
++     ** Returns the security capabilities in effect on the cluster 
++     * </pre>
++     */
++    public abstract void getSecurityCapabilities(
++        com.google.protobuf.RpcController controller,
++        org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request,
++        com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse> done);
++
+     public static final
+         com.google.protobuf.Descriptors.ServiceDescriptor
+         getDescriptor() {
+@@ -43315,6 +44321,11 @@ public final class MasterProtos {
+             com.google.protobuf.RpcUtil.<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse>specializeCallback(
+               done));
+           return;
++        case 43:
++          this.getSecurityCapabilities(controller, (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest)request,
++            com.google.protobuf.RpcUtil.<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse>specializeCallback(
++              done));
++          return;
+         default:
+           throw new java.lang.AssertionError("Can't get here.");
+       }
+@@ -43415,6 +44426,8 @@ public final class MasterProtos {
+           return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest.getDefaultInstance();
+         case 42:
+           return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest.getDefaultInstance();
++        case 43:
++          return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest.getDefaultInstance();
+         default:
+           throw new java.lang.AssertionError("Can't get here.");
+       }
+@@ -43515,6 +44528,8 @@ public final class MasterProtos {
+           return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceResponse.getDefaultInstance();
+         case 42:
+           return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse.getDefaultInstance();
++        case 43:
++          return org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance();
+         default:
+           throw new java.lang.AssertionError("Can't get here.");
+       }
+@@ -44180,6 +45195,21 @@ public final class MasterProtos {
+             org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse.class,
+             org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse.getDefaultInstance()));
+       }
++
++      public  void getSecurityCapabilities(
++          com.google.protobuf.RpcController controller,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request,
++          com.google.protobuf.RpcCallback<org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse> done) {
++        channel.callMethod(
++          getDescriptor().getMethods().get(43),
++          controller,
++          request,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance(),
++          com.google.protobuf.RpcUtil.generalizeCallback(
++            done,
++            org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.class,
++            org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance()));
++      }
+     }
+ 
+     public static BlockingInterface newBlockingStub(
+@@ -44402,6 +45432,11 @@ public final class MasterProtos {
+           com.google.protobuf.RpcController controller,
+           org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest request)
+           throws com.google.protobuf.ServiceException;
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse getSecurityCapabilities(
++          com.google.protobuf.RpcController controller,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request)
++          throws com.google.protobuf.ServiceException;
+     }
+ 
+     private static final class BlockingStub implements BlockingInterface {
+@@ -44926,6 +45961,18 @@ public final class MasterProtos {
+           org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse.getDefaultInstance());
+       }
+ 
++
++      public org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse getSecurityCapabilities(
++          com.google.protobuf.RpcController controller,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest request)
++          throws com.google.protobuf.ServiceException {
++        return (org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse) channel.callBlockingMethod(
++          getDescriptor().getMethods().get(43),
++          controller,
++          request,
++          org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.getDefaultInstance());
++      }
++
+     }
+ 
+     // @@protoc_insertion_point(class_scope:MasterService)
+@@ -45351,6 +46398,16 @@ public final class MasterProtos {
+   private static
+     com.google.protobuf.GeneratedMessage.FieldAccessorTable
+       internal_static_TruncateTableResponse_fieldAccessorTable;
++  private static com.google.protobuf.Descriptors.Descriptor
++    internal_static_SecurityCapabilitiesRequest_descriptor;
++  private static
++    com.google.protobuf.GeneratedMessage.FieldAccessorTable
++      internal_static_SecurityCapabilitiesRequest_fieldAccessorTable;
++  private static com.google.protobuf.Descriptors.Descriptor
++    internal_static_SecurityCapabilitiesResponse_descriptor;
++  private static
++    com.google.protobuf.GeneratedMessage.FieldAccessorTable
++      internal_static_SecurityCapabilitiesResponse_fieldAccessorTable;
+ 
+   public static com.google.protobuf.Descriptors.FileDescriptor
+       getDescriptor() {
+@@ -45470,85 +46527,94 @@ public final class MasterProtos {
+       "dureDescription\"T\n\024TruncateTableRequest\022" +
+       "\035\n\ttableName\030\001 \002(\0132\n.TableName\022\035\n\016preser" +
+       "veSplits\030\002 \001(\010:\005false\"\027\n\025TruncateTableRe",
+-      "sponse2\372\027\n\rMasterService\022S\n\024GetSchemaAlt" +
+-      "erStatus\022\034.GetSchemaAlterStatusRequest\032\035" +
+-      ".GetSchemaAlterStatusResponse\022P\n\023GetTabl" +
+-      "eDescriptors\022\033.GetTableDescriptorsReques" +
+-      "t\032\034.GetTableDescriptorsResponse\022>\n\rGetTa" +
+-      "bleNames\022\025.GetTableNamesRequest\032\026.GetTab" +
+-      "leNamesResponse\022G\n\020GetClusterStatus\022\030.Ge" +
+-      "tClusterStatusRequest\032\031.GetClusterStatus" +
+-      "Response\022D\n\017IsMasterRunning\022\027.IsMasterRu" +
+-      "nningRequest\032\030.IsMasterRunningResponse\0222",
+-      "\n\tAddColumn\022\021.AddColumnRequest\032\022.AddColu" +
+-      "mnResponse\022;\n\014DeleteColumn\022\024.DeleteColum" +
+-      "nRequest\032\025.DeleteColumnResponse\022;\n\014Modif" +
+-      "yColumn\022\024.ModifyColumnRequest\032\025.ModifyCo" +
+-      "lumnResponse\0225\n\nMoveRegion\022\022.MoveRegionR" +
+-      "equest\032\023.MoveRegionResponse\022Y\n\026DispatchM" +
+-      "ergingRegions\022\036.DispatchMergingRegionsRe" +
+-      "quest\032\037.DispatchMergingRegionsResponse\022;" +
+-      "\n\014AssignRegion\022\024.AssignRegionRequest\032\025.A" +
+-      "ssignRegionResponse\022A\n\016UnassignRegion\022\026.",
+-      "UnassignRegionRequest\032\027.UnassignRegionRe" +
+-      "sponse\022>\n\rOfflineRegion\022\025.OfflineRegionR" +
+-      "equest\032\026.OfflineRegionResponse\0228\n\013Delete" +
+-      "Table\022\023.DeleteTableRequest\032\024.DeleteTable" +
+-      "Response\0228\n\013EnableTable\022\023.EnableTableReq" +
+-      "uest\032\024.EnableTableResponse\022;\n\014DisableTab" +
+-      "le\022\024.DisableTableRequest\032\025.DisableTableR" +
+-      "esponse\0228\n\013ModifyTable\022\023.ModifyTableRequ" +
+-      "est\032\024.ModifyTableResponse\0228\n\013CreateTable" +
+-      "\022\023.CreateTableRequest\032\024.CreateTableRespo",
+-      "nse\022/\n\010Shutdown\022\020.ShutdownRequest\032\021.Shut" +
+-      "downResponse\0225\n\nStopMaster\022\022.StopMasterR" +
+-      "equest\032\023.StopMasterResponse\022,\n\007Balance\022\017" +
+-      ".BalanceRequest\032\020.BalanceResponse\022M\n\022Set" +
+-      "BalancerRunning\022\032.SetBalancerRunningRequ" +
+-      "est\032\033.SetBalancerRunningResponse\022J\n\021IsBa" +
+-      "lancerEnabled\022\031.IsBalancerEnabledRequest" +
+-      "\032\032.IsBalancerEnabledResponse\022A\n\016RunCatal" +
+-      "ogScan\022\026.RunCatalogScanRequest\032\027.RunCata" +
+-      "logScanResponse\022S\n\024EnableCatalogJanitor\022",
+-      "\034.EnableCatalogJanitorRequest\032\035.EnableCa" +
+-      "talogJanitorResponse\022\\\n\027IsCatalogJanitor" +
+-      "Enabled\022\037.IsCatalogJanitorEnabledRequest" +
+-      "\032 .IsCatalogJanitorEnabledResponse\022L\n\021Ex" +
+-      "ecMasterService\022\032.CoprocessorServiceRequ" +
+-      "est\032\033.CoprocessorServiceResponse\022/\n\010Snap" +
+-      "shot\022\020.SnapshotRequest\032\021.SnapshotRespons" +
+-      "e\022V\n\025GetCompletedSnapshots\022\035.GetComplete" +
+-      "dSnapshotsRequest\032\036.GetCompletedSnapshot" +
+-      "sResponse\022A\n\016DeleteSnapshot\022\026.DeleteSnap",
+-      "shotRequest\032\027.DeleteSnapshotResponse\022A\n\016" +
+-      "IsSnapshotDone\022\026.IsSnapshotDoneRequest\032\027" +
+-      ".IsSnapshotDoneResponse\022D\n\017RestoreSnapsh" +
+-      "ot\022\027.RestoreSnapshotRequest\032\030.RestoreSna" +
+-      "pshotResponse\022V\n\025IsRestoreSnapshotDone\022\035" +
+-      ".IsRestoreSnapshotDoneRequest\032\036.IsRestor" +
+-      "eSnapshotDoneResponse\022>\n\rExecProcedure\022\025" +
+-      ".ExecProcedureRequest\032\026.ExecProcedureRes" +
+-      "ponse\022D\n\017IsProcedureDone\022\027.IsProcedureDo" +
+-      "neRequest\032\030.IsProcedureDoneResponse\022D\n\017M",
+-      "odifyNamespace\022\027.ModifyNamespaceRequest\032" +
+-      "\030.ModifyNamespaceResponse\022D\n\017CreateNames" +
+-      "pace\022\027.CreateNamespaceRequest\032\030.CreateNa" +
+-      "mespaceResponse\022D\n\017DeleteNamespace\022\027.Del" +
+-      "eteNamespaceRequest\032\030.DeleteNamespaceRes" +
+-      "ponse\022Y\n\026GetNamespaceDescriptor\022\036.GetNam" +
+-      "espaceDescriptorRequest\032\037.GetNamespaceDe" +
+-      "scriptorResponse\022_\n\030ListNamespaceDescrip" +
+-      "tors\022 .ListNamespaceDescriptorsRequest\032!" +
+-      ".ListNamespaceDescriptorsResponse\022t\n\037Lis",
+-      "tTableDescriptorsByNamespace\022\'.ListTable" +
+-      "DescriptorsByNamespaceRequest\032(.ListTabl" +
+-      "eDescriptorsByNamespaceResponse\022b\n\031ListT" +
+-      "ableNamesByNamespace\022!.ListTableNamesByN" +
+-      "amespaceRequest\032\".ListTableNamesByNamesp" +
+-      "aceResponse\022>\n\rtruncateTable\022\025.TruncateT" +
+-      "ableRequest\032\026.TruncateTableResponseBB\n*o" +
+-      "rg.apache.hadoop.hbase.protobuf.generate" +
+-      "dB\014MasterProtosH\001\210\001\001\240\001\001"
++      "sponse\"\035\n\033SecurityCapabilitiesRequest\"\343\001" +
++      "\n\034SecurityCapabilitiesResponse\022>\n\014capabi" +
++      "lities\030\001 \003(\0162(.SecurityCapabilitiesRespo" +
++      "nse.Capability\"\202\001\n\nCapability\022\031\n\025SIMPLE_" +
++      "AUTHENTICATION\020\000\022\031\n\025SECURE_AUTHENTICATIO" +
++      "N\020\001\022\021\n\rAUTHORIZATION\020\002\022\026\n\022CELL_AUTHORIZA" +
++      "TION\020\003\022\023\n\017CELL_VISIBILITY\020\0042\322\030\n\rMasterSe" +
++      "rvice\022S\n\024GetSchemaAlterStatus\022\034.GetSchem" +
++      "aAlterStatusRequest\032\035.GetSchemaAlterStat" +
++      "usResponse\022P\n\023GetTableDescriptors\022\033.GetT",
++      "ableDescriptorsRequest\032\034.GetTableDescrip" +
++      "torsResponse\022>\n\rGetTableNames\022\025.GetTable" +
++      "NamesRequest\032\026.GetTableNamesResponse\022G\n\020" +
++      "GetClusterStatus\022\030.GetClusterStatusReque" +
++      "st\032\031.GetClusterStatusResponse\022D\n\017IsMaste" +
++      "rRunning\022\027.IsMasterRunningRequest\032\030.IsMa" +
++      "sterRunningResponse\0222\n\tAddColumn\022\021.AddCo" +
++      "lumnRequest\032\022.AddColumnResponse\022;\n\014Delet" +
++      "eColumn\022\024.DeleteColumnRequest\032\025.DeleteCo" +
++      "lumnResponse\022;\n\014ModifyColumn\022\024.ModifyCol",
++      "umnRequest\032\025.ModifyColumnResponse\0225\n\nMov" +
++      "eRegion\022\022.MoveRegionRequest\032\023.MoveRegion" +
++      "Response\022Y\n\026DispatchMergingRegions\022\036.Dis" +
++      "patchMergingRegionsRequest\032\037.DispatchMer" +
++      "gingRegionsResponse\022;\n\014AssignRegion\022\024.As" +
++      "signRegionRequest\032\025.AssignRegionResponse" +
++      "\022A\n\016UnassignRegion\022\026.UnassignRegionReque" +
++      "st\032\027.UnassignRegionResponse\022>\n\rOfflineRe" +
++      "gion\022\025.OfflineRegionRequest\032\026.OfflineReg" +
++      "ionResponse\0228\n\013DeleteTable\022\023.DeleteTable",
++      "Request\032\024.DeleteTableResponse\0228\n\013EnableT" +
++      "able\022\023.EnableTableRequest\032\024.EnableTableR" +
++      "esponse\022;\n\014DisableTable\022\024.DisableTableRe" +
++      "quest\032\025.DisableTableResponse\0228\n\013ModifyTa" +
++      "ble\022\023.ModifyTableRequest\032\024.ModifyTableRe" +
++      "sponse\0228\n\013CreateTable\022\023.CreateTableReque" +
++      "st\032\024.CreateTableResponse\022/\n\010Shutdown\022\020.S" +
++      "hutdownRequest\032\021.ShutdownResponse\0225\n\nSto" +
++      "pMaster\022\022.StopMasterRequest\032\023.StopMaster" +
++      "Response\022,\n\007Balance\022\017.BalanceRequest\032\020.B",
++      "alanceResponse\022M\n\022SetBalancerRunning\022\032.S" +
++      "etBalancerRunningRequest\032\033.SetBalancerRu" +
++      "nningResponse\022J\n\021IsBalancerEnabled\022\031.IsB" +
++      "alancerEnabledRequest\032\032.IsBalancerEnable" +
++      "dResponse\022A\n\016RunCatalogScan\022\026.RunCatalog" +
++      "ScanRequest\032\027.RunCatalogScanResponse\022S\n\024" +
++      "EnableCatalogJanitor\022\034.EnableCatalogJani" +
++      "torRequest\032\035.EnableCatalogJanitorRespons" +
++      "e\022\\\n\027IsCatalogJanitorEnabled\022\037.IsCatalog" +
++      "JanitorEnabledRequest\032 .IsCatalogJanitor",
++      "EnabledResponse\022L\n\021ExecMasterService\022\032.C" +
++      "oprocessorServiceRequest\032\033.CoprocessorSe" +
++      "rviceResponse\022/\n\010Snapshot\022\020.SnapshotRequ" +
++      "est\032\021.SnapshotResponse\022V\n\025GetCompletedSn" +
++      "apshots\022\035.GetCompletedSnapshotsRequest\032\036" +
++      ".GetCompletedSnapshotsResponse\022A\n\016Delete" +
++      "Snapshot\022\026.DeleteSnapshotRequest\032\027.Delet" +
++      "eSnapshotResponse\022A\n\016IsSnapshotDone\022\026.Is" +
++      "SnapshotDoneRequest\032\027.IsSnapshotDoneResp" +
++      "onse\022D\n\017RestoreSnapshot\022\027.RestoreSnapsho",
++      "tRequest\032\030.RestoreSnapshotResponse\022V\n\025Is" +
++      "RestoreSnapshotDone\022\035.IsRestoreSnapshotD" +
++      "oneRequest\032\036.IsRestoreSnapshotDoneRespon" +
++      "se\022>\n\rExecProcedure\022\025.ExecProcedureReque" +
++      "st\032\026.ExecProcedureResponse\022D\n\017IsProcedur" +
++      "eDone\022\027.IsProcedureDoneRequest\032\030.IsProce" +
++      "dureDoneResponse\022D\n\017ModifyNamespace\022\027.Mo" +
++      "difyNamespaceRequest\032\030.ModifyNamespaceRe" +
++      "sponse\022D\n\017CreateNamespace\022\027.CreateNamesp" +
++      "aceRequest\032\030.CreateNamespaceResponse\022D\n\017",
++      "DeleteNamespace\022\027.DeleteNamespaceRequest" +
++      "\032\030.DeleteNamespaceResponse\022Y\n\026GetNamespa" +
++      "ceDescriptor\022\036.GetNamespaceDescriptorReq" +
++      "uest\032\037.GetNamespaceDescriptorResponse\022_\n" +
++      "\030ListNamespaceDescriptors\022 .ListNamespac" +
++      "eDescriptorsRequest\032!.ListNamespaceDescr" +
++      "iptorsResponse\022t\n\037ListTableDescriptorsBy" +
++      "Namespace\022\'.ListTableDescriptorsByNamesp" +
++      "aceRequest\032(.ListTableDescriptorsByNames" +
++      "paceResponse\022b\n\031ListTableNamesByNamespac",
++      "e\022!.ListTableNamesByNamespaceRequest\032\".L" +
++      "istTableNamesByNamespaceResponse\022>\n\rtrun" +
++      "cateTable\022\025.TruncateTableRequest\032\026.Trunc" +
++      "ateTableResponse\022V\n\027getSecurityCapabilit" +
++      "ies\022\034.SecurityCapabilitiesRequest\032\035.Secu" +
++      "rityCapabilitiesResponseBB\n*org.apache.h" +
++      "adoop.hbase.protobuf.generatedB\014MasterPr" +
++      "otosH\001\210\001\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+@@ -46059,6 +47125,18 @@ public final class MasterProtos {
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_TruncateTableResponse_descriptor,
+               new java.lang.String[] { });
++          internal_static_SecurityCapabilitiesRequest_descriptor =
++            getDescriptor().getMessageTypes().get(84);
++          internal_static_SecurityCapabilitiesRequest_fieldAccessorTable = new
++            com.google.protobuf.GeneratedMessage.FieldAccessorTable(
++              internal_static_SecurityCapabilitiesRequest_descriptor,
++              new java.lang.String[] { });
++          internal_static_SecurityCapabilitiesResponse_descriptor =
++            getDescriptor().getMessageTypes().get(85);
++          internal_static_SecurityCapabilitiesResponse_fieldAccessorTable = new
++            com.google.protobuf.GeneratedMessage.FieldAccessorTable(
++              internal_static_SecurityCapabilitiesResponse_descriptor,
++              new java.lang.String[] { "Capabilities", });
+           return null;
+         }
+       };
+diff --git a/hbase-protocol/src/main/protobuf/Master.proto b/hbase-protocol/src/main/protobuf/Master.proto
+index 3dc73e5..7400e10 100644
+--- a/hbase-protocol/src/main/protobuf/Master.proto
++++ b/hbase-protocol/src/main/protobuf/Master.proto
+@@ -364,6 +364,21 @@ message TruncateTableRequest {
+ message TruncateTableResponse {
+ }
+ 
++message SecurityCapabilitiesRequest {
++}
++
++message SecurityCapabilitiesResponse {
++  enum Capability {
++    SIMPLE_AUTHENTICATION = 0;
++    SECURE_AUTHENTICATION = 1;
++    AUTHORIZATION = 2;
++    CELL_AUTHORIZATION = 3;
++    CELL_VISIBILITY = 4;
++  }
++
++  repeated Capability capabilities = 1;
++}
++
+ service MasterService {
+   /** Used by the client to get the number of regions that have received the updated schema */
+   rpc GetSchemaAlterStatus(GetSchemaAlterStatusRequest)
+@@ -572,4 +587,8 @@ service MasterService {
+   /** Truncate a table */
+     rpc truncateTable(TruncateTableRequest)
+         returns(TruncateTableResponse);
++
++  /** Returns the security capabilities in effect on the cluster */
++  rpc getSecurityCapabilities(SecurityCapabilitiesRequest)
++    returns(SecurityCapabilitiesResponse);
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index ca6a994..aaaef80 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -191,6 +191,9 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRe
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanResponse;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse;
++import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownRequest;
+@@ -218,7 +221,10 @@ import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos.SplitLogTask.R
+ import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+ import org.apache.hadoop.hbase.regionserver.RegionSplitPolicy;
+ import org.apache.hadoop.hbase.replication.regionserver.Replication;
++import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.security.UserProvider;
++import org.apache.hadoop.hbase.security.access.AccessController;
++import org.apache.hadoop.hbase.security.visibility.VisibilityController;
+ import org.apache.hadoop.hbase.snapshot.ClientSnapshotDescriptionUtils;
+ import org.apache.hadoop.hbase.snapshot.SnapshotDescriptionUtils;
+ import org.apache.hadoop.hbase.trace.SpanReceiverHost;
+@@ -3567,4 +3573,43 @@ MasterServices, Server {
+       .getDefaultLoadBalancerClass().getName());
+   }
+ 
++  /** 
++   * Returns the security capabilities in effect on the cluster
++   */
++  @Override
++  public SecurityCapabilitiesResponse getSecurityCapabilities(RpcController controller,
++      SecurityCapabilitiesRequest request) throws ServiceException {
++    SecurityCapabilitiesResponse.Builder response = SecurityCapabilitiesResponse.newBuilder();
++    try {
++      checkInitialized();
++      Set<Capability> capabilities = new HashSet<Capability>();
++      // Authentication
++      if (User.isHBaseSecurityEnabled(conf)) {
++        capabilities.add(Capability.SECURE_AUTHENTICATION);
++      } else {
++        capabilities.add(Capability.SIMPLE_AUTHENTICATION);
++      }
++      // The AccessController can provide AUTHORIZATION and CELL_AUTHORIZATION
++      if (cpHost != null &&
++          cpHost.findCoprocessor(AccessController.class.getName()) != null) {
++        if (AccessController.isAuthorizationSupported(conf)) {
++          capabilities.add(Capability.AUTHORIZATION);
++        }
++        if (AccessController.isCellAuthorizationSupported(conf)) {
++          capabilities.add(Capability.CELL_AUTHORIZATION);
++        }
++      }
++      // The VisibilityController can provide CELL_VISIBILITY
++      if (cpHost != null &&
++          cpHost.findCoprocessor(VisibilityController.class.getName()) != null) {
++        if (VisibilityController.isCellAuthorizationSupported(conf)) {
++          capabilities.add(Capability.CELL_VISIBILITY);
++        }
++      }
++      response.addAllCapabilities(capabilities);
++    } catch (IOException e) {
++      throw new ServiceException(e);
++    }
++    return response.build();
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+index d0b9e50..214b7bd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+@@ -205,6 +205,15 @@ public class AccessController extends BaseMasterAndRegionObserver
+   /** if the ACL table is available, only relevant in the master */
+   private volatile boolean aclTabAvailable = false;
+ 
++  public static boolean isAuthorizationSupported(Configuration conf) {
++    return conf.getBoolean(User.HBASE_SECURITY_AUTHORIZATION_CONF_KEY, true);
++  }
++
++  public static boolean isCellAuthorizationSupported(Configuration conf) {
++    return isAuthorizationSupported(conf) &&
++        (HFile.getFormatVersion(conf) >= HFile.MIN_FORMAT_VERSION_WITH_TAGS);
++  }
++
+   public HRegion getRegion() {
+     return regionEnv != null ? regionEnv.getRegion() : null;
+   }
+@@ -918,7 +927,7 @@ public class AccessController extends BaseMasterAndRegionObserver
+     CompoundConfiguration conf = new CompoundConfiguration();
+     conf.add(env.getConfiguration());
+ 
+-    authorizationEnabled = conf.getBoolean(User.HBASE_SECURITY_AUTHORIZATION_CONF_KEY, true);
++    authorizationEnabled = isAuthorizationSupported(conf);
+     if (!authorizationEnabled) {
+       LOG.warn("The AccessController has been loaded with authorization checks disabled.");
+     }
+@@ -926,7 +935,7 @@ public class AccessController extends BaseMasterAndRegionObserver
+     shouldCheckExecPermission = conf.getBoolean(AccessControlConstants.EXEC_PERMISSION_CHECKS_KEY,
+       AccessControlConstants.DEFAULT_EXEC_PERMISSION_CHECKS);
+ 
+-    cellFeaturesEnabled = HFile.getFormatVersion(conf) >= HFile.MIN_FORMAT_VERSION_WITH_TAGS;
++    cellFeaturesEnabled = (HFile.getFormatVersion(conf) >= HFile.MIN_FORMAT_VERSION_WITH_TAGS);
+     if (!cellFeaturesEnabled) {
+       LOG.info("A minimum HFile version of " + HFile.MIN_FORMAT_VERSION_WITH_TAGS
+           + " is required to persist cell ACLs. Consider setting " + HFile.FORMAT_VERSION_KEY
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+index 348e229..e9a01fd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+@@ -151,11 +151,19 @@ public class VisibilityController extends BaseMasterAndRegionObserver implements
+     RESERVED_VIS_TAG_TYPES.add(TagType.STRING_VIS_TAG_TYPE);
+   }
+ 
++  public static boolean isAuthorizationSupported(Configuration conf) {
++    return conf.getBoolean(User.HBASE_SECURITY_AUTHORIZATION_CONF_KEY, true);
++  }
++
++  public static boolean isCellAuthorizationSupported(Configuration conf) {
++    return isAuthorizationSupported(conf);
++  }
++
+   @Override
+   public void start(CoprocessorEnvironment env) throws IOException {
+     this.conf = env.getConfiguration();
+ 
+-    authorizationEnabled = conf.getBoolean(User.HBASE_SECURITY_AUTHORIZATION_CONF_KEY, true);
++    authorizationEnabled = isAuthorizationSupported(conf);
+     if (!authorizationEnabled) {
+       LOG.warn("The VisibilityController has been loaded with authorization checks disabled.");
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+index 56af4a3..1216a67 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+@@ -60,6 +60,7 @@ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
+ import org.apache.hadoop.hbase.coprocessor.CoprocessorService;
+ import org.apache.hadoop.hbase.coprocessor.MasterCoprocessorEnvironment;
+@@ -300,6 +301,15 @@ public class TestAccessController extends SecureTestUtil {
+   }
+ 
+   @Test
++  public void testSecurityCapabilities() throws Exception {
++    List<SecurityCapability> capabilities = TEST_UTIL.getHBaseAdmin().getSecurityCapabilities();
++    assertTrue("AUTHORIZATION capability is missing",
++      capabilities.contains(SecurityCapability.AUTHORIZATION));
++    assertTrue("CELL_AUTHORIZATION capability is missing",
++      capabilities.contains(SecurityCapability.CELL_AUTHORIZATION));
++  }
++
++  @Test
+   public void testTableCreate() throws Exception {
+     AccessTestAction createTable = new AccessTestAction() {
+       @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
+index d84a2ac..ba6ff50 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
+@@ -50,6 +50,7 @@ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.RowMutations;
+ import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.security.SecurityCapability;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionActionResult;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.GetAuthsResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsResponse;
+@@ -109,6 +110,13 @@ public abstract class TestVisibilityLabels {
+   }
+ 
+   @Test
++  public void testSecurityCapabilities() throws Exception {
++    List<SecurityCapability> capabilities = TEST_UTIL.getHBaseAdmin().getSecurityCapabilities();
++    assertTrue("CELL_VISIBILITY capability is missing",
++      capabilities.contains(SecurityCapability.CELL_VISIBILITY));
++  }
++
++  @Test
+   public void testSimpleVisibilityLabels() throws Exception {
+     TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     HTable table = createTableAndWriteDataWithLabels(tableName, SECRET + "|" + CONFIDENTIAL,
+diff --git a/hbase-shell/src/main/ruby/hbase/admin.rb b/hbase-shell/src/main/ruby/hbase/admin.rb
+index 00708e9..2ae31c3 100644
+--- a/hbase-shell/src/main/ruby/hbase/admin.rb
++++ b/hbase-shell/src/main/ruby/hbase/admin.rb
+@@ -973,5 +973,10 @@ module Hbase
+       @admin.deleteNamespace(namespace_name)
+     end
+ 
++    #----------------------------------------------------------------------------------------------
++    # Get security capabilities
++    def get_security_capabilities
++      @admin.getSecurityCapabilities
++    end
+   end
+ end
+diff --git a/hbase-shell/src/main/ruby/hbase/security.rb b/hbase-shell/src/main/ruby/hbase/security.rb
+index 402c004..95abddd 100644
+--- a/hbase-shell/src/main/ruby/hbase/security.rb
++++ b/hbase-shell/src/main/ruby/hbase/security.rb
+@@ -176,10 +176,23 @@ module Hbase
+       end
+     end
+ 
+-    # Make sure that security tables are available
++    # Make sure that security features are available
+     def security_available?()
+-      raise(ArgumentError, "DISABLED: Security features are not available") \
+-        unless exists?(org.apache.hadoop.hbase.security.access.AccessControlLists::ACL_TABLE_NAME)
++      caps = []
++      begin
++        # Try the getSecurityCapabilities API where supported.
++        # We only need to look at AUTHORIZATION, the AccessController doesn't support
++        # CELL_AUTHORIZATION without AUTHORIZATION also available.
++        caps = @admin.getSecurityCapabilities
++      rescue
++        # If we are unable to use getSecurityCapabilities, fall back with a check for
++        # deployment of the ACL table
++        raise(ArgumentError, "DISABLED: Security features are not available") unless \
++          exists?(org.apache.hadoop.hbase.security.access.AccessControlLists::ACL_TABLE_NAME)
++        return
++      end
++      raise(ArgumentError, "DISABLED: Security features are not available") unless \
++        caps.include? org.apache.hadoop.hbase.client.security.SecurityCapability::AUTHORIZATION
+     end
+   end
+ end
+diff --git a/hbase-shell/src/main/ruby/hbase/visibility_labels.rb b/hbase-shell/src/main/ruby/hbase/visibility_labels.rb
+index d7b83cb..b8b3a78 100644
+--- a/hbase-shell/src/main/ruby/hbase/visibility_labels.rb
++++ b/hbase-shell/src/main/ruby/hbase/visibility_labels.rb
+@@ -31,7 +31,7 @@ module Hbase
+     end
+ 
+     def add_labels(*args)
+-      lables_table_available?
++      visibility_feature_available?
+       # Normalize args
+       if args.kind_of?(Array)
+         labels = [ args ].flatten.compact
+@@ -59,7 +59,7 @@ module Hbase
+     end
+ 
+     def set_auths(user, *args)
+-      lables_table_available?
++      visibility_feature_available?
+       # Normalize args
+       if args.kind_of?(Array)
+         auths = [ args ].flatten.compact
+@@ -84,7 +84,7 @@ module Hbase
+     end
+ 
+     def get_auths(user)
+-      lables_table_available?
++      visibility_feature_available?
+       begin
+         response = VisibilityClient.getAuths(@config, user)
+         if response.nil?
+@@ -98,7 +98,7 @@ module Hbase
+     end
+ 
+     def list_labels(regex = ".*")
+-      lables_table_available?
++      visibility_feature_available?
+       begin
+         response = VisibilityClient.listLabels(@config, regex)
+         if response.nil?
+@@ -112,7 +112,7 @@ module Hbase
+     end
+ 
+     def clear_auths(user, *args)
+-      lables_table_available?
++      visibility_feature_available?
+       # Normalize args
+       if args.kind_of?(Array)
+         auths = [ args ].flatten.compact
+@@ -137,9 +137,20 @@ module Hbase
+     end
+ 
+     # Make sure that lables table is available
+-    def lables_table_available?()
+-      raise(ArgumentError, "DISABLED: Visibility labels feature is not available") \
+-        unless exists?(VisibilityConstants::LABELS_TABLE_NAME)
++    def visibility_feature_available?()
++      caps = []
++      begin
++        # Try the getSecurityCapabilities API where supported.
++        caps = @admin.getSecurityCapabilities
++      rescue
++        # If we are unable to use getSecurityCapabilities, fall back with a check for
++        # deployment of the labels table
++        raise(ArgumentError, "DISABLED: Visibility labels feature is not available") unless \
++          exists?(VisibilityConstants::LABELS_TABLE_NAME)
++        return
++      end
++      raise(ArgumentError, "DISABLED: Visibility labels feature is not available") unless \
++        caps.include? org.apache.hadoop.hbase.client.security.SecurityCapability::CELL_VISIBILITY
+     end
+ 
+     # Does table exist?
+diff --git a/hbase-shell/src/main/ruby/shell.rb b/hbase-shell/src/main/ruby/shell.rb
+index 41d71c4..f56499c 100644
+--- a/hbase-shell/src/main/ruby/shell.rb
++++ b/hbase-shell/src/main/ruby/shell.rb
+@@ -366,6 +366,7 @@ Shell.load_command_group(
+   :full_name => 'SECURITY TOOLS',
+   :comment => "NOTE: Above commands are only applicable if running with the AccessController coprocessor",
+   :commands => %w[
++    list_security_capabilities
+     grant
+     revoke
+     user_permission
+diff --git a/hbase-shell/src/main/ruby/shell/commands/list_security_capabilities.rb b/hbase-shell/src/main/ruby/shell/commands/list_security_capabilities.rb
+new file mode 100644
+index 0000000..922ad11
+--- /dev/null
++++ b/hbase-shell/src/main/ruby/shell/commands/list_security_capabilities.rb
+@@ -0,0 +1,47 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++module Shell
++  module Commands
++    class ListSecurityCapabilities < Command
++      def help
++        return <<-EOF
++List supported security capabilities
++
++Example:
++    hbase> list_security_capabilities
++EOF
++      end
++
++      def command()
++        begin
++          list = admin.get_security_capabilities
++          list.each do |s|
++            puts s.getName
++          end
++          return list.map { |s| s.getName() }
++        rescue Exception => e
++          if e.to_s.include? "UnsupportedOperationException"
++            puts "ERROR: Master does not support getSecurityCapabilities"
++            return []
++          end
++          raise e
++        end
++      end
++    end
++  end
++end
+-- 
+1.9.1
+

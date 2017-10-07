@@ -1,0 +1,447 @@
+From 85b7e563eb9f233ff5104c92c35da1705302bdb9 Mon Sep 17 00:00:00 2001
+From: rahul gidwani <rgidwani@salesforce.com>
+Date: Wed, 11 May 2016 14:41:27 -0700
+Subject: [PATCH] HBASE-15816 - Provide client with ability to set priority on
+ Operations
+
+---
+ .../org/apache/hadoop/hbase/client/Action.java     | 10 ++++++++++
+ .../apache/hadoop/hbase/client/AsyncProcess.java   | 13 +++++++++---
+ .../hadoop/hbase/client/ClientSmallScanner.java    |  1 +
+ .../org/apache/hadoop/hbase/client/HTable.java     | 10 ++++++++++
+ .../hadoop/hbase/client/MultiServerCallable.java   | 13 +++++++++++-
+ .../hbase/client/OperationWithAttributes.java      | 11 +++++++++++
+ .../apache/hadoop/hbase/client/RowMutations.java   | 13 ++++++++++++
+ .../hadoop/hbase/client/ScannerCallable.java       |  1 +
+ .../hbase/ipc/PayloadCarryingRpcController.java    |  7 ++++---
+ .../ipc/TestPayloadCarryingRpcController.java      | 10 ++++++++++
+ .../hbase/client/TestRpcControllerFactory.java     | 23 +++++++++++++++++++++-
+ 11 files changed, 104 insertions(+), 8 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Action.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Action.java
+index 1c38349..08dfcaf 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Action.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Action.java
+@@ -34,11 +34,17 @@ public class Action<R> implements Comparable<R> {
+   private int originalIndex;
+   private long nonce = HConstants.NO_NONCE;
+   private int replicaId = RegionReplicaUtil.DEFAULT_REPLICA_ID;
++  private int priority = HConstants.NORMAL_QOS;
+ 
+   public Action(Row action, int originalIndex) {
++    this(action, originalIndex, HConstants.NORMAL_QOS);
++  }
++
++  public Action(Row action, int originalIndex, int priority) {
+     super();
+     this.action = action;
+     this.originalIndex = originalIndex;
++    this.priority = priority;
+   }
+ 
+   /**
+@@ -75,6 +81,10 @@ public class Action<R> implements Comparable<R> {
+     return replicaId;
+   }
+ 
++  public int getPriority() {
++    return priority;
++  }
++
+   @SuppressWarnings("rawtypes")
+   @Override
+   public int compareTo(Object o) {
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+index b2c758d..bf4838c 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+@@ -41,19 +41,20 @@ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.RetryImmediatelyException;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.DoNotRetryIOException;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HRegionLocation;
+ import org.apache.hadoop.hbase.RegionLocations;
++import org.apache.hadoop.hbase.RetryImmediatelyException;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.backoff.ServerStatistics;
+ import org.apache.hadoop.hbase.client.coprocessor.Batch;
+ import org.apache.hadoop.hbase.exceptions.ClientExceptionsUtil;
++import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
+ import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
+ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -418,7 +419,11 @@ class AsyncProcess {
+           LOG.error("Failed to get region location ", ex);
+           // This action failed before creating ars. Retain it, but do not add to submit list.
+           // We will then add it to ars in an already-failed state.
+-          retainedActions.add(new Action<Row>(r, ++posInList));
++          int priority = HConstants.NORMAL_QOS;
++          if (r instanceof Mutation) {
++            priority = ((Mutation) r).getPriority();
++          }
++          retainedActions.add(new Action<Row>(r, ++posInList, priority));
+           locationErrors.add(ex);
+           locationErrorRows.add(posInList);
+           it.remove();
+@@ -583,6 +588,7 @@ class AsyncProcess {
+     // The position will be used by the processBatch to match the object array returned.
+     int posInList = -1;
+     NonceGenerator ng = this.connection.getNonceGenerator();
++    int highestPriority = PayloadCarryingRpcController.PRIORITY_UNSET;
+     for (Row r : rows) {
+       posInList++;
+       if (r instanceof Put) {
+@@ -590,6 +596,7 @@ class AsyncProcess {
+         if (put.isEmpty()) {
+           throw new IllegalArgumentException("No columns to insert for #" + (posInList+1)+ " item");
+         }
++        highestPriority = Math.max(put.getPriority(), highestPriority);
+       }
+       Action<Row> action = new Action<Row>(r, posInList);
+       setNonce(ng, r, action);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientSmallScanner.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientSmallScanner.java
+index f9bdd55..09e660b 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientSmallScanner.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientSmallScanner.java
+@@ -196,6 +196,7 @@ public class ClientSmallScanner extends ClientSimpleScanner {
+       controller = controllerFactory.newController();
+       try {
+         controller.setPriority(getTableName());
++        controller.setPriority(getScan().getPriority());
+         controller.setCallTimeout(timeout);
+         response = getStub().scan(controller, request);
+         Result[] results = ResponseConverter.getResults(controller.cellScanner(),
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index bf9ec22..feec2f0 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -432,6 +432,7 @@ public class HTable implements HTableInterface {
+             RequestConverter.buildGetRequest(getLocation().getRegionInfo().getRegionName(), getReq);
+           PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+           controller.setPriority(tableName);
++          controller.setPriority(getReq.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             ClientProtos.GetResponse response = getStub().get(controller, request);
+@@ -517,6 +518,7 @@ public class HTable implements HTableInterface {
+       public Boolean call(int callTimeout) throws IOException {
+         PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+         controller.setPriority(tableName);
++        controller.setPriority(delete.getPriority());
+         controller.setCallTimeout(callTimeout);
+ 
+         try {
+@@ -594,6 +596,7 @@ public class HTable implements HTableInterface {
+         public MultiResponse call(int callTimeout) throws IOException {
+           tracker.start();
+           controller.setPriority(tableName);
++          controller.setPriority(rm.getHighestPriority());
+           int remainingTime = tracker.getRemainingTime(callTimeout);
+           if (remainingTime == 0) {
+             throw new DoNotRetryIOException("Timeout for mutate row");
+@@ -647,6 +650,7 @@ public class HTable implements HTableInterface {
+         public Result call(int callTimeout) throws IOException {
+           PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+           controller.setPriority(getTableName());
++          controller.setPriority(append.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             MutateRequest request = RequestConverter.buildMutateRequest(
+@@ -680,6 +684,7 @@ public class HTable implements HTableInterface {
+       public Result call(int callTimeout) throws IOException {
+         PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+         controller.setPriority(getTableName());
++        controller.setPriority(increment.getPriority());
+         controller.setCallTimeout(callTimeout);
+         try {
+           MutateRequest request = RequestConverter.buildMutateRequest(
+@@ -765,6 +770,7 @@ public class HTable implements HTableInterface {
+         public Boolean call(int callTimeout) throws IOException {
+           PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+           controller.setPriority(tableName);
++          controller.setPriority(put.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             MutateRequest request = RequestConverter.buildMutateRequest(
+@@ -795,6 +801,7 @@ public class HTable implements HTableInterface {
+         public Boolean call(int callTimeout) throws IOException {
+           PayloadCarryingRpcController controller = new PayloadCarryingRpcController();
+           controller.setPriority(tableName);
++          controller.setPriority(put.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             CompareType compareType = CompareType.valueOf(compareOp.name());
+@@ -826,6 +833,7 @@ public class HTable implements HTableInterface {
+         public Boolean call(int callTimeout) throws IOException {
+           PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+           controller.setPriority(tableName);
++          controller.setPriority(delete.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             MutateRequest request = RequestConverter.buildMutateRequest(
+@@ -856,6 +864,7 @@ public class HTable implements HTableInterface {
+         public Boolean call(int callTimeout) throws IOException {
+           PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+           controller.setPriority(tableName);
++          controller.setPriority(delete.getPriority());
+           controller.setCallTimeout(callTimeout);
+           try {
+             CompareType compareType = CompareType.valueOf(compareOp.name());
+@@ -888,6 +897,7 @@ public class HTable implements HTableInterface {
+         public MultiResponse call(int callTimeout) throws IOException {
+           tracker.start();
+           controller.setPriority(tableName);
++          controller.setPriority(rm.getHighestPriority());
+           int remainingTime = tracker.getRemainingTime(callTimeout);
+           if (remainingTime == 0) {
+             throw new DoNotRetryIOException("Timeout for mutate row");
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiServerCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiServerCallable.java
+index f78f348..3b20182 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiServerCallable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MultiServerCallable.java
+@@ -30,6 +30,7 @@ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HRegionLocation;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
+ import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.RequestConverter;
+@@ -92,13 +93,14 @@ class MultiServerCallable<R> extends PayloadCarryingServerCallable<MultiResponse
+     if (nonceGroup != HConstants.NO_NONCE) {
+       multiRequestBuilder.setNonceGroup(nonceGroup);
+     }
++    int highestPriority = PayloadCarryingRpcController.PRIORITY_UNSET;
+     for (Map.Entry<byte[], List<Action<R>>> e: this.multiAction.actions.entrySet()) {
+       final byte [] regionName = e.getKey();
+       final List<Action<R>> actions = e.getValue();
+       regionActionBuilder.clear();
+       regionActionBuilder.setRegion(RequestConverter.buildRegionSpecifier(
+           HBaseProtos.RegionSpecifier.RegionSpecifierType.REGION_NAME, regionName));
+-
++      highestPriority = Math.max(highestPriority, getHighestPriorityOperation(actions));
+ 
+       if (this.cellBlock) {
+         // Presize.  Presume at least a KV per Action.  There are likely more.
+@@ -118,6 +120,7 @@ class MultiServerCallable<R> extends PayloadCarryingServerCallable<MultiResponse
+     // optionally ferries cell response data back out again.
+     if (cells != null) controller.setCellScanner(CellUtil.createCellScanner(cells));
+     controller.setPriority(getTableName());
++    controller.setPriority(highestPriority);
+     controller.setCallTimeout(callTimeout);
+     ClientProtos.MultiResponse responseProto;
+     ClientProtos.MultiRequest requestProto = multiRequestBuilder.build();
+@@ -152,4 +155,12 @@ class MultiServerCallable<R> extends PayloadCarryingServerCallable<MultiResponse
+   ServerName getServerName() {
+     return location.getServerName();
+   }
++
++  private int getHighestPriorityOperation(List<Action<R>> actions) {
++    int priority = PayloadCarryingRpcController.PRIORITY_UNSET;
++    for (Action<R> action : actions) {
++      priority = Math.max(priority, action.getPriority());
++    }
++    return priority;
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/OperationWithAttributes.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/OperationWithAttributes.java
+index 9fdd577..3077fac 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/OperationWithAttributes.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/OperationWithAttributes.java
+@@ -23,6 +23,7 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -36,6 +37,7 @@ public abstract class OperationWithAttributes extends Operation implements Attri
+ 
+   // used for uniquely identifying an operation
+   public static final String ID_ATRIBUTE = "_operation.attributes.id";
++  private int priority = HConstants.NORMAL_QOS;
+ 
+   @Override
+   public OperationWithAttributes setAttribute(String name, byte[] value) {
+@@ -110,4 +112,13 @@ public abstract class OperationWithAttributes extends Operation implements Attri
+     byte[] attr = getAttribute(ID_ATRIBUTE);
+     return attr == null? null: Bytes.toString(attr);
+   }
++
++  public OperationWithAttributes setPriority(int priority) {
++    this.priority = priority;
++    return this;
++  }
++
++  public int getPriority() {
++    return priority;
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RowMutations.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RowMutations.java
+index 888306d..985dd76 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RowMutations.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RowMutations.java
+@@ -25,6 +25,7 @@ import java.util.List;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
++import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+ /**
+@@ -114,4 +115,16 @@ public class RowMutations implements Row {
+   public List<Mutation> getMutations() {
+     return Collections.unmodifiableList(mutations);
+   }
++
++  /**
++   * @return the highest priority in the list of mutations.
++   */
++  int getHighestPriority() {
++    int priority = PayloadCarryingRpcController.PRIORITY_UNSET;
++    for (Mutation mutation : mutations) {
++      priority = Math.max(priority, mutation.getPriority());
++    }
++    return priority;
++  }
++
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+index 72d69ec..b69dd28 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+@@ -195,6 +195,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
+     if (controller == null) {
+       controller = controllerFactory.newController();
+       controller.setPriority(getTableName());
++      controller.setPriority(scan.getPriority());
+       controller.setCallTimeout(callTimeout);
+     }
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/PayloadCarryingRpcController.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/PayloadCarryingRpcController.java
+index f4f18b3..d698146 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/PayloadCarryingRpcController.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/ipc/PayloadCarryingRpcController.java
+@@ -81,15 +81,16 @@ public class PayloadCarryingRpcController
+    * {@link HConstants#NORMAL_QOS} to {@link HConstants#HIGH_QOS}
+    */
+   public void setPriority(int priority) {
+-    this.priority = priority;
++    this.priority = Math.max(this.priority, priority);
+   }
+ 
+   /**
+    * @param tn Set priority based off the table we are going against.
+    */
+   public void setPriority(final TableName tn) {
+-    this.priority =
+-        (tn != null && tn.isSystemTable())? HConstants.SYSTEMTABLE_QOS: HConstants.NORMAL_QOS;
++    setPriority(
++        (tn != null && tn.isSystemTable()) ? HConstants.SYSTEMTABLE_QOS : HConstants.NORMAL_QOS
++    );
+   }
+ 
+   /**
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestPayloadCarryingRpcController.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestPayloadCarryingRpcController.java
+index 11c8ff8..f2a1746 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestPayloadCarryingRpcController.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestPayloadCarryingRpcController.java
+@@ -28,6 +28,8 @@ import java.util.List;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellScannable;
+ import org.apache.hadoop.hbase.CellScanner;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.testclassification.ClientTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -56,6 +58,14 @@ public class TestPayloadCarryingRpcController {
+     assertEquals(count, index);
+   }
+ 
++  @Test
++  public void testSettingPriorityWillNotLowerPriority() throws Exception {
++    PayloadCarryingRpcController controller = new PayloadCarryingRpcController();
++    controller.setPriority(TableName.META_TABLE_NAME);
++    controller.setPriority(HConstants.NORMAL_QOS);
++    assertEquals(HConstants.SYSTEMTABLE_QOS, controller.getPriority());
++  }
++
+   /**
+    * @param index
+    * @return A faked out 'Cell' that does nothing but return index as its value
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
+index 656dedc..a00fc10 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
+@@ -25,6 +25,9 @@ import java.io.IOException;
+ import java.util.List;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import com.google.common.collect.ConcurrentHashMultiset;
++import com.google.common.collect.HashMultiset;
++import com.google.common.collect.Multiset;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.CellScannable;
+ import org.apache.hadoop.hbase.CellScanner;
+@@ -73,6 +76,7 @@ public class TestRpcControllerFactory {
+ 
+   public static class CountingRpcController extends DelegatingPayloadCarryingRpcController {
+ 
++    private static Multiset<Integer> GROUPED_PRIORITY = ConcurrentHashMultiset.create();
+     private static AtomicInteger INT_PRIORITY = new AtomicInteger();
+     private static AtomicInteger TABLE_PRIORITY = new AtomicInteger();
+ 
+@@ -82,8 +86,13 @@ public class TestRpcControllerFactory {
+ 
+     @Override
+     public void setPriority(int priority) {
++      int oldPriority = getPriority();
+       super.setPriority(priority);
+-      INT_PRIORITY.incrementAndGet();
++      int newPriority = getPriority();
++      if (newPriority != oldPriority) {
++        INT_PRIORITY.incrementAndGet();
++        GROUPED_PRIORITY.add(priority);
++      }
+     }
+ 
+     @Override
+@@ -190,6 +199,14 @@ public class TestRpcControllerFactory {
+     scanInfo.setSmall(false);
+     counter = doScan(table, scanInfo, counter);
+ 
++    // make sure we have no priority count
++    verifyPriorityGroupCount(HConstants.ADMIN_QOS, 0);
++    // lets set a custom priority on this bad boy
++    Get get = new Get(row);
++    get.setPriority(HConstants.ADMIN_QOS);
++    Result result = table.get(get);
++    verifyPriorityGroupCount(HConstants.ADMIN_QOS, 1);
++
+     table.close();
+     connection.close();
+   }
+@@ -207,6 +224,10 @@ public class TestRpcControllerFactory {
+     return counter + 1;
+   }
+ 
++  void verifyPriorityGroupCount(int priorityLevel, int count) {
++    assertEquals(count, CountingRpcController.GROUPED_PRIORITY.count(priorityLevel));
++  }
++
+   @Test
+   public void testFallbackToDefaultRpcControllerFactory() {
+     Configuration conf = new Configuration(UTIL.getConfiguration());
+-- 
+1.9.1
+
