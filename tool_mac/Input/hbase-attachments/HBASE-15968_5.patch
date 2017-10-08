@@ -1,0 +1,2424 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+index b75e8cd..b6e5ee0 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+@@ -134,6 +134,9 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+   public static final String DFS_REPLICATION = "DFS_REPLICATION";
+   public static final short DEFAULT_DFS_REPLICATION = 0;
+ 
++  public static final String MVCC_SENSITIVE = "MVCC_SENSITIVE";
++  public static final boolean DEFAULT_MVCC_SENSITIVE = false;
++
+   /**
+    * Default compression type.
+    */
+@@ -273,6 +276,7 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+     DEFAULT_VALUES.put(CACHE_BLOOMS_ON_WRITE, String.valueOf(DEFAULT_CACHE_BLOOMS_ON_WRITE));
+     DEFAULT_VALUES.put(EVICT_BLOCKS_ON_CLOSE, String.valueOf(DEFAULT_EVICT_BLOCKS_ON_CLOSE));
+     DEFAULT_VALUES.put(PREFETCH_BLOCKS_ON_OPEN, String.valueOf(DEFAULT_PREFETCH_BLOCKS_ON_OPEN));
++    DEFAULT_VALUES.put(MVCC_SENSITIVE, String.valueOf(DEFAULT_MVCC_SENSITIVE));
+     for (String s : DEFAULT_VALUES.keySet()) {
+       RESERVED_KEYWORDS.add(new Bytes(Bytes.toBytes(s)));
+     }
+@@ -727,6 +731,23 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+   }
+ 
+   /**
++   * By default, HBase only consider timestamp in versions. So a previous Delete with higher ts will
++   * mask a later Put with lower ts. Set this to true to open MVCC_SENSITIVE semantics of versions.
++   * We also consider mvcc in versions. See HBASE-15968 for details.
++   */
++  public boolean isMvccSensitive() {
++    String value = getValue(MVCC_SENSITIVE);
++    if (value != null) {
++      return Boolean.parseBoolean(value);
++    }
++    return DEFAULT_MVCC_SENSITIVE;
++  }
++
++  public HColumnDescriptor setMvccSensitive(boolean sensitive) {
++    return setValue(MVCC_SENSITIVE, Boolean.toString(sensitive));
++  }
++
++  /**
+    * @return Time-to-live of cell contents, in seconds.
+    */
+   public int getTimeToLive() {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanInfo.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanInfo.java
+index 349e166..3a3455e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanInfo.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ScanInfo.java
+@@ -48,6 +48,7 @@ public class ScanInfo {
+   private boolean usePread;
+   private long cellsPerTimeoutCheck;
+   private boolean parallelSeekEnabled;
++  private boolean mvccSensitive;
+   private final Configuration conf;
+ 
+   public static final long FIXED_OVERHEAD = ClassSize.align(ClassSize.OBJECT
+@@ -65,7 +66,14 @@ public class ScanInfo {
+   public ScanInfo(final Configuration conf, final HColumnDescriptor family, final long ttl,
+       final long timeToPurgeDeletes, final CellComparator comparator) {
+     this(conf, family.getName(), family.getMinVersions(), family.getMaxVersions(), ttl, family
+-        .getKeepDeletedCells(), timeToPurgeDeletes, comparator);
++        .getKeepDeletedCells(), timeToPurgeDeletes, comparator, family.isMvccSensitive());
++  }
++
++  public ScanInfo(final Configuration conf, final byte[] family, final int minVersions,
++      final int maxVersions, final long ttl, final KeepDeletedCells keepDeletedCells,
++      final long timeToPurgeDeletes, final CellComparator comparator) {
++    this(conf, family, minVersions, maxVersions, ttl, keepDeletedCells, timeToPurgeDeletes,
++        comparator, false);
+   }
+ 
+   /**
+@@ -78,10 +86,11 @@ public class ScanInfo {
+    *        be purged during a major compaction.
+    * @param keepDeletedCells Store's keepDeletedCells setting
+    * @param comparator The store's comparator
++   * @param mvccSensitive use mvcc-sensitive semantics of versions
+    */
+   public ScanInfo(final Configuration conf, final byte[] family, final int minVersions,
+       final int maxVersions, final long ttl, final KeepDeletedCells keepDeletedCells,
+-      final long timeToPurgeDeletes, final CellComparator comparator) {
++      final long timeToPurgeDeletes, final CellComparator comparator, boolean mvccSensitive) {
+     this.family = family;
+     this.minVersions = minVersions;
+     this.maxVersions = maxVersions;
+@@ -99,6 +108,7 @@ public class ScanInfo {
+         perHeartbeat: StoreScanner.DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK;
+     this.parallelSeekEnabled =
+       conf.getBoolean(StoreScanner.STORESCANNER_PARALLEL_SEEK_ENABLE, false);
++    this.mvccSensitive = mvccSensitive;
+     this.conf = conf;
+   }
+ 
+@@ -149,4 +159,8 @@ public class ScanInfo {
+   public CellComparator getComparator() {
+     return comparator;
+   }
++
++  public boolean isMvccSensitive() {
++    return mvccSensitive;
++  }
+ }
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
+index c695788..e439a56 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
+@@ -304,7 +304,8 @@ public abstract class Compactor<T extends CellSink> {
+         return new ArrayList<Path>();
+       }
+       boolean cleanSeqId = false;
+-      if (fd.minSeqIdToKeep > 0) {
++      if (fd.minSeqIdToKeep > 0 && !store.getFamily().isMvccSensitive()) {
++        // For mvcc-sensitive family, we never set mvcc to 0.
+         smallestReadPoint = Math.min(fd.minSeqIdToKeep, smallestReadPoint);
+         cleanSeqId = true;
+       }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ColumnTracker.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ColumnTracker.java
+index 17c6afe..50dbd12 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ColumnTracker.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ColumnTracker.java
+@@ -77,7 +77,7 @@ public interface ColumnTracker {
+    * the {@link #checkColumn(Cell, byte)} method and perform all the operations in this
+    * checkVersions method.
+    * @param cell
+-   * @param ttl The timeToLive to enforce.
++   * @param timestamp The timestamp of the cell.
+    * @param type the type of the key value (Put/Delete)
+    * @param ignoreCount indicates if the KV needs to be excluded while counting (used during
+    *          compactions. We only count KV's that are older than all the scanners' read points.)
+@@ -85,8 +85,8 @@ public interface ColumnTracker {
+    * @throws IOException in case there is an internal consistency problem caused by a data
+    *           corruption.
+    */
+-  ScanQueryMatcher.MatchCode checkVersions(Cell cell, long ttl, byte type, boolean ignoreCount)
+-      throws IOException;
++  ScanQueryMatcher.MatchCode checkVersions(Cell cell, long timestamp, byte type,
++      boolean ignoreCount) throws IOException;
+   /**
+    * Resets the Matcher
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CombinedTracker.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CombinedTracker.java
+new file mode 100644
+index 0000000..304c5ed
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CombinedTracker.java
+@@ -0,0 +1,365 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.querymatcher;
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.NavigableMap;
++import java.util.NavigableSet;
++import java.util.SortedMap;
++import java.util.SortedSet;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellComparator;
++import org.apache.hadoop.hbase.CellUtil;
++import org.apache.hadoop.hbase.KeyValue.Type;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher.MatchCode;
++import org.apache.hadoop.hbase.util.Bytes;
++
++/**
++ * A tracked both implementing ColumnTracker and DeleteTracker, used for mvcc-sensitive scanning.
++ * We should make sure in one QueryMatcher the ColumnTracker and DeleteTracker is the same instance.
++ */
++@InterfaceAudience.Private
++public class CombinedTracker implements ColumnTracker, DeleteTracker {
++
++  private byte[] lastCqArray;
++  private int lastCqLength;
++  private int lastCqOffset;
++  private long lastCqTs;
++  private long lastCqMvcc;
++  private byte lastCqType;
++  private int columnIndex;
++  private int countCurrentCol;
++
++  protected int maxVersions;
++  private int resultMaxVersions;
++  private byte[][] columns;
++  private int minVersions;
++  private long oldestStamp;
++
++  // These two maps have same structure.
++  // Each node is a versions deletion (DeleteFamily or DeleteColumn). Key is the mvcc of the marker,
++  // value is a data structure which contains infos we need that happens before this node's mvcc and
++  // after the previous node's mvcc. The last node is a special node whose key is max_long that
++  // saves infos after last deletion. See DeleteVersionsNode's comments for details.
++  // The first delColMap is constructed and used for each cq, and the second delFamMap is
++  // constructed when cq is null and saving family-level delete markers.
++  // Each time the cq is changed, we should reconstruct delColMap as a deep copy of delFamMap
++  protected NavigableMap<Long, DeleteVersionsNode> delColMap = new TreeMap<>();
++  protected NavigableMap<Long, DeleteVersionsNode> delFamMap = new TreeMap<>();
++
++  /**
++   * Note maxVersion and minVersion must set accourding to cf's conf, not user's scan parameter.
++   *
++   * @param minVersion        The minimum number of versions to keep(used when TTL is set).
++   */
++  public CombinedTracker(NavigableSet<byte[]> columns, int minVersion, int maxVersion,
++      int resultMaxVersions, long oldestUnexpiredTS) {
++    this.maxVersions = maxVersion;
++    this.minVersions = minVersion;
++    this.resultMaxVersions = resultMaxVersions;
++    this.oldestStamp = oldestUnexpiredTS;
++    if (columns != null && columns.size() > 0) {
++      this.columns = new byte[columns.size()][];
++      int i = 0;
++      for (byte[] column : columns) {
++        this.columns[i++] = column;
++      }
++    }
++    reset();
++  }
++
++  /**
++   * A data structure which contains infos we need that happens before this node's mvcc and
++   * after the previous node's mvcc. A node means there is a version deletion at the mvcc and ts.
++   */
++  protected class DeleteVersionsNode {
++    public long ts;
++    public long mvcc;
++
++    // <timestamp, set<mvcc>>
++    // Key is ts of version deletes, value is its mvccs.
++    // We may delete more than one time for a version.
++    private Map<Long, SortedSet<Long>> deletesMap = new HashMap<>();
++
++    // <mvcc, set<mvcc>>
++    // Key is mvcc of version deletes, value is mvcc of visible puts before the delete effect.
++    private NavigableMap<Long, SortedSet<Long>> mvccCountingMap = new TreeMap<>();
++
++    protected DeleteVersionsNode(long ts, long mvcc) {
++      this.ts = ts;
++      this.mvcc = mvcc;
++      mvccCountingMap.put(Long.MAX_VALUE, new TreeSet<Long>());
++    }
++
++    protected DeleteVersionsNode() {
++      this(Long.MIN_VALUE, Long.MAX_VALUE);
++    }
++
++    public void addVersionDelete(Cell cell) {
++      SortedSet<Long> set = deletesMap.get(cell.getTimestamp());
++      if (set == null) {
++        set = new TreeSet<>();
++        deletesMap.put(cell.getTimestamp(), set);
++      }
++      set.add(cell.getSequenceId());
++      // The init set should be the puts whose mvcc is smaller than this Delete. Because
++      // there may be some Puts masked by them. The Puts whose mvcc is larger than this Delete can
++      // not be copied to this node because we may delete one version and the oldest put may not be
++      // masked.
++      SortedSet<Long> nextValue = mvccCountingMap.ceilingEntry(cell.getSequenceId()).getValue();
++      SortedSet<Long> thisValue = new TreeSet<>(nextValue.headSet(cell.getSequenceId()));
++      mvccCountingMap.put(cell.getSequenceId(), thisValue);
++    }
++
++    protected DeleteVersionsNode getDeepCopy() {
++      DeleteVersionsNode node = new DeleteVersionsNode(ts, mvcc);
++      for (Map.Entry<Long, SortedSet<Long>> e : deletesMap.entrySet()) {
++        node.deletesMap.put(e.getKey(), new TreeSet<>(e.getValue()));
++      }
++      for (Map.Entry<Long, SortedSet<Long>> e : mvccCountingMap.entrySet()) {
++        node.mvccCountingMap.put(e.getKey(), new TreeSet<>(e.getValue()));
++      }
++      return node;
++    }
++  }
++
++  /**
++   * Reset the map if it is different with the last Cell.
++   * Save the cq array/offset/length for next Cell.
++   *
++   * @return If this put has duplicate ts with last cell, return the mvcc of last cell.
++   * Else return MAX_VALUE.
++   */
++  protected long prepare(Cell cell) {
++    boolean matchCq = CellUtil.matchingQualifier(cell, lastCqArray, lastCqOffset, lastCqLength);
++    if (!matchCq) {
++      // The last cell is family-level delete and this is not, or the cq is changed,
++      // we should construct delColMap as a deep copy of delFamMap.
++      delColMap.clear();
++      for (Map.Entry<Long, DeleteVersionsNode> e : delFamMap.entrySet()) {
++        delColMap.put(e.getKey(), e.getValue().getDeepCopy());
++      }
++      countCurrentCol = 0;
++    }
++    if (matchCq && !CellUtil.isDelete(lastCqType) && lastCqType == cell.getTypeByte()
++        && lastCqTs == cell.getTimestamp()) {
++      // Put with duplicate timestamp, ignore.
++      return lastCqMvcc;
++    }
++    lastCqArray = cell.getQualifierArray();
++    lastCqOffset = cell.getQualifierOffset();
++    lastCqLength = cell.getQualifierLength();
++    lastCqTs = cell.getTimestamp();
++    lastCqMvcc = cell.getSequenceId();
++    lastCqType = cell.getTypeByte();
++    return Long.MAX_VALUE;
++  }
++
++  // DeleteTracker
++  @Override
++  public void add(Cell cell) {
++    prepare(cell);
++    byte type = cell.getTypeByte();
++    switch (Type.codeToType(type)) {
++    // By the order of seen. We put null cq at first.
++    case DeleteFamily: // Delete all versions of all columns of the specified family
++      delFamMap.put(cell.getSequenceId(),
++          new DeleteVersionsNode(cell.getTimestamp(), cell.getSequenceId()));
++      break;
++    case DeleteFamilyVersion: // Delete all columns of the specified family and specified version
++      delFamMap.ceilingEntry(cell.getSequenceId()).getValue().addVersionDelete(cell);
++      break;
++
++    // These two kinds of markers are mix with Puts.
++    case DeleteColumn: // Delete all versions of the specified column
++      delColMap.put(cell.getSequenceId(),
++          new DeleteVersionsNode(cell.getTimestamp(), cell.getSequenceId()));
++      break;
++    case Delete: // Delete the specified version of the specified column.
++      delColMap.ceilingEntry(cell.getSequenceId()).getValue().addVersionDelete(cell);
++      break;
++    }
++  }
++
++  /**
++   * This method is not idempotent, we will save some info to judge VERSION_MASKED.
++   * @param cell - current cell to check if deleted by a previously seen delete
++   * @return We don't distinguish DeleteColumn and DeleteFamily. We only return code for column.
++   */
++  @Override
++  public DeleteResult isDeleted(Cell cell) {
++    long duplicateMvcc = prepare(cell);
++
++    for (Map.Entry<Long, DeleteVersionsNode> e : delColMap.tailMap(cell.getSequenceId())
++        .entrySet()) {
++      DeleteVersionsNode node = e.getValue();
++      long deleteMvcc = Long.MAX_VALUE;
++      SortedSet<Long> deleteVersionMvccs = node.deletesMap.get(cell.getTimestamp());
++      if (deleteVersionMvccs != null) {
++        SortedSet<Long> tail = deleteVersionMvccs.tailSet(cell.getSequenceId());
++        if (!tail.isEmpty()) {
++          deleteMvcc = tail.first();
++        }
++      }
++      SortedMap<Long, SortedSet<Long>> subMap =
++          node.mvccCountingMap
++              .subMap(cell.getSequenceId(), true, Math.min(duplicateMvcc, deleteMvcc), true);
++      for (Map.Entry<Long, SortedSet<Long>> seg : subMap.entrySet()) {
++        if (seg.getValue().size() >= maxVersions) {
++          return DeleteResult.VERSION_MASKED;
++        }
++        seg.getValue().add(cell.getSequenceId());
++      }
++      if (deleteMvcc < Long.MAX_VALUE) {
++        return DeleteResult.VERSION_DELETED;
++      }
++
++      if (cell.getTimestamp() <= node.ts) {
++        return DeleteResult.COLUMN_DELETED;
++      }
++    }
++    if (duplicateMvcc < Long.MAX_VALUE) {
++      return DeleteResult.VERSION_MASKED;
++    }
++    return DeleteResult.NOT_DELETED;
++  }
++
++  @Override
++  public boolean isEmpty() {
++    return delColMap.size() == 1 && delColMap.get(Long.MAX_VALUE).mvccCountingMap.size() == 1
++        && delFamMap.size() == 1 && delFamMap.get(Long.MAX_VALUE).mvccCountingMap.size() == 1;
++  }
++
++  @Override
++  public void update() {
++    // ignore
++  }
++
++  //ColumnTracker
++
++  @Override
++  public MatchCode checkColumn(Cell cell, byte type) throws IOException {
++    if (done()) {
++      // No more columns left, we are done with this query
++      return ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW; // done_row
++    }
++    if (columns != null) {
++      while (columnIndex < columns.length) {
++        int c = Bytes.compareTo(columns[columnIndex], 0, columns[columnIndex].length,
++            cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength());
++        if (c < 0) {
++          columnIndex++;
++        } else if (c == 0) {
++          // We drop old version in #isDeleted, so here we must return INCLUDE.
++          return MatchCode.INCLUDE;
++        } else {
++          return MatchCode.SEEK_NEXT_COL;
++        }
++      }
++      return MatchCode.SEEK_NEXT_ROW;
++    }
++    return MatchCode.INCLUDE;
++  }
++
++  @Override
++  public MatchCode checkVersions(Cell cell, long timestamp, byte type,
++      boolean ignoreCount) throws IOException {
++    assert !CellUtil.isDelete(type);
++    // We drop old version in #isDeleted, so here we won't SKIP because of versioning. But we should
++    // consider TTL.
++    if (ignoreCount) {
++      return MatchCode.INCLUDE;
++    }
++    countCurrentCol++;
++    if (timestamp < this.oldestStamp) {
++      if (countCurrentCol == minVersions) {
++        return MatchCode.INCLUDE_AND_SEEK_NEXT_COL;
++      }
++      if (countCurrentCol > minVersions) {
++        // This may not be reached, only for safety.
++        return MatchCode.SEEK_NEXT_COL;
++      }
++    }
++
++    if (countCurrentCol == resultMaxVersions) {
++      // We have enough number of versions for user's requirement.
++      return MatchCode.INCLUDE_AND_SEEK_NEXT_COL;
++    }
++    if (countCurrentCol > resultMaxVersions) {
++      // This may not be reached, only for safety
++      return MatchCode.SEEK_NEXT_COL;
++    }
++    return MatchCode.INCLUDE;
++  }
++
++  @Override
++  public void reset() {
++    delColMap.clear();
++    delFamMap.clear();
++    lastCqArray = null;
++    lastCqLength = 0;
++    lastCqOffset = 0;
++    lastCqTs = Long.MIN_VALUE;
++    lastCqMvcc = 0;
++    lastCqType = 0;
++    columnIndex = 0;
++    countCurrentCol = 0;
++    resetInternal();
++  }
++
++  protected void resetInternal(){
++    delFamMap.put(Long.MAX_VALUE, new DeleteVersionsNode());
++  }
++
++  @Override
++  public boolean done() {
++    // lastCq* have been updated to this cell.
++    return !(columns == null || lastCqArray == null) && Bytes
++        .compareTo(lastCqArray, lastCqOffset, lastCqLength, columns[columnIndex], 0,
++            columns[columnIndex].length) > 0;
++  }
++
++  @Override
++  public ColumnCount getColumnHint() {
++    if (columns != null) {
++      if (columnIndex < columns.length) {
++        return new ColumnCount(columns[columnIndex]);
++      }
++    }
++    return null;
++  }
++
++  @Override
++  public MatchCode getNextRowOrNextColumn(Cell cell) {
++    // TODO maybe we can optimize.
++    return MatchCode.SEEK_NEXT_COL;
++  }
++
++  @Override
++  public boolean isDone(long timestamp) {
++    // We can not skip Cells with small ts.
++    return false;
++  }
++
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CompactionScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CompactionScanQueryMatcher.java
+index d3224dc..03a8171 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CompactionScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/CompactionScanQueryMatcher.java
+@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.filter.Filter;
+ import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ import org.apache.hadoop.hbase.regionserver.ScanType;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ /**
+  * Query matcher for compaction.
+@@ -44,11 +45,8 @@ public abstract class CompactionScanQueryMatcher extends ScanQueryMatcher {
+   protected final KeepDeletedCells keepDeletedCells;
+ 
+   protected CompactionScanQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
+-      long readPointToUse, long oldestUnexpiredTS, long now) {
+-    super(HConstants.EMPTY_START_ROW, scanInfo,
+-        new ScanWildcardColumnTracker(scanInfo.getMinVersions(), scanInfo.getMaxVersions(),
+-            oldestUnexpiredTS),
+-        oldestUnexpiredTS, now);
++      ColumnTracker columns, long readPointToUse, long oldestUnexpiredTS, long now) {
++    super(HConstants.EMPTY_START_ROW, scanInfo, columns, oldestUnexpiredTS, now);
+     this.maxReadPointToTrackVersions = readPointToUse;
+     this.deletes = deletes;
+     this.keepDeletedCells = scanInfo.getKeepDeletedCells();
+@@ -102,18 +100,27 @@ public abstract class CompactionScanQueryMatcher extends ScanQueryMatcher {
+       long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, long now,
+       byte[] dropDeletesFromRow, byte[] dropDeletesToRow,
+       RegionCoprocessorHost regionCoprocessorHost) throws IOException {
+-    DeleteTracker deleteTracker = instantiateDeleteTracker(regionCoprocessorHost);
++    Pair<DeleteTracker, ColumnTracker> trackers = getTrackers(regionCoprocessorHost, null,
++        scanInfo,oldestUnexpiredTS, null);
++    DeleteTracker deleteTracker = trackers.getFirst();
++    ColumnTracker columnTracker = trackers.getSecond();
+     if (dropDeletesFromRow == null) {
+       if (scanType == ScanType.COMPACT_RETAIN_DELETES) {
+-        return new MinorCompactionScanQueryMatcher(scanInfo, deleteTracker, readPointToUse,
+-            oldestUnexpiredTS, now);
++        if (scanInfo.isMvccSensitive()) {
++          return new IncludeAllCompactionQueryMatcher(scanInfo, deleteTracker, columnTracker,
++              readPointToUse, oldestUnexpiredTS, now);
++        } else {
++          return new MinorCompactionScanQueryMatcher(scanInfo, deleteTracker, columnTracker,
++              readPointToUse, oldestUnexpiredTS, now);
++        }
+       } else {
+-        return new MajorCompactionScanQueryMatcher(scanInfo, deleteTracker, readPointToUse,
+-            earliestPutTs, oldestUnexpiredTS, now);
++        return new MajorCompactionScanQueryMatcher(scanInfo, deleteTracker, columnTracker,
++            readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
+       }
+     } else {
+-      return new StripeCompactionScanQueryMatcher(scanInfo, deleteTracker, readPointToUse,
+-          earliestPutTs, oldestUnexpiredTS, now, dropDeletesFromRow, dropDeletesToRow);
++      return new StripeCompactionScanQueryMatcher(scanInfo, deleteTracker, columnTracker,
++          readPointToUse, earliestPutTs, oldestUnexpiredTS, now, dropDeletesFromRow,
++          dropDeletesToRow);
+     }
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DeleteTracker.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DeleteTracker.java
+index 4e1ba4e..8824cc4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DeleteTracker.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DeleteTracker.java
+@@ -95,7 +95,9 @@ public interface DeleteTracker {
+     FAMILY_VERSION_DELETED, // The KeyValue is deleted by a delete family version.
+     COLUMN_DELETED, // The KeyValue is deleted by a delete column.
+     VERSION_DELETED, // The KeyValue is deleted by a version delete.
+-    NOT_DELETED
++    NOT_DELETED,
++    VERSION_MASKED  // The KeyValue is masked by max number of versions which is considered as
++                    // deleted in strong semantics of versions(See MvccTracker)
+   }
+ 
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DropDeletesCompactionScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DropDeletesCompactionScanQueryMatcher.java
+index 89725fe..15762be 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DropDeletesCompactionScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/DropDeletesCompactionScanQueryMatcher.java
+@@ -53,8 +53,9 @@ public abstract class DropDeletesCompactionScanQueryMatcher extends CompactionSc
+   protected final long earliestPutTs;
+ 
+   protected DropDeletesCompactionScanQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
+-      long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, long now) {
+-    super(scanInfo, deletes, readPointToUse, oldestUnexpiredTS, now);
++      ColumnTracker columns, long readPointToUse, long earliestPutTs, long oldestUnexpiredTS,
++      long now) {
++    super(scanInfo, deletes, columns, readPointToUse, oldestUnexpiredTS, now);
+     this.timeToPurgeDeletes = scanInfo.getTimeToPurgeDeletes();
+     this.earliestPutTs = earliestPutTs;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/IncludeAllCompactionQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/IncludeAllCompactionQueryMatcher.java
+new file mode 100644
+index 0000000..6937626
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/IncludeAllCompactionQueryMatcher.java
+@@ -0,0 +1,42 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.querymatcher;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.regionserver.ScanInfo;
++
++/**
++ * A compaction query matcher that always return INCLUDE and drops nothing.
++ */
++@InterfaceAudience.Private
++public class IncludeAllCompactionQueryMatcher extends MinorCompactionScanQueryMatcher{
++
++  public IncludeAllCompactionQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
++      ColumnTracker columns, long readPointToUse, long oldestUnexpiredTS, long now) {
++    super(scanInfo, deletes, columns, readPointToUse, oldestUnexpiredTS, now);
++  }
++
++  @Override
++  public MatchCode match(Cell cell) throws IOException {
++    return MatchCode.INCLUDE;
++  }
++
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/LegacyScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/LegacyScanQueryMatcher.java
+index ea4bd97..7b28d25 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/LegacyScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/LegacyScanQueryMatcher.java
+@@ -38,6 +38,7 @@ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ import org.apache.hadoop.hbase.regionserver.ScanType;
+ import org.apache.hadoop.hbase.regionserver.querymatcher.DeleteTracker.DeleteResult;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ /**
+  * The old query matcher implementation. Used to keep compatibility for coprocessor that could
+@@ -367,29 +368,17 @@ public class LegacyScanQueryMatcher extends ScanQueryMatcher {
+       NavigableSet<byte[]> columns, ScanType scanType, long readPointToUse, long earliestPutTs,
+       long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow, byte[] dropDeletesToRow,
+       RegionCoprocessorHost regionCoprocessorHost) throws IOException {
+-    int maxVersions = Math.min(scan.getMaxVersions(), scanInfo.getMaxVersions());
+-    boolean hasNullColumn;
+-    ColumnTracker columnTracker;
+-    if (columns == null || columns.size() == 0) {
+-      // there is always a null column in the wildcard column query.
+-      hasNullColumn = true;
+-      // use a specialized scan for wildcard column tracker.
+-      columnTracker = new ScanWildcardColumnTracker(scanInfo.getMinVersions(), maxVersions,
+-          oldestUnexpiredTS);
+-    } else {
+-      // We can share the ExplicitColumnTracker, diff is we reset
+-      // between rows, not between storefiles.
+-      // whether there is null column in the explicit column query
+-      hasNullColumn = columns.first().length == 0;
+-      columnTracker = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,
+-          oldestUnexpiredTS);
+-    }
+-    DeleteTracker deletes = instantiateDeleteTracker(regionCoprocessorHost);
++    boolean hasNullColumn =
++        !(columns != null && columns.size() != 0 && columns.first().length != 0);
++    Pair<DeleteTracker, ColumnTracker> trackers = getTrackers(regionCoprocessorHost, null,
++        scanInfo, oldestUnexpiredTS, scan);
++    DeleteTracker deleteTracker = trackers.getFirst();
++    ColumnTracker columnTracker = trackers.getSecond();
+     if (dropDeletesFromRow == null) {
+-      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deletes,
++      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deleteTracker,
+           scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
+     } else {
+-      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deletes,
++      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deleteTracker,
+           scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now, dropDeletesFromRow,
+           dropDeletesToRow);
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MajorCompactionScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MajorCompactionScanQueryMatcher.java
+index 6a2ed40..0a0b81a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MajorCompactionScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MajorCompactionScanQueryMatcher.java
+@@ -31,8 +31,9 @@ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ public class MajorCompactionScanQueryMatcher extends DropDeletesCompactionScanQueryMatcher {
+ 
+   public MajorCompactionScanQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
+-      long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, long now) {
+-    super(scanInfo, deletes, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
++      ColumnTracker columns, long readPointToUse, long earliestPutTs, long oldestUnexpiredTS,
++      long now) {
++    super(scanInfo, deletes, columns, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MinorCompactionScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MinorCompactionScanQueryMatcher.java
+index 3b6acde..e02515f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MinorCompactionScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/MinorCompactionScanQueryMatcher.java
+@@ -31,8 +31,8 @@ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ public class MinorCompactionScanQueryMatcher extends CompactionScanQueryMatcher {
+ 
+   public MinorCompactionScanQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
+-      long readPointToUse, long oldestUnexpiredTS, long now) {
+-    super(scanInfo, deletes, readPointToUse, oldestUnexpiredTS, now);
++      ColumnTracker columns, long readPointToUse, long oldestUnexpiredTS, long now) {
++    super(scanInfo, deletes, columns, readPointToUse, oldestUnexpiredTS, now);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/NormalUserScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/NormalUserScanQueryMatcher.java
+index 3942f04..1d73656 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/NormalUserScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/NormalUserScanQueryMatcher.java
+@@ -24,7 +24,6 @@ import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.KeepDeletedCells;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.Scan;
+-import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ 
+ /**
+@@ -40,7 +39,7 @@ public class NormalUserScanQueryMatcher extends UserScanQueryMatcher {
+   private final boolean get;
+ 
+   /** whether time range queries can see rows "behind" a delete */
+-  private final boolean seePastDeleteMarkers;
++  protected final boolean seePastDeleteMarkers;
+ 
+   protected NormalUserScanQueryMatcher(Scan scan, ScanInfo scanInfo, ColumnTracker columns,
+       boolean hasNullColumn, DeleteTracker deletes, long oldestUnexpiredTS, long now) {
+@@ -86,9 +85,8 @@ public class NormalUserScanQueryMatcher extends UserScanQueryMatcher {
+   }
+ 
+   public static NormalUserScanQueryMatcher create(Scan scan, ScanInfo scanInfo,
+-      ColumnTracker columns, boolean hasNullColumn, long oldestUnexpiredTS, long now,
+-      RegionCoprocessorHost regionCoprocessorHost) throws IOException {
+-    DeleteTracker deletes = instantiateDeleteTracker(regionCoprocessorHost);
++      ColumnTracker columns, DeleteTracker deletes, boolean hasNullColumn, long oldestUnexpiredTS,
++      long now) throws IOException {
+     if (scan.isReversed()) {
+       return new NormalUserScanQueryMatcher(scan, scanInfo, columns, hasNullColumn, deletes,
+           oldestUnexpiredTS, now) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ScanQueryMatcher.java
+index b5469d3..e64bd42 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/ScanQueryMatcher.java
+@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.regionserver.querymatcher;
+ 
+ import java.io.IOException;
+ import java.util.Iterator;
++import java.util.NavigableSet;
+ 
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellComparator;
+@@ -36,7 +37,10 @@ import org.apache.hadoop.hbase.filter.Filter;
+ import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+ import org.apache.hadoop.hbase.regionserver.ScanInfo;
+ import org.apache.hadoop.hbase.regionserver.querymatcher.DeleteTracker.DeleteResult;
++import org.apache.hadoop.hbase.security.visibility.VisibilityCombinedTracker;
++import org.apache.hadoop.hbase.security.visibility.VisibilityScanDeleteTracker;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ /**
+  * A query matcher that is specifically designed for the scan case.
+@@ -204,16 +208,21 @@ public abstract class ScanQueryMatcher {
+   }
+ 
+   protected final MatchCode checkDeleted(DeleteTracker deletes, Cell cell) {
+-    if (deletes.isEmpty()) {
++    if (deletes.isEmpty() && !(deletes instanceof CombinedTracker)) {
+       return null;
+     }
++    // MvccSensitiveTracker always need check all cells to save some infos.
+     DeleteResult deleteResult = deletes.isDeleted(cell);
+     switch (deleteResult) {
+       case FAMILY_DELETED:
+       case COLUMN_DELETED:
+-        return columns.getNextRowOrNextColumn(cell);
++        if (!(deletes instanceof CombinedTracker)) {
++          // MvccSensitive can not seek to next because the Put with lower ts may have higher mvcc
++          return columns.getNextRowOrNextColumn(cell);
++        }
+       case VERSION_DELETED:
+       case FAMILY_VERSION_DELETED:
++      case VERSION_MASKED:
+         return MatchCode.SKIP;
+       case NOT_DELETED:
+         return null;
+@@ -222,6 +231,7 @@ public abstract class ScanQueryMatcher {
+     }
+   }
+ 
++
+   /**
+    * Determines if the caller should do one of several things:
+    * <ul>
+@@ -334,13 +344,40 @@ public abstract class ScanQueryMatcher {
+    */
+   public abstract Cell getNextKeyHint(Cell cell) throws IOException;
+ 
+-  protected static DeleteTracker instantiateDeleteTracker(RegionCoprocessorHost host)
++  protected static Pair<DeleteTracker, ColumnTracker> getTrackers(RegionCoprocessorHost host,
++      NavigableSet<byte[]> columns, ScanInfo scanInfo, long oldestUnexpiredTS, Scan userScan)
+       throws IOException {
+-    DeleteTracker tracker = new ScanDeleteTracker();
++    int resultMaxVersion = scanInfo.getMaxVersions();
++    if (userScan != null && !userScan.isRaw()) {
++      resultMaxVersion = Math.min(userScan.getMaxVersions(), scanInfo.getMaxVersions());
++    }
++    DeleteTracker deleteTracker;
++    if (scanInfo.isMvccSensitive()) {
++      deleteTracker = new CombinedTracker(columns, scanInfo.getMinVersions(),
++          scanInfo.getMaxVersions(), resultMaxVersion, oldestUnexpiredTS);
++    } else {
++      deleteTracker = new ScanDeleteTracker();
++    }
+     if (host != null) {
+-      tracker = host.postInstantiateDeleteTracker(tracker);
++      deleteTracker = host.postInstantiateDeleteTracker(deleteTracker);
++      if (deleteTracker instanceof VisibilityScanDeleteTracker && scanInfo.isMvccSensitive()) {
++        deleteTracker = new VisibilityCombinedTracker(columns, scanInfo.getMinVersions(),
++            scanInfo.getMaxVersions(), resultMaxVersion, oldestUnexpiredTS);
++      }
++    }
++
++    ColumnTracker columnTracker;
++
++    if (deleteTracker instanceof CombinedTracker) {
++      columnTracker = (CombinedTracker) deleteTracker;
++    } else if (columns == null || columns.size() == 0) {
++      columnTracker = new ScanWildcardColumnTracker(scanInfo.getMinVersions(), resultMaxVersion,
++          oldestUnexpiredTS);
++    } else {
++      columnTracker = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(),
++          resultMaxVersion, oldestUnexpiredTS);
+     }
+-    return tracker;
++    return new Pair<>(deleteTracker, columnTracker);
+   }
+ 
+   // Used only for testing purposes
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/StripeCompactionScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/StripeCompactionScanQueryMatcher.java
+index c1e63b4..923ec3f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/StripeCompactionScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/StripeCompactionScanQueryMatcher.java
+@@ -41,9 +41,9 @@ public class StripeCompactionScanQueryMatcher extends DropDeletesCompactionScanQ
+   private DropDeletesInOutput dropDeletesInOutput = DropDeletesInOutput.BEFORE;
+ 
+   public StripeCompactionScanQueryMatcher(ScanInfo scanInfo, DeleteTracker deletes,
+-      long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, long now,
+-      byte[] dropDeletesFromRow, byte[] dropDeletesToRow) {
+-    super(scanInfo, deletes, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
++      ColumnTracker columns, long readPointToUse, long earliestPutTs, long oldestUnexpiredTS,
++      long now, byte[] dropDeletesFromRow, byte[] dropDeletesToRow) {
++    super(scanInfo, deletes, columns, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);
+     this.dropDeletesFromRow = dropDeletesFromRow;
+     this.dropDeletesToRow = dropDeletesToRow;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/UserScanQueryMatcher.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/UserScanQueryMatcher.java
+index ec7fc11..039b74e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/UserScanQueryMatcher.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/querymatcher/UserScanQueryMatcher.java
+@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.filter.Filter.ReturnCode;
+ import org.apache.hadoop.hbase.io.TimeRange;
+ import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+ import org.apache.hadoop.hbase.regionserver.ScanInfo;
++import org.apache.hadoop.hbase.util.Pair;
+ 
+ /**
+  * Query matcher for user scan.
+@@ -88,7 +89,7 @@ public abstract class UserScanQueryMatcher extends ScanQueryMatcher {
+     }
+   }
+ 
+-  protected final MatchCode matchColumn(Cell cell) throws IOException {
++  protected MatchCode matchColumn(Cell cell) throws IOException {
+     long timestamp = cell.getTimestamp();
+     int tsCmp = tr.compare(timestamp);
+     if (tsCmp > 0) {
+@@ -188,30 +189,18 @@ public abstract class UserScanQueryMatcher extends ScanQueryMatcher {
+   public static UserScanQueryMatcher create(Scan scan, ScanInfo scanInfo,
+       NavigableSet<byte[]> columns, long oldestUnexpiredTS, long now,
+       RegionCoprocessorHost regionCoprocessorHost) throws IOException {
+-    int maxVersions = scan.isRaw() ? scan.getMaxVersions()
+-        : Math.min(scan.getMaxVersions(), scanInfo.getMaxVersions());
+-    boolean hasNullColumn;
+-    ColumnTracker columnTracker;
+-    if (columns == null || columns.size() == 0) {
+-      // there is always a null column in the wildcard column query.
+-      hasNullColumn = true;
+-      // use a specialized scan for wildcard column tracker.
+-      columnTracker = new ScanWildcardColumnTracker(scanInfo.getMinVersions(), maxVersions,
+-          oldestUnexpiredTS);
+-    } else {
+-      // We can share the ExplicitColumnTracker, diff is we reset
+-      // between rows, not between storefiles.
+-      // whether there is null column in the explicit column query
+-      hasNullColumn = columns.first().length == 0;
+-      columnTracker = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,
+-          oldestUnexpiredTS);
+-    }
++    boolean hasNullColumn =
++        !(columns != null && columns.size() != 0 && columns.first().length != 0);
++    Pair<DeleteTracker, ColumnTracker> trackers = getTrackers(regionCoprocessorHost, columns,
++        scanInfo, oldestUnexpiredTS, scan);
++    DeleteTracker deleteTracker = trackers.getFirst();
++    ColumnTracker columnTracker = trackers.getSecond();
+     if (scan.isRaw()) {
+       return RawScanQueryMatcher.create(scan, scanInfo, columnTracker, hasNullColumn,
+-        oldestUnexpiredTS, now);
++          oldestUnexpiredTS, now);
+     } else {
+-      return NormalUserScanQueryMatcher.create(scan, scanInfo, columnTracker, hasNullColumn,
+-        oldestUnexpiredTS, now, regionCoprocessorHost);
++      return NormalUserScanQueryMatcher.create(scan, scanInfo, columnTracker, deleteTracker,
++          hasNullColumn, oldestUnexpiredTS, now);
+     }
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityCombinedTracker.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityCombinedTracker.java
+new file mode 100644
+index 0000000..976525c
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityCombinedTracker.java
+@@ -0,0 +1,201 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.security.visibility;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.NavigableMap;
++import java.util.NavigableSet;
++import java.util.SortedMap;
++import java.util.SortedSet;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.Tag;
++import org.apache.hadoop.hbase.regionserver.querymatcher.CombinedTracker;
++
++/**
++ * Similar to MvccSensitiveTracker but tracks the visibility expression also before
++ * deciding if a Cell can be considered deleted
++ */
++public class VisibilityCombinedTracker extends CombinedTracker {
++
++  private static final Log LOG = LogFactory.getLog(VisibilityCombinedTracker.class);
++
++  public VisibilityCombinedTracker(NavigableSet<byte[]> columns, int minVersion,
++      int maxVersion,
++      int resultMaxVersions, long oldestUnexpiredTS) {
++    super(columns, minVersion, maxVersion, resultMaxVersions, oldestUnexpiredTS);
++  }
++
++  private class TagInfo {
++    List<Tag> tags;
++    Byte format;
++
++    private TagInfo(Cell c) {
++      tags = new ArrayList<>();
++      format = VisibilityUtils.extractVisibilityTags(c, tags);
++    }
++
++    private TagInfo() {
++      tags = new ArrayList<>();
++    }
++  }
++
++  private class VisibilityDeleteVersionsNode extends DeleteVersionsNode {
++    private TagInfo tagInfo;
++
++    // <timestamp, set<mvcc>>
++    // Key is ts of version deletes, value is its mvccs.
++    // We may delete more than one time for a version.
++    private Map<Long, SortedMap<Long, TagInfo>> deletesMap = new HashMap<>();
++
++    // <mvcc, set<mvcc>>
++    // Key is mvcc of version deletes, value is mvcc of visible puts before the delete effect.
++    private NavigableMap<Long, SortedSet<Long>> mvccCountingMap = new TreeMap<>();
++
++    protected VisibilityDeleteVersionsNode(long ts, long mvcc, TagInfo tagInfo) {
++      this.tagInfo = tagInfo;
++      this.ts = ts;
++      this.mvcc = mvcc;
++      mvccCountingMap.put(Long.MAX_VALUE, new TreeSet<Long>());
++    }
++
++    protected VisibilityDeleteVersionsNode getDeepCopy() {
++      VisibilityDeleteVersionsNode node = new VisibilityDeleteVersionsNode(ts, mvcc, tagInfo);
++      for (Map.Entry<Long, SortedMap<Long, TagInfo>> e : deletesMap.entrySet()) {
++        node.deletesMap.put(e.getKey(), new TreeMap<>(e.getValue()));
++      }
++      for (Map.Entry<Long, SortedSet<Long>> e : mvccCountingMap.entrySet()) {
++        node.mvccCountingMap.put(e.getKey(), new TreeSet<>(e.getValue()));
++      }
++      return node;
++    }
++
++    public void addVersionDelete(Cell cell) {
++      SortedMap<Long, TagInfo> set = deletesMap.get(cell.getTimestamp());
++      if (set == null) {
++        set = new TreeMap<>();
++        deletesMap.put(cell.getTimestamp(), set);
++      }
++      set.put(cell.getSequenceId(), new TagInfo(cell));
++      // The init set should be the puts whose mvcc is smaller than this Delete. Because
++      // there may be some Puts masked by them. The Puts whose mvcc is larger than this Delete can
++      // not be copied to this node because we may delete one version and the oldest put may not be
++      // masked.
++      SortedSet<Long> nextValue = mvccCountingMap.ceilingEntry(cell.getSequenceId()).getValue();
++      SortedSet<Long> thisValue = new TreeSet<>(nextValue.headSet(cell.getSequenceId()));
++      mvccCountingMap.put(cell.getSequenceId(), thisValue);
++    }
++
++  }
++
++  @Override
++  public void add(Cell cell) {
++    System.out.println("add "+cell);
++    prepare(cell);
++    byte type = cell.getTypeByte();
++    switch (KeyValue.Type.codeToType(type)) {
++    // By the order of seen. We put null cq at first.
++    case DeleteFamily: // Delete all versions of all columns of the specified family
++      delFamMap.put(cell.getSequenceId(),
++          new VisibilityDeleteVersionsNode(cell.getTimestamp(), cell.getSequenceId(),
++              new TagInfo(cell)));
++      break;
++    case DeleteFamilyVersion: // Delete all columns of the specified family and specified version
++      delFamMap.ceilingEntry(cell.getSequenceId()).getValue().addVersionDelete(cell);
++      break;
++
++    // These two kinds of markers are mix with Puts.
++    case DeleteColumn: // Delete all versions of the specified column
++      delColMap.put(cell.getSequenceId(),
++          new VisibilityDeleteVersionsNode(cell.getTimestamp(), cell.getSequenceId(),
++              new TagInfo(cell)));
++      break;
++    case Delete: // Delete the specified version of the specified column.
++      delColMap.ceilingEntry(cell.getSequenceId()).getValue().addVersionDelete(cell);
++      break;
++    }
++  }
++
++  private boolean tagMatched(Cell put, TagInfo delInfo) throws IOException {
++    List<Tag> putVisTags = new ArrayList<>();
++    Byte putCellVisTagsFormat = VisibilityUtils.extractVisibilityTags(put, putVisTags);
++    return putVisTags.isEmpty() == delInfo.tags.isEmpty() && (
++        putVisTags.isEmpty() && delInfo.tags.isEmpty() || VisibilityLabelServiceManager
++            .getInstance().getVisibilityLabelService()
++            .matchVisibility(putVisTags, putCellVisTagsFormat, delInfo.tags, delInfo.format));
++  }
++
++  @Override
++  public DeleteResult isDeleted(Cell cell) {
++    try {
++      long duplicateMvcc = prepare(cell);
++
++      for (Map.Entry<Long, DeleteVersionsNode> e : delColMap.tailMap(cell.getSequenceId())
++          .entrySet()) {
++        VisibilityDeleteVersionsNode node = (VisibilityDeleteVersionsNode) e.getValue();
++        long deleteMvcc = Long.MAX_VALUE;
++        SortedMap<Long, TagInfo> deleteVersionMvccs = node.deletesMap.get(cell.getTimestamp());
++        if (deleteVersionMvccs != null) {
++          SortedMap<Long, TagInfo> tail = deleteVersionMvccs.tailMap(cell.getSequenceId());
++          for (Map.Entry<Long, TagInfo> entry : tail.entrySet()) {
++            if (tagMatched(cell, entry.getValue())) {
++              deleteMvcc = tail.firstKey();
++              break;
++            }
++          }
++        }
++        SortedMap<Long, SortedSet<Long>> subMap = node.mvccCountingMap
++            .subMap(cell.getSequenceId(), true, Math.min(duplicateMvcc, deleteMvcc), true);
++        for (Map.Entry<Long, SortedSet<Long>> seg : subMap.entrySet()) {
++          if (seg.getValue().size() >= maxVersions) {
++            return DeleteResult.VERSION_MASKED;
++          }
++          seg.getValue().add(cell.getSequenceId());
++        }
++        if (deleteMvcc < Long.MAX_VALUE) {
++          return DeleteResult.VERSION_DELETED;
++        }
++
++        if (cell.getTimestamp() <= node.ts && tagMatched(cell, node.tagInfo)) {
++          return DeleteResult.COLUMN_DELETED;
++        }
++      }
++      if (duplicateMvcc < Long.MAX_VALUE) {
++        return DeleteResult.VERSION_MASKED;
++      }
++    } catch (IOException e) {
++      LOG.error("Error in isDeleted() check! Will treat cell as not deleted", e);
++    }
++    return DeleteResult.NOT_DELETED;
++  }
++
++  protected void resetInternal() {
++    delFamMap.put(Long.MAX_VALUE,
++        new VisibilityDeleteVersionsNode(Long.MIN_VALUE, Long.MAX_VALUE, new TagInfo()));
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMvccSensitiveSemanticsFromClientSide.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMvccSensitiveSemanticsFromClientSide.java
+new file mode 100644
+index 0000000..c7485c5
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMvccSensitiveSemanticsFromClientSide.java
+@@ -0,0 +1,318 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.KeepDeletedCells;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Delete;
++import org.apache.hadoop.hbase.client.Get;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TestName;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++
++public class TestMvccSensitiveSemanticsFromClientSide {
++
++  private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++
++  private static final byte[] ROW = Bytes.toBytes("r1");
++  private static final byte[] ROW2 = Bytes.toBytes("r2");
++  private static final byte[] FAMILY = Bytes.toBytes("f");
++  private static final byte[] value = Bytes.toBytes("value");
++  private static final byte[] col1 = Bytes.toBytes("col1");
++  private static final byte[] col2 = Bytes.toBytes("col2");
++  private static final byte[] col3 = Bytes.toBytes("col3");
++
++  @Rule
++  public TestName name = new TestName();
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    TEST_UTIL.startMiniCluster(1);
++  }
++
++  @AfterClass
++  public static void setDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++  private Table createTable() throws IOException {
++    TableName tableName = TableName.valueOf(name.getMethodName());
++    HTableDescriptor table = new HTableDescriptor(tableName);
++    HColumnDescriptor fam = new HColumnDescriptor(FAMILY);
++    fam.setMvccSensitive(true);
++    fam.setMaxVersions(3);
++    table.addFamily(fam);
++    TEST_UTIL.getHBaseAdmin().createTable(table);
++    return TEST_UTIL.getConnection().getTable(tableName);
++  }
++
++  @Test
++  public void testPutAndDeleteVersions() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++      t.delete(new Delete(ROW).addColumns(FAMILY, col1, 2000000));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000000, value));
++      TEST_UTIL.getAdmin().flush(t.getName());
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(1, r.size());
++      assertEquals(1000000, r.rawCells()[0].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testPutMasked() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1, 1000003));
++
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(2, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000002, r.rawCells()[1].getTimestamp());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(2, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000002, r.rawCells()[1].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testPutMasked2() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1, 1000003));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000003, r.rawCells()[1].getTimestamp());
++      assertEquals(1000002, r.rawCells()[2].getTimestamp());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000003, r.rawCells()[1].getTimestamp());
++      assertEquals(1000002, r.rawCells()[2].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testPutMaskedAndUserMaxVersion() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1, 1000004));
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1, 1000003));
++
++      Result r = t.get(new Get(ROW).setMaxVersions(1));
++      assertEquals(1, r.size());
++      assertEquals(1000002, r.rawCells()[0].getTimestamp());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(1));
++      assertEquals(1, r.size());
++      assertEquals(1000002, r.rawCells()[0].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testSameTs() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000003, r.rawCells()[1].getTimestamp());
++      assertEquals(1000002, r.rawCells()[2].getTimestamp());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000003, r.rawCells()[1].getTimestamp());
++      assertEquals(1000002, r.rawCells()[2].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testSameTsAndDelete() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1, 1000003));
++
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000002, r.rawCells()[1].getTimestamp());
++      assertEquals(1000001, r.rawCells()[2].getTimestamp());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(3, r.size());
++      assertEquals(1000004, r.rawCells()[0].getTimestamp());
++      assertEquals(1000002, r.rawCells()[1].getTimestamp());
++      assertEquals(1000001, r.rawCells()[2].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testDeleteFamily() throws IOException {
++    try (Table t = createTable()) {
++
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, 1000001, value));
++
++      t.delete(new Delete(ROW).addFamily(FAMILY, 2000000));
++
++      t.put(new Put(ROW).addColumn(FAMILY, col3, 1500002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, 1500001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1500001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1500002, value));
++      TEST_UTIL.getAdmin().flush(t.getName());
++      Result r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(4, r.size());
++      assertEquals(1500002, r.rawCells()[0].getTimestamp());
++      assertEquals(1500001, r.rawCells()[1].getTimestamp());
++      assertEquals(1500001, r.rawCells()[2].getTimestamp());
++      assertEquals(1500002, r.rawCells()[3].getTimestamp());
++
++      t.delete(new Delete(ROW).addFamilyVersion(FAMILY, 1500001));
++
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(2, r.size());
++      assertEquals(1500002, r.rawCells()[0].getTimestamp());
++      assertEquals(1500002, r.rawCells()[1].getTimestamp());
++
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, 1000001, value));
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3));
++      assertEquals(6, r.size());
++      assertEquals(1500002, r.rawCells()[0].getTimestamp());
++      assertEquals(1000002, r.rawCells()[1].getTimestamp());
++      assertEquals(1000001, r.rawCells()[2].getTimestamp());
++      assertEquals(1000002, r.rawCells()[3].getTimestamp());
++      assertEquals(1500002, r.rawCells()[4].getTimestamp());
++      assertEquals(1000001, r.rawCells()[5].getTimestamp());
++    }
++  }
++
++  @Test
++  public void testTimeRange() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000001, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000002, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000003, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000004, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000005, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000006, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000007, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 1000008, value));
++      Result r = t.get(new Get(ROW).setMaxVersions(3).setTimeRange(0, 1000005));
++      assertEquals(0, r.size());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3).setTimeRange(0, 1000005));
++      assertEquals(0, r.size());
++    }
++  }
++
++  @Test
++  public void testExplicitColum() throws IOException {
++    try (Table t = createTable()) {
++      t.put(new Put(ROW).addColumn(FAMILY, col1, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col2, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col3, value));
++      Result r = t.get(new Get(ROW).setMaxVersions(3).addColumn(FAMILY, col2));
++      assertEquals(3, r.size());
++      TEST_UTIL.getAdmin().flush(t.getName());
++      r = t.get(new Get(ROW).setMaxVersions(3).addColumn(FAMILY, col2));
++      assertEquals(3, r.size());
++      TEST_UTIL.getAdmin().flush(t.getName());
++    }
++  }
++
++  @Test
++  public void testgetColumnHint() throws IOException {
++    try (Table t = createTable()) {
++      t.setOperationTimeout(10000);
++      t.setRpcTimeout(10000);
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 100, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 101, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 102, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 103, value));
++      t.put(new Put(ROW).addColumn(FAMILY, col1, 104, value));
++      t.put(new Put(ROW2).addColumn(FAMILY, col1, 104, value));
++      TEST_UTIL.getAdmin().flush(t.getName());
++      t.delete(new Delete(ROW).addColumn(FAMILY, col1));
++    }
++  }
++
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/querymatcher/TestMvccSensitiveTracker.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/querymatcher/TestMvccSensitiveTracker.java
+new file mode 100644
+index 0000000..644bc5e
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/querymatcher/TestMvccSensitiveTracker.java
+@@ -0,0 +1,262 @@
++/*
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.querymatcher;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.regionserver.querymatcher.DeleteTracker.DeleteResult;
++import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher.MatchCode;
++import org.apache.hadoop.hbase.testclassification.RegionServerTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++import static org.junit.Assert.assertEquals;
++
++@Category({ RegionServerTests.class, SmallTests.class })
++public class TestMvccSensitiveTracker {
++
++  private final byte[] col1 = Bytes.toBytes("col1");
++  private final byte[] col2 = Bytes.toBytes("col2");
++  private final byte[] row = Bytes.toBytes("row");
++  private final byte[] family = Bytes.toBytes("family");
++  private final byte[] value = Bytes.toBytes("value");
++
++  @Test
++  public void testMaxVersionMask() {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 10000);
++
++    KeyValue keyValue = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    keyValue.setTimestamp(20000);
++    keyValue.setSequenceId(1000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(999);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(998);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19998);
++    keyValue.setSequenceId(997);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19997);
++    keyValue.setSequenceId(996);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++
++    keyValue = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    keyValue.setTimestamp(20000);
++    keyValue.setSequenceId(1000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(1002);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(1001);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19998);
++    keyValue.setSequenceId(1003);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    keyValue.setTimestamp(19997);
++    keyValue.setSequenceId(1004);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++  }
++
++  @Test
++  public void testVersionsDelete() {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 10000);
++    KeyValue put = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    KeyValue delete = new KeyValue(row, family, col1, 20000, KeyValue.Type.DeleteColumn, value);
++    delete.setSequenceId(1000);
++    delete.setTimestamp(20000);
++    tracker.add(delete);
++    put.setSequenceId(1001);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(19998);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++
++    delete = new KeyValue(row, family, col2, 20000, KeyValue.Type.DeleteColumn, value);
++    delete.setSequenceId(1002);
++    delete.setTimestamp(20000);
++    tracker.add(delete);
++    put = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    put.setSequenceId(1001);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(19998);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++  }
++
++  @Test
++  public void testVersionDelete() {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 10000);
++    KeyValue put = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    KeyValue delete = new KeyValue(row, family, col1, 20000, KeyValue.Type.Delete, value);
++    delete.setSequenceId(1000);
++    delete.setTimestamp(20000);
++    tracker.add(delete);
++    put.setSequenceId(1001);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.VERSION_DELETED, tracker.isDeleted(put));
++
++    delete = new KeyValue(row, family, col2, 20000, KeyValue.Type.Delete, value);
++    delete.setSequenceId(1002);
++    delete.setTimestamp(20000);
++    tracker.add(delete);
++    put = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    put.setSequenceId(1001);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.VERSION_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.VERSION_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(1002);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(998);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(put));
++  }
++
++  @Test
++  public void testFamilyVersionsDelete() {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 10000);
++
++    KeyValue delete = new KeyValue(row, family, null, 20000, KeyValue.Type.DeleteFamily, value);
++    delete.setSequenceId(1000);
++    delete.setTimestamp(20000);
++
++    KeyValue put = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    tracker.add(delete);
++    put.setSequenceId(1001);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(19998);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++
++    put = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    put.setSequenceId(998);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(19998);
++    assertEquals(DeleteResult.COLUMN_DELETED, tracker.isDeleted(put));
++  }
++
++  @Test
++  public void testFamilyVersionDelete() {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 10000);
++
++    KeyValue delete = new KeyValue(row, family, null, 20000, KeyValue.Type.DeleteFamilyVersion,
++        value);
++    delete.setSequenceId(1000);
++    delete.setTimestamp(20000);
++    tracker.add(delete);
++
++    KeyValue put = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    put.setSequenceId(1001);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.VERSION_DELETED, tracker.isDeleted(put));
++
++    put = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    put.setSequenceId(1001);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(999);
++    put.setTimestamp(20000);
++    assertEquals(DeleteResult.VERSION_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(1002);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(put));
++    put.setSequenceId(998);
++    put.setTimestamp(19999);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(put));
++  }
++
++  @Test
++  public void testMinVersionsAndTTL() throws IOException {
++    CombinedTracker tracker = new CombinedTracker(null, 1, 3, 3, 30000);
++
++    KeyValue keyValue = new KeyValue(row, family, col1, 20000, KeyValue.Type.Put, value);
++    keyValue.setTimestamp(20000);
++    keyValue.setSequenceId(1000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.INCLUDE_AND_SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(999);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(
++        MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(998);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19998);
++    keyValue.setSequenceId(997);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19997);
++    keyValue.setSequenceId(996);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++
++    keyValue = new KeyValue(row, family, col2, 20000, KeyValue.Type.Put, value);
++    keyValue.setTimestamp(20000);
++    keyValue.setSequenceId(1000);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.INCLUDE_AND_SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(1002);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19999);
++    keyValue.setSequenceId(1001);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19998);
++    keyValue.setSequenceId(1003);
++    assertEquals(DeleteResult.NOT_DELETED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++    keyValue.setTimestamp(19997);
++    keyValue.setSequenceId(1004);
++    assertEquals(DeleteResult.VERSION_MASKED, tracker.isDeleted(keyValue));
++    assertEquals(MatchCode.SEEK_NEXT_COL,
++        tracker.checkVersions(keyValue, keyValue.getTimestamp(), keyValue.getTypeByte(), false));
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOnMvccSensitiveTable.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOnMvccSensitiveTable.java
+new file mode 100644
+index 0000000..fc56d76
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOnMvccSensitiveTable.java
+@@ -0,0 +1,21 @@
++package org.apache.hadoop.hbase.security.visibility;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Table;
++
++public class TestVisibilityLabelsOnMvccSensitiveTable extends TestVisibilityLabelsWithDeletes {
++
++  protected Table createTable(HColumnDescriptor fam) throws IOException {
++    fam.setMvccSensitive(true);
++    TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
++    HTableDescriptor table = new HTableDescriptor(tableName);
++    table.addFamily(fam);
++    TEST_UTIL.getHBaseAdmin().createTable(table);
++    return TEST_UTIL.getConnection().getTable(tableName);
++  }
++
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
+index 56078d8..8f104ca 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
+@@ -41,9 +41,11 @@ import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.testclassification.SecurityTests;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Threads;
+ import org.junit.After;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
++import org.junit.Ignore;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+@@ -73,11 +75,11 @@ public class TestVisibilityLabelsWithDeletes {
+   public static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+   private static final byte[] row1 = Bytes.toBytes("row1");
+   private static final byte[] row2 = Bytes.toBytes("row2");
+-  private final static byte[] fam = Bytes.toBytes("info");
+-  private final static byte[] qual = Bytes.toBytes("qual");
++  protected final static byte[] fam = Bytes.toBytes("info");
++  protected final static byte[] qual = Bytes.toBytes("qual");
+   private final static byte[] qual1 = Bytes.toBytes("qual1");
+   private final static byte[] qual2 = Bytes.toBytes("qual2");
+-  private final static byte[] value = Bytes.toBytes("value");
++  protected final static byte[] value = Bytes.toBytes("value");
+   private final static byte[] value1 = Bytes.toBytes("value1");
+   public static Configuration conf;
+ 
+@@ -111,13 +113,20 @@ public class TestVisibilityLabelsWithDeletes {
+   public void tearDown() throws Exception {
+   }
+ 
++  protected Table createTable(HColumnDescriptor fam) throws IOException {
++    TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
++    HTableDescriptor table = new HTableDescriptor(tableName);
++    table.addFamily(fam);
++    TEST_UTIL.getHBaseAdmin().createTable(table);
++    return TEST_UTIL.getConnection().getTable(tableName);
++  }
++
+   @Test
+   public void testVisibilityLabelsWithDeleteColumns() throws Throwable {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+ 
+-    try (Table table = createTableAndWriteDataWithLabels(tableName,
+-        SECRET + "&" + TOPSECRET, SECRET)) {
++    try (Table table = createTableAndWriteDataWithLabels(SECRET + "&" + TOPSECRET, SECRET)) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -154,8 +163,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testVisibilityLabelsWithDeleteFamily() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = createTableAndWriteDataWithLabels(tableName, SECRET,
+-        CONFIDENTIAL + "|" + TOPSECRET);) {
++    try (Table table = createTableAndWriteDataWithLabels(SECRET, CONFIDENTIAL + "|" + TOPSECRET);) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -192,7 +200,7 @@ public class TestVisibilityLabelsWithDeletes {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     long[] ts = new long[] { 123l, 125l };
+-    try (Table table = createTableAndWriteDataWithLabels(tableName, ts,
++    try (Table table = createTableAndWriteDataWithLabels(ts,
+         CONFIDENTIAL + "|" + TOPSECRET, SECRET)) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -230,7 +238,7 @@ public class TestVisibilityLabelsWithDeletes {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     long[] ts = new long[] { 123l, 125l };
+-    try (Table table = createTableAndWriteDataWithLabels(tableName, ts,
++    try (Table table = createTableAndWriteDataWithLabels(ts,
+         CONFIDENTIAL + "|" + TOPSECRET, SECRET);) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -267,7 +275,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testVisibilityLabelsWithDeleteColumnsWithMultipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -323,7 +331,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -373,7 +381,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -426,7 +434,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -472,12 +480,8 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteColumnsWithoutAndWithVisibilityLabels() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(row1);
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -529,12 +533,8 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteColumnsWithAndWithoutVisibilityLabels() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(row1);
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -586,12 +586,8 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteFamiliesWithoutAndWithVisibilityLabels() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(row1);
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -643,12 +639,8 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteFamiliesWithAndWithoutVisibilityLabels() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(row1);
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -700,12 +692,8 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeletesWithoutAndWithVisibilityLabels() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(row1);
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -759,13 +747,9 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testVisibilityLabelsWithDeleteFamilyWithPutsReAppearing() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -835,13 +819,9 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testVisibilityLabelsWithDeleteColumnsWithPutsReAppearing() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -911,13 +891,9 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testVisibilityCombinations() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual, 123l, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -960,18 +936,14 @@ public class TestVisibilityLabelsWithDeletes {
+       assertEquals(next.length, 0);
+     }
+   }
++
+   @Test
+   public void testVisibilityLabelsWithDeleteColumnWithSpecificVersionWithPutsReAppearing()
+       throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put1 = new Put(Bytes.toBytes("row1"));
+       put1.addColumn(fam, qual, 123l, value);
+       put1.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -1028,7 +1000,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1080,7 +1052,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteFamilyAndDeleteColumnsWithAndWithoutVisibilityExp() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1137,14 +1109,11 @@ public class TestVisibilityLabelsWithDeletes {
+     }
+   }
+ 
+-  private Table doPuts(TableName tableName) throws IOException, InterruptedIOException,
++  private Table doPuts() throws IOException, InterruptedIOException,
+       RetriesExhaustedWithDetailsException, InterruptedException {
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
++    Table table = createTable(colDesc);
+ 
+     List<Put> puts = new ArrayList<Put>();
+     Put put = new Put(Bytes.toBytes("row1"));
+@@ -1175,26 +1144,22 @@ public class TestVisibilityLabelsWithDeletes {
+         + TOPSECRET + "&" + SECRET+")"));
+     puts.add(put);
+ 
+-    TEST_UTIL.getHBaseAdmin().flush(tableName);
++    TEST_UTIL.getHBaseAdmin().flush(table.getName());
+     put = new Put(Bytes.toBytes("row2"));
+     put.addColumn(fam, qual, 127l, value);
+     put.setCellVisibility(new CellVisibility("(" + CONFIDENTIAL + "&" + PRIVATE + ")|(" + TOPSECRET
+         + "&" + SECRET + ")"));
+     puts.add(put);
+ 
+-    Table table = TEST_UTIL.getConnection().getTable(tableName);
+     table.put(puts);
+     return table;
+   }
+ 
+-  private Table doPutsWithDiffCols(TableName tableName) throws IOException,
++  private Table doPutsWithDiffCols() throws IOException,
+       InterruptedIOException, RetriesExhaustedWithDetailsException, InterruptedException {
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
++    Table table = createTable(colDesc);
+ 
+     List<Put> puts = new ArrayList<>();
+     Put put = new Put(Bytes.toBytes("row1"));
+@@ -1224,19 +1189,16 @@ public class TestVisibilityLabelsWithDeletes {
+         + TOPSECRET + "&" + SECRET+")"));
+     puts.add(put);
+ 
+-    Table table = TEST_UTIL.getConnection().getTable(tableName);
+     table.put(puts);
+     return table;
+   }
+ 
+-  private Table doPutsWithoutVisibility(TableName tableName) throws IOException,
++  private Table doPutsWithoutVisibility() throws IOException,
+       InterruptedIOException, RetriesExhaustedWithDetailsException, InterruptedException {
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
++    Table table = createTable(colDesc);
++
+     List<Put> puts = new ArrayList<>();
+     Put put = new Put(Bytes.toBytes("row1"));
+     put.addColumn(fam, qual, 123l, value);
+@@ -1258,10 +1220,9 @@ public class TestVisibilityLabelsWithDeletes {
+     put.addColumn(fam, qual, 127l, value);
+     puts.add(put);
+ 
+-    Table table = TEST_UTIL.getConnection().getTable(tableName);
+     table.put(puts);
+ 
+-    TEST_UTIL.getHBaseAdmin().flush(tableName);
++    TEST_UTIL.getHBaseAdmin().flush(table.getName());
+ 
+     put = new Put(Bytes.toBytes("row2"));
+     put.addColumn(fam, qual, 127l, value);
+@@ -1276,7 +1237,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1341,7 +1302,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteColumnWithLatestTimeStampUsingMultipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1400,7 +1361,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteColumnWithLatestTimeStampWhenNoVersionMatches() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual, 128l, value);
+@@ -1487,7 +1448,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1553,7 +1514,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteFamilyLatestTimeStampWithMulipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1602,7 +1563,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteColumnswithMultipleColumnsWithMultipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPutsWithDiffCols(tableName)) {
++    try (Table table = doPutsWithDiffCols()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1659,13 +1620,9 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteColumnsWithDiffColsAndTags() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual1, 125l, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -1704,16 +1661,13 @@ public class TestVisibilityLabelsWithDeletes {
+       assertEquals(next.length, 1);
+     }
+   }
++
+   @Test
+   public void testDeleteColumnsWithDiffColsAndTags1() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual1, 125l, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -1756,7 +1710,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteFamilyWithoutCellVisibilityWithMulipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPutsWithoutVisibility(tableName)) {
++    try (Table table = doPutsWithoutVisibility()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1795,7 +1749,7 @@ public class TestVisibilityLabelsWithDeletes {
+       throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPutsWithoutVisibility(tableName)) {
++    try (Table table = doPutsWithoutVisibility()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -1857,7 +1811,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteFamilySpecificTimeStampWithMulipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1912,7 +1866,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testScanAfterCompaction() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -1966,7 +1920,7 @@ public class TestVisibilityLabelsWithDeletes {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     // Do not flush here.
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2078,7 +2032,7 @@ public class TestVisibilityLabelsWithDeletes {
+     };
+     VisibilityLabelsResponse response = SUPERUSER.runAs(action);
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName);) {
++    try (Table table = doPuts();) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2130,7 +2084,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testSpecificDeletesFollowedByDeleteFamily() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)){
++    try (Table table = doPuts()){
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2230,7 +2184,7 @@ public class TestVisibilityLabelsWithDeletes {
+     };
+     VisibilityLabelsResponse response = SUPERUSER.runAs(action);
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)){
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2318,7 +2272,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteColumnSpecificTimeStampWithMulipleVersionsDoneTwice() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2423,7 +2377,7 @@ public class TestVisibilityLabelsWithDeletes {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     // Do not flush here.
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2533,7 +2487,7 @@ public class TestVisibilityLabelsWithDeletes {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+ 
+     // Do not flush here.
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2649,7 +2603,7 @@ public class TestVisibilityLabelsWithDeletes {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     // Do not flush here.
+-    try (Table table = doPuts(tableName)) {
++    try (Table table = doPuts()) {
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+         public Void run() throws Exception {
+@@ -2765,7 +2719,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDiffDeleteTypesForTheSameCellUsingMultipleVersions() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)){
++    try (Table table = doPuts()){
+       // Do not flush here.
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -2870,7 +2824,7 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testDeleteColumnLatestWithNoCellVisibility() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    try (Table table = doPuts(tableName)){
++    try (Table table = doPuts()){
+       TEST_UTIL.getHBaseAdmin().flush(tableName);
+       PrivilegedExceptionAction<Void> actiona = new PrivilegedExceptionAction<Void>() {
+         @Override
+@@ -3061,13 +3015,9 @@ public class TestVisibilityLabelsWithDeletes {
+   public void testVisibilityExpressionWithNotEqualORCondition() throws Exception {
+     setAuths();
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    try (Table table = TEST_UTIL.getConnection().getTable(tableName)) {
++    try (Table table = createTable(colDesc)) {
+       Put put = new Put(Bytes.toBytes("row1"));
+       put.addColumn(fam, qual, 123l, value);
+       put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+@@ -3118,15 +3068,11 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteWithNoVisibilitiesForPutsAndDeletes() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+     Put p = new Put (Bytes.toBytes("row1"));
+     p.addColumn(fam, qual, value);
+-    Table table = TEST_UTIL.getConnection().getTable(tableName);
++    Table table = createTable(colDesc);
+     table.put(p);
+     p = new Put (Bytes.toBytes("row1"));
+     p.addColumn(fam, qual1, value);
+@@ -3155,13 +3101,9 @@ public class TestVisibilityLabelsWithDeletes {
+   @Test
+   public void testDeleteWithFamilyDeletesOfSameTsButDifferentVisibilities() throws Exception {
+     final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+-    Admin hBaseAdmin = TEST_UTIL.getHBaseAdmin();
+     HColumnDescriptor colDesc = new HColumnDescriptor(fam);
+     colDesc.setMaxVersions(5);
+-    HTableDescriptor desc = new HTableDescriptor(tableName);
+-    desc.addFamily(colDesc);
+-    hBaseAdmin.createTable(desc);
+-    Table table = TEST_UTIL.getConnection().getTable(tableName);
++    Table table = createTable(colDesc);
+     long t1 = 1234L;
+     CellVisibility cellVisibility1 = new CellVisibility(SECRET);
+     CellVisibility cellVisibility2 = new CellVisibility(PRIVATE);
+@@ -3220,10 +3162,10 @@ public class TestVisibilityLabelsWithDeletes {
+     assertEquals(0, result.rawCells().length);
+   }
+ 
+-  public static Table createTableAndWriteDataWithLabels(TableName tableName, String... labelExps)
++  public Table createTableAndWriteDataWithLabels(String... labelExps)
+       throws Exception {
+-    Table table = null;
+-    table = TEST_UTIL.createTable(tableName, fam);
++    HColumnDescriptor cf = new HColumnDescriptor(fam);
++    Table table = createTable(cf);
+     int i = 1;
+     List<Put> puts = new ArrayList<Put>();
+     for (String labelExp : labelExps) {
+@@ -3238,10 +3180,10 @@ public class TestVisibilityLabelsWithDeletes {
+     return table;
+   }
+ 
+-  public static Table createTableAndWriteDataWithLabels(TableName tableName, long[] timestamp,
++  public Table createTableAndWriteDataWithLabels(long[] timestamp,
+       String... labelExps) throws Exception {
+-    Table table = null;
+-    table = TEST_UTIL.createTable(tableName, fam);
++    HColumnDescriptor cf = new HColumnDescriptor(fam);
++    Table table = createTable(cf);
+     int i = 1;
+     List<Put> puts = new ArrayList<Put>();
+     for (String labelExp : labelExps) {
+@@ -3250,7 +3192,7 @@ public class TestVisibilityLabelsWithDeletes {
+       put.setCellVisibility(new CellVisibility(labelExp));
+       puts.add(put);
+       table.put(put);
+-      TEST_UTIL.getHBaseAdmin().flush(tableName);
++      TEST_UTIL.getHBaseAdmin().flush(table.getName());
+       i++;
+     }
+     return table;

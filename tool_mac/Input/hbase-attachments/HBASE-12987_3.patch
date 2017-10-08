@@ -1,0 +1,274 @@
+From 561c0e8d13692507dbfed7aaa1a902a704b1e72b Mon Sep 17 00:00:00 2001
+From: Josh Elser <elserj@apache.org>
+Date: Wed, 8 Apr 2015 16:22:22 -0400
+Subject: [PATCH] HBASE-12987 Pare repeated hbck output and increase verbosity
+ in long-running tasks.
+
+---
+ .../java/org/apache/hadoop/hbase/util/FSUtils.java | 55 +++++++++++++++++++++-
+ .../org/apache/hadoop/hbase/util/HBaseFsck.java    | 38 ++++++++++++---
+ 2 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+index 0d0912e..e86054b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+@@ -66,6 +66,7 @@ import org.apache.hadoop.hbase.fs.HFileSystem;
+ import org.apache.hadoop.hbase.master.HMaster;
+ import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
+ import org.apache.hadoop.hbase.security.AccessDeniedException;
++import org.apache.hadoop.hbase.util.HBaseFsck.ErrorReporter;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.FSProtos;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+@@ -1546,6 +1547,28 @@ public abstract class FSUtils {
+   public static Map<String, Path> getTableStoreFilePathMap(Map<String, Path> map,
+   final FileSystem fs, final Path hbaseRootDir, TableName tableName)
+   throws IOException {
++    return getTableStoreFilePathMap(map, fs, hbaseRootDir, tableName, null);
++  }
++
++  /**
++   * Runs through the HBase rootdir/tablename and creates a reverse lookup map for
++   * table StoreFile names to the full Path.
++   * <br>
++   * Example...<br>
++   * Key = 3944417774205889744  <br>
++   * Value = hdfs://localhost:51169/user/userid/-ROOT-/70236052/info/3944417774205889744
++   *
++   * @param map map to add values.  If null, this method will create and populate one to return
++   * @param fs  The file system to use.
++   * @param hbaseRootDir  The root directory to scan.
++   * @param tableName name of the table to scan.
++   * @param errors ErrorReporter instance or null
++   * @return Map keyed by StoreFile name with a value of the full Path.
++   * @throws IOException When scanning the directory fails.
++   */
++  public static Map<String, Path> getTableStoreFilePathMap(Map<String, Path> map,
++  final FileSystem fs, final Path hbaseRootDir, TableName tableName, ErrorReporter errors)
++  throws IOException {
+     if (map == null) {
+       map = new HashMap<String, Path>();
+     }
+@@ -1557,10 +1580,16 @@ public abstract class FSUtils {
+     PathFilter familyFilter = new FamilyDirFilter(fs);
+     FileStatus[] regionDirs = fs.listStatus(tableDir, new RegionDirFilter(fs));
+     for (FileStatus regionDir : regionDirs) {
++      if (null != errors) {
++        errors.progress();
++      }
+       Path dd = regionDir.getPath();
+       // else its a region name, now look in region for families
+       FileStatus[] familyDirs = fs.listStatus(dd, familyFilter);
+       for (FileStatus familyDir : familyDirs) {
++        if (null != errors) {
++          errors.progress();
++        }
+         Path family = familyDir.getPath();
+         if (family.getName().equals(HConstants.RECOVERED_EDITS_DIR)) {
+           continue;
+@@ -1569,6 +1598,9 @@ public abstract class FSUtils {
+         // put in map
+         FileStatus[] familyStatus = fs.listStatus(family);
+         for (FileStatus sfStatus : familyStatus) {
++          if (null != errors) {
++            errors.progress();
++          }
+           Path sf = sfStatus.getPath();
+           map.put( sf.getName(), sf);
+         }
+@@ -1589,7 +1621,6 @@ public abstract class FSUtils {
+     return result;
+   }
+ 
+-
+   /**
+    * Runs through the HBase rootdir and creates a reverse lookup map for
+    * table StoreFile names to the full Path.
+@@ -1606,6 +1637,26 @@ public abstract class FSUtils {
+   public static Map<String, Path> getTableStoreFilePathMap(
+     final FileSystem fs, final Path hbaseRootDir)
+   throws IOException {
++    return getTableStoreFilePathMap(fs, hbaseRootDir, null);
++  }
++
++  /**
++   * Runs through the HBase rootdir and creates a reverse lookup map for
++   * table StoreFile names to the full Path.
++   * <br>
++   * Example...<br>
++   * Key = 3944417774205889744  <br>
++   * Value = hdfs://localhost:51169/user/userid/-ROOT-/70236052/info/3944417774205889744
++   *
++   * @param fs  The file system to use.
++   * @param hbaseRootDir  The root directory to scan.
++   * @param errors ErrorReporter instance or null
++   * @return Map keyed by StoreFile name with a value of the full Path.
++   * @throws IOException When scanning the directory fails.
++   */
++  public static Map<String, Path> getTableStoreFilePathMap(
++    final FileSystem fs, final Path hbaseRootDir, ErrorReporter errors)
++  throws IOException {
+     Map<String, Path> map = new HashMap<String, Path>();
+ 
+     // if this method looks similar to 'getTableFragmentation' that is because
+@@ -1614,7 +1665,7 @@ public abstract class FSUtils {
+     // only include the directory paths to tables
+     for (Path tableDir : FSUtils.getTableDirs(fs, hbaseRootDir)) {
+       getTableStoreFilePathMap(map, fs, hbaseRootDir,
+-          FSUtils.getTableName(tableDir));
++          FSUtils.getTableName(tableDir), errors);
+     }
+     return map;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+index f8fdd96..67e3411 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+@@ -641,13 +641,17 @@ public class HBaseFsck extends Configured implements Closeable {
+ 
+     // load regiondirs and regioninfos from HDFS
+     if (shouldCheckHdfs()) {
++      LOG.info("Loading region directories from HDFS");
+       loadHdfsRegionDirs();
++      LOG.info("Loading region information from HDFS");
+       loadHdfsRegionInfos();
+     }
+ 
+     // fix the orphan tables
+     fixOrphanTables();
+ 
++    LOG.info("Checking and fixing region consistency");
++
+     // Check and fix consistency
+     checkAndFixConsistency();
+ 
+@@ -970,7 +974,10 @@ public class HBaseFsck extends Configured implements Closeable {
+     Configuration conf = getConf();
+     Path hbaseRoot = FSUtils.getRootDir(conf);
+     FileSystem fs = hbaseRoot.getFileSystem(conf);
+-    Map<String, Path> allFiles = FSUtils.getTableStoreFilePathMap(fs, hbaseRoot);
++    LOG.info("Computing mapping of all store files");
++    Map<String, Path> allFiles = FSUtils.getTableStoreFilePathMap(fs, hbaseRoot, errors);
++    errors.print("");
++    LOG.info("Validating mapping using HDFS state");
+     for (Path path: allFiles.values()) {
+       boolean isReference = false;
+       try {
+@@ -1168,6 +1175,7 @@ public class HBaseFsck extends Configured implements Closeable {
+     }
+ 
+     loadTableInfosForTablesWithNoRegion();
++    errors.print("");
+ 
+     return tablesInfo;
+   }
+@@ -1358,6 +1366,7 @@ public class HBaseFsck extends Configured implements Closeable {
+    */
+   private void suggestFixes(
+       SortedMap<TableName, TableInfo> tablesInfo) throws IOException {
++    logParallelMerge();
+     for (TableInfo tInfo : tablesInfo.values()) {
+       TableIntegrityErrorHandler handler = tInfo.new IntegrityFixSuggester(tInfo, errors);
+       tInfo.checkRegionChain(handler);
+@@ -1431,9 +1440,23 @@ public class HBaseFsck extends Configured implements Closeable {
+     return true;
+   }
+ 
++  /**
++   * Log an appropriate message about whether or not overlapping merges are computed in parallel.
++   */
++  private void logParallelMerge() {
++    if (getConf().getBoolean("hbasefsck.overlap.merge.parallel", true)) {
++      LOG.info("Handling overlap merges in parallel. set hbasefsck.overlap.merge.parallel to" +
++          " false to run serially.");
++    } else {
++      LOG.info("Handling overlap merges serially.  set hbasefsck.overlap.merge.parallel to" +
++          " true to run in parallel.");
++    }
++  }
++
+   private SortedMap<TableName, TableInfo> checkHdfsIntegrity(boolean fixHoles,
+       boolean fixOverlaps) throws IOException {
+     LOG.info("Checking HBase region split map from HDFS data...");
++    logParallelMerge();
+     for (TableInfo tInfo : tablesInfo.values()) {
+       TableIntegrityErrorHandler handler;
+       if (fixHoles || fixOverlaps) {
+@@ -1662,6 +1685,7 @@ public class HBaseFsck extends Configured implements Closeable {
+         LOG.warn("Could not load region dir " , e.getCause());
+       }
+     }
++    errors.print("");
+   }
+ 
+   /**
+@@ -2395,6 +2419,7 @@ public class HBaseFsck extends Configured implements Closeable {
+ 
+     loadTableInfosForTablesWithNoRegion();
+ 
++    logParallelMerge();
+     for (TableInfo tInfo : tablesInfo.values()) {
+       TableIntegrityErrorHandler handler = tInfo.new IntegrityFixSuggester(tInfo, errors);
+       if (!tInfo.checkRegionChain(handler)) {
+@@ -3011,15 +3036,11 @@ public class HBaseFsck extends Configured implements Closeable {
+ 
+       // TODO fold this into the TableIntegrityHandler
+       if (getConf().getBoolean("hbasefsck.overlap.merge.parallel", true)) {
+-        LOG.info("Handling overlap merges in parallel. set hbasefsck.overlap.merge.parallel to" +
+-            " false to run serially.");
+         boolean ok = handleOverlapsParallel(handler, prevKey);
+         if (!ok) {
+           return false;
+         }
+       } else {
+-        LOG.info("Handling overlap merges serially.  set hbasefsck.overlap.merge.parallel to" +
+-            " true to run in parallel.");
+         for (Collection<HbckInfo> overlap : overlapGroups.asMap().values()) {
+           handler.handleOverlapGroup(overlap);
+         }
+@@ -3745,6 +3766,8 @@ public class HBaseFsck extends Configured implements Closeable {
+   static class PrintingErrorReporter implements ErrorReporter {
+     public int errorCount = 0;
+     private int showProgress;
++    // How frequently calls to progress() will create output
++    private static final int progressThreshold = 100;
+ 
+     Set<TableInfo> errorTables = new HashSet<TableInfo>();
+ 
+@@ -3859,7 +3882,7 @@ public class HBaseFsck extends Configured implements Closeable {
+ 
+     @Override
+     public synchronized void progress() {
+-      if (showProgress++ == 10) {
++      if (showProgress++ == progressThreshold) {
+         if (!summary) {
+           System.out.print(".");
+         }
+@@ -3956,6 +3979,7 @@ public class HBaseFsck extends Configured implements Closeable {
+         // level 2: <HBASE_DIR>/<table>/*
+         FileStatus[] regionDirs = fs.listStatus(tableDir.getPath());
+         for (FileStatus regionDir : regionDirs) {
++          errors.progress();
+           String encodedName = regionDir.getPath().getName();
+           // ignore directories that aren't hexadecimal
+           if (!encodedName.toLowerCase().matches("[0-9a-f]+")) {
+@@ -3983,6 +4007,7 @@ public class HBaseFsck extends Configured implements Closeable {
+             FileStatus[] subDirs = fs.listStatus(regionDir.getPath());
+             Path ePath = WALSplitter.getRegionDirRecoveredEditsDir(regionDir.getPath());
+             for (FileStatus subDir : subDirs) {
++              errors.progress();
+               String sdName = subDir.getPath().getName();
+               if (!sdName.startsWith(".") && !sdName.equals(ePath.getName())) {
+                 he.hdfsOnlyEdits = false;
+@@ -4023,6 +4048,7 @@ public class HBaseFsck extends Configured implements Closeable {
+       // only load entries that haven't been loaded yet.
+       if (hbi.getHdfsHRI() == null) {
+         try {
++          errors.progress();
+           hbck.loadHdfsRegioninfo(hbi);
+         } catch (IOException ioe) {
+           String msg = "Orphan region in HDFS: Unable to load .regioninfo from table "
+-- 
+2.1.2
+

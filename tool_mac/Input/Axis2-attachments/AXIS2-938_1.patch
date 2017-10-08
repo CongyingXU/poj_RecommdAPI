@@ -1,0 +1,493 @@
+Index: /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigrator.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigrator.java	(revision 0)
++++ /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigrator.java	(revision 0)
+@@ -0,0 +1,114 @@
++/*
++ * Copyright 2006 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.axis2.util;
++
++import org.apache.axis2.AxisFault;
++import org.apache.axis2.context.MessageContext;
++
++/**
++ * This is the interface for a piece of code that will plug into the user
++ * programming model impl (e.g. JAX-WS impl) and will be invoked while on the
++ * ultimate thread of execution.  It is intended to provide a mechanism to
++ * allow information to be migrated between the Axis2 contexts and thread
++ * local storage.
++ * 
++ * Note: It is up to each particular programming model impl to decide whether
++ * or not they wish to make use of the ThreadContextMigrators.
++ * 
++ * For each general MEP, here is the invocation pattern:
++ * 
++ * [one-way inbound]
++ * migrateContextToThread(req)
++ * cleanupThread(req)
++ * 
++ * [req/rsp inbound]
++ * migrateContextToThread(req)
++ * migrateThreadToContext(rsp)
++ * cleanupContext(rsp)
++ * cleanupThread(req)
++ * 
++ * [one-way outbound]
++ * migrateThreadToContext(req)
++ * cleanupContext(req)
++ * 
++ * [req/rsp outbound (both sync and async)]
++ * migrateThreadToContext(req)
++ * cleanupContext(rsp)
++ * migrateContextToThread(rsp)
++ * Note: there is no corresponding cleanupContext(rsp); one of the inbound
++ *       cases would need to handle this
++ * 
++ * If a fault occurs during execution of one of the migrators, it will be
++ * treated like any other service fault (i.e. like what will happen if we can't
++ * deliver the message to a service or if a handler fails.
++ * 
++ * The cleanup* methods can be expected to be invoked after any exeception
++ * that occurs within the scope of the migration that would cause that scope
++ * to be left so that the thread and/or context may be cleaned up properly. 
++ */
++public interface ThreadContextMigrator
++{
++  /**
++   * This method will be invoked when the processing of the message is
++   * guaranteed to be on the thread of execution that will be used in
++   * user space.  It will be invoked for incoming messages.
++   * Implementations of this interface can use the information found in the
++   * MessageContext to determine whether a request or response is being
++   * processed.
++   * (e.g. MessageContext.getAxisOperation().getMessageExchangePattern())
++   * 
++   * @param messageContext
++   * @throws AxisFault
++   */
++  void migrateContextToThread(MessageContext messageContext) throws AxisFault;
++
++  /**
++   * This method will be invoked when the processing of the message is
++   * guaranteed to still be on the thread of execution that was used in user
++   * space, after all processing has completed (i.e. when the particular
++   * processing of a message is unwinding.)  It provides a mechanism which can
++   * be used to clean up the TLS.
++   *   
++   * @param messageContext
++   */
++  void cleanupThread(MessageContext messageContext);
++
++  /**
++   * This method will be invoked when the processing of the message is
++   * guaranteed to still be on the thread of execution that was used in
++   * user space.  It will be invoked for both outgoing messages.
++   * Implementations of this interface can use the information found in the
++   * MessageContext to determine whether a request or response is being
++   * processed.
++   * (e.g. MessageContext.getAxisOperation().getMessageExchangePattern())
++   * 
++   * @param messageContext
++   * @throws AxisFault
++   */
++  void migrateThreadToContext(MessageContext messageContext) throws AxisFault;
++  
++  /**
++   * This method will be invoked when the processing of the message is
++   * guaranteed to be on the thread of execution that will be used in user
++   * space, after all processing has completed (i.e. when the particular
++   * processing of a message is unwinding.)  It provides a mechanism which can
++   * be used to clean up the MessageContext or restore TLS.
++   *   
++   * @param messageContext
++   */
++  void cleanupContext(MessageContext messageContext);
++}
+Index: /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigratorUtil.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigratorUtil.java	(revision 0)
++++ /home/nagy/work/apache/axis2/modules/core/src/org/apache/axis2/util/ThreadContextMigratorUtil.java	(revision 0)
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2006 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.axis2.util;
++
++import org.apache.axis2.AxisFault;
++import org.apache.axis2.context.ConfigurationContext;
++import org.apache.axis2.context.MessageContext;
++
++import java.util.LinkedList;
++import java.util.List;
++import java.util.ListIterator;
++
++/**
++ * This is a utility class to make it easier/cleaner for user programming
++ * model-level implementations (e.g. the Axis2 JAX-WS code) to invoke the
++ * ThreadContextMigrators. 
++ */
++public class ThreadContextMigratorUtil
++{  
++  /**
++   * Register a new ThreadContextMigrator.
++   * 
++   * @param configurationContext
++   * @param threadContextMigratorListID The name of the property in the
++   *                                    ConfigurationContext that contains
++   *                                    the list of migrators.
++   * @param migrator
++   */
++  public static void addThreadContextMigrator(ConfigurationContext configurationContext, String threadContextMigratorListID, ThreadContextMigrator migrator)
++  {
++    List migratorList = (List)configurationContext.getProperty(threadContextMigratorListID);
++
++    if (migratorList == null)
++    {
++      migratorList = new LinkedList();
++      configurationContext.setProperty(threadContextMigratorListID, migratorList);
++    }
++    
++    migratorList.add(migrator);
++  }
++ 
++  /**
++   * Activate any registered ThreadContextMigrators to move context info
++   * to the thread of execution.
++   * @param threadContextMigratorListID The name of the property in the
++   *                                    ConfigurationContext that contains
++   *                                    the list of migrators.
++   * @param msgContext
++   * 
++   * @throws AxisFault
++   */
++  public static void performMigrationToThread(String threadContextMigratorListID, MessageContext msgContext)
++  throws AxisFault
++  {
++    List migratorList = (List)msgContext.getConfigurationContext().getProperty(threadContextMigratorListID);
++    
++    if (migratorList != null)
++    {
++      ListIterator threadContextMigrators = migratorList.listIterator();
++      while (threadContextMigrators.hasNext())
++      {
++        ((ThreadContextMigrator)threadContextMigrators.next()).migrateContextToThread(msgContext);
++      }
++    }
++  }
++
++  /**
++   * Activate any registered ThreadContextMigrators to remove information
++   * from the thread of execution if necessary.
++   * 
++   * @param threadContextMigratorListID The name of the property in the
++   *                                    ConfigurationContext that contains
++   *                                    the list of migrators.
++   * @param msgContext
++   */
++  public static void performThreadCleanup(String threadContextMigratorListID, MessageContext msgContext)
++  {
++    List migratorList = (List)msgContext.getConfigurationContext().getProperty(threadContextMigratorListID);
++    
++    if (migratorList != null)
++    {
++      ListIterator threadContextMigrators = migratorList.listIterator();
++      while (threadContextMigrators.hasNext())
++      {
++        ((ThreadContextMigrator)threadContextMigrators.next()).cleanupThread(msgContext);
++      }
++    }
++  }
++
++  /**
++   * Activate any registered ThreadContextMigrators to move info from the
++   * thread of execution into the context.
++   * 
++   * @param threadContextMigratorListID The name of the property in the
++   *                                    ConfigurationContext that contains
++   *                                    the list of migrators.
++   * @param msgContext
++   * @throws AxisFault
++   */
++  public static void performMigrationToContext(String threadContextMigratorListID, MessageContext msgContext)
++  throws AxisFault
++  {
++    List migratorList = (List)msgContext.getConfigurationContext().getProperty(threadContextMigratorListID);
++
++    if (migratorList != null)
++    {
++      ListIterator threadContextMigrators = migratorList.listIterator();
++      while (threadContextMigrators.hasNext())
++      {
++        ((ThreadContextMigrator)threadContextMigrators.next()).migrateThreadToContext(msgContext);
++      }
++    }
++  }
++  
++  /**
++   * Activate any registered ThreadContextMigrators to remove information from
++   * the context if necessary.
++   * 
++   * @param threadContextMigratorListID The name of the property in the
++   *                                    ConfigurationContext that contains
++   *                                    the list of migrators.
++   * @param msgContext
++   */
++  public static void performContextCleanup(String threadContextMigratorListID, MessageContext msgContext)
++  {
++    List migratorList = (List)msgContext.getConfigurationContext().getProperty(threadContextMigratorListID);
++
++    if (migratorList != null)
++    {
++      ListIterator threadContextMigrators = migratorList.listIterator();
++      while (threadContextMigrators.hasNext())
++      {
++        ((ThreadContextMigrator)threadContextMigrators.next()).cleanupContext(msgContext);
++      }
++    }
++  }
++}
+Index: /home/nagy/work/apache/axis2/modules/core/test/org/apache/axis2/util/ThreadContextMigratorTest.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/core/test/org/apache/axis2/util/ThreadContextMigratorTest.java	(revision 0)
++++ /home/nagy/work/apache/axis2/modules/core/test/org/apache/axis2/util/ThreadContextMigratorTest.java	(revision 0)
+@@ -0,0 +1,98 @@
++/*
++ * Copyright 2006 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.axis2.util;
++
++import org.apache.axis2.AxisFault;
++import org.apache.axis2.context.ConfigurationContext;
++import org.apache.axis2.context.MessageContext;
++import org.apache.axis2.description.AxisService;
++import org.apache.axis2.description.AxisServiceGroup;
++import org.apache.axis2.engine.AxisConfiguration;
++
++import junit.framework.TestCase;
++
++public class ThreadContextMigratorTest extends TestCase
++{
++  private static String TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID
++                         = "Test-ThreadContextMigrator-List";
++  private MessageContext messageContext;
++  
++  public void setUp()
++  {
++    messageContext = new MessageContext();
++    messageContext.setConfigurationContext(new ConfigurationContext(new AxisConfiguration()));
++  }
++  
++  public void testEmptyMigratorStructure()
++  throws Exception
++  {
++    ThreadContextMigratorUtil.performMigrationToThread(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    ThreadContextMigratorUtil.performMigrationToContext(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    ThreadContextMigratorUtil.performThreadCleanup(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    ThreadContextMigratorUtil.performContextCleanup(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++  }
++  
++  public void testMigration()
++  throws Exception
++  {
++    TestMigrator testMigrator1 = new TestMigrator();
++    TestMigrator testMigrator2 = new TestMigrator();
++    ThreadContextMigratorUtil.addThreadContextMigrator(messageContext.getConfigurationContext(), TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, testMigrator1);
++    ThreadContextMigratorUtil.addThreadContextMigrator(messageContext.getConfigurationContext(), TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, testMigrator2);
++    ThreadContextMigratorUtil.performMigrationToThread(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    assertTrue(testMigrator1.migratedToThread);
++    assertTrue(testMigrator2.migratedToThread);
++    ThreadContextMigratorUtil.performMigrationToContext(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    assertTrue(testMigrator1.migratedToContext);
++    assertTrue(testMigrator2.migratedToContext);
++    ThreadContextMigratorUtil.performThreadCleanup(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    assertTrue(testMigrator1.cleanedThread);
++    assertTrue(testMigrator2.cleanedThread);
++    ThreadContextMigratorUtil.performContextCleanup(TEST_THREAD_CONTEXT_MIGRATOR_LIST_ID, messageContext);
++    assertTrue(testMigrator1.cleanedContext);
++    assertTrue(testMigrator2.cleanedContext);
++  }
++  
++  class TestMigrator implements ThreadContextMigrator
++  {
++    boolean migratedToThread;
++    boolean cleanedThread;
++    boolean migratedToContext;
++    boolean cleanedContext;
++    
++    public void migrateContextToThread(MessageContext messageContext) throws AxisFault
++    {
++      migratedToThread = true;
++    }
++
++    public void cleanupThread(MessageContext messageContext)
++    {
++      cleanedThread = true;
++    }
++
++    public void migrateThreadToContext(MessageContext messageContext) throws AxisFault
++    {
++      migratedToContext = true;
++    }
++
++    public void cleanupContext(MessageContext messageContext)
++    {
++      cleanedContext = true;
++    }
++    
++  }
++}
+Index: /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java	(revision 427633)
++++ /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/AxisCallback.java	(working copy)
+@@ -24,6 +24,8 @@
+ import org.apache.axis2.jaxws.message.Message;
+ import org.apache.axis2.jaxws.message.factory.MessageFactory;
+ import org.apache.axis2.jaxws.registry.FactoryRegistry;
++import org.apache.axis2.jaxws.util.Constants;
++import org.apache.axis2.util.ThreadContextMigratorUtil;
+ 
+ /**
+  * The AxisCallback is the touch point for asynchronous invocations 
+@@ -49,6 +51,9 @@
+         responseMsgCtx = new MessageContext(axisMsgCtx);
+         
+         try {
++            //REVIEW: Are we on the final thread of execution here or does this get handed off to the executor?
++            ThreadContextMigratorUtil.performMigrationToThread(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisMsgCtx);
++          
+             OMElement responseEnv = result.getResponseEnvelope();
+             
+             MessageFactory mf = (MessageFactory) FactoryRegistry.getFactory(MessageFactory.class);
+Index: /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java	(revision 427633)
++++ /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/core/controller/AxisInvocationController.java	(working copy)
+@@ -42,6 +42,7 @@
+ import org.apache.axis2.jaxws.message.factory.MessageFactory;
+ import org.apache.axis2.jaxws.registry.FactoryRegistry;
+ import org.apache.axis2.jaxws.util.Constants;
++import org.apache.axis2.util.ThreadContextMigratorUtil;
+ import org.apache.axis2.wsdl.WSDLConstants;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -123,7 +124,11 @@
+ 
+                 // Set the Axis2 request MessageContext
+                 opClient.addMessageContext(axisRequestMsgCtx);
++
++                //This assumes that we are on the ultimate execution thread
++                ThreadContextMigratorUtil.performMigrationToContext(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisRequestMsgCtx);
+                 opClient.execute(true);
++                ThreadContextMigratorUtil.performContextCleanup(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisRequestMsgCtx);
+                 
+                 // Collect the response MessageContext and envelope
+                 org.apache.axis2.context.MessageContext axisResponseMsgCtx = 
+@@ -129,6 +134,9 @@
+                 org.apache.axis2.context.MessageContext axisResponseMsgCtx = 
+                     opClient.getMessageContext(WSDLConstants.MESSAGE_LABEL_IN_VALUE);
+                 
++                //This assumes that we are on the ultimate execution thread
++                ThreadContextMigratorUtil.performMigrationToThread(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisResponseMsgCtx);
++                
+                 SOAPEnvelope rspEnvelope = axisResponseMsgCtx.getEnvelope();
+                 Message responseMsg = null;
+                 if (rspEnvelope != null) {
+Index: /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java	(revision 427633)
++++ /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/server/JAXWSMessageReceiver.java	(working copy)
+@@ -29,6 +29,8 @@
+ import org.apache.axis2.jaxws.core.InvocationContextImpl;
+ import org.apache.axis2.jaxws.core.MessageContext;
+ import org.apache.axis2.jaxws.message.Message;
++import org.apache.axis2.jaxws.util.Constants;
++import org.apache.axis2.util.ThreadContextMigratorUtil;
+ import org.apache.axis2.wsdl.WSDLConstants.WSDL20_2004Constants;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -72,6 +74,9 @@
+                 throw new RuntimeException("No service class was found for this AxisService");
+             }
+             
++            //This assumes that we are on the ultimate execution thread
++            ThreadContextMigratorUtil.performMigrationToThread(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisRequestMsgCtx);
++            
+             //Get the appropriate endpoint dispatcher for this service
+         	EndpointController endpointCtlr = new EndpointController();
+           	
+@@ -99,6 +104,9 @@
+                 
+                 OperationContext opCtx = axisResponseMsgCtx.getOperationContext();
+                 opCtx.addMessageContext(axisResponseMsgCtx);
++            
++                //This assumes that we are on the ultimate execution thread
++                ThreadContextMigratorUtil.performMigrationToContext(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisResponseMsgCtx);
+                 
+                 //Create the AxisEngine for the reponse and send it.
+                 AxisEngine engine = new AxisEngine(axisResponseMsgCtx.getConfigurationContext());
+@@ -103,7 +111,13 @@
+                 //Create the AxisEngine for the reponse and send it.
+                 AxisEngine engine = new AxisEngine(axisResponseMsgCtx.getConfigurationContext());
+                 engine.send(axisResponseMsgCtx);
++                
++                //This assumes that we are on the ultimate execution thread
++                ThreadContextMigratorUtil.performContextCleanup(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisResponseMsgCtx);
+             }
++
++            //This assumes that we are on the ultimate execution thread
++            ThreadContextMigratorUtil.performThreadCleanup(Constants.THREAD_CONTEXT_MIGRATOR_LIST_ID, axisRequestMsgCtx);
+             
+         } catch (Exception e) {
+         	//TODO: This temp code for alpha till we add fault processing on client code.
+Index: /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/util/Constants.java
+===================================================================
+--- /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/util/Constants.java	(revision 427633)
++++ /home/nagy/work/apache/axis2/modules/jaxws/src/org/apache/axis2/jaxws/util/Constants.java	(working copy)
+@@ -43,4 +43,6 @@
+     
+     public static final QName QNAME_WSADDRESSING_MODULE = new QName("", "addressing");
+     public static final QName QNAME_WSRM_MODULE = new QName("", "sandesha2");
++    
++    public static final String THREAD_CONTEXT_MIGRATOR_LIST_ID = "JAXWS-ThreadContextMigrator-List";
+ }

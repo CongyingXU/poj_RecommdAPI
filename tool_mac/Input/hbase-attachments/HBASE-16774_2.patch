@@ -1,0 +1,439 @@
+From c7b126c506c3134c1e7e2464fb678ab1ff3d9a2b Mon Sep 17 00:00:00 2001
+From: Esteban Gutierrez <esteban@apache.org>
+Date: Wed, 5 Oct 2016 15:25:54 -0700
+Subject: [PATCH] HBASE-16774 [shell] Add coverage to TestShell when ZooKeeper
+ is not reachable
+
+---
+ .../hbase/client/ConnectionImplementation.java     |  2 +-
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java | 40 ++++++----
+ .../org/apache/hadoop/hbase/client/Registry.java   |  4 +-
+ .../hadoop/hbase/client/ZooKeeperRegistry.java     |  7 +-
+ .../hadoop/hbase/mapred/TableOutputFormat.java     | 13 ++++
+ .../hadoop/hbase/client/TestClientTimeouts.java    |  8 +-
+ .../hadoop/hbase/client/TestShellNoCluster.java    | 61 +++++++++++++++
+ .../test/ruby/hbase/test_connection_no_cluster.rb  | 46 +++++++++++
+ .../src/test/ruby/no_cluster_tests_runner.rb       | 89 ++++++++++++++++++++++
+ 9 files changed, 245 insertions(+), 25 deletions(-)
+ create mode 100644 hbase-shell/src/test/java/org/apache/hadoop/hbase/client/TestShellNoCluster.java
+ create mode 100644 hbase-shell/src/test/ruby/hbase/test_connection_no_cluster.rb
+ create mode 100644 hbase-shell/src/test/ruby/no_cluster_tests_runner.rb
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+index 8db9dbf..f0e93fe 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+@@ -439,7 +439,7 @@ class ConnectionImplementation implements ClusterConnection, Closeable {
+ 
+   protected String clusterId = null;
+ 
+-  protected void retrieveClusterId() throws IOException {
++  protected void retrieveClusterId() {
+     if (clusterId != null) {
+       return;
+     }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index e7f6929..51d07e3 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -2112,10 +2112,12 @@ public class HBaseAdmin implements Admin {
+   /**
+    * Is HBase available? Throw an exception if not.
+    * @param conf system configuration
+-   * @throws ZooKeeperConnectionException if unable to connect to zookeeper]
++   * @throws MasterNotRunningException if the master is not running.
++   * @throws ZooKeeperConnectionException if unable to connect to zookeeper.
++   * // TODO do not expose ZKConnectionException.
+    */
+   public static void available(final Configuration conf)
+-  throws ZooKeeperConnectionException, InterruptedIOException {
++  throws MasterNotRunningException, ZooKeeperConnectionException, IOException {
+     Configuration copyOfConf = HBaseConfiguration.create(conf);
+     // We set it to make it fail as soon as possible if HBase is not available
+     copyOfConf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
+@@ -2124,19 +2126,29 @@ public class HBaseAdmin implements Admin {
+     // Check ZK first.
+     // If the connection exists, we may have a connection to ZK that does not work anymore
+     try (ClusterConnection connection =
+-             (ClusterConnection) ConnectionFactory.createConnection(copyOfConf);
+-         ZooKeeperKeepAliveConnection zkw = ((ConnectionImplementation) connection).
+-             getKeepAliveZooKeeperWatcher();) {
+-      // This is NASTY. FIX!!!! Dependent on internal implementation! TODO
+-      zkw.getRecoverableZooKeeper().getZooKeeper().exists(zkw.znodePaths.baseZNode, false);
++        (ClusterConnection) ConnectionFactory.createConnection(copyOfConf)) {
++      // Check ZK first.
++      // If the connection exists, we may have a connection to ZK that does not work anymore
++      ZooKeeperKeepAliveConnection zkw = null;
++      try {
++        // This is NASTY. FIX!!!! Dependent on internal implementation! TODO
++        zkw = ((ConnectionImplementation) connection)
++            .getKeepAliveZooKeeperWatcher();
++          zkw.getRecoverableZooKeeper().getZooKeeper().exists(zkw.znodePaths.baseZNode, false);
++      } catch (IOException e) {
++        throw new ZooKeeperConnectionException("Can't connect to ZooKeeper", e);
++      } catch (InterruptedException e) {
++        throw (InterruptedIOException)
++            new InterruptedIOException("Can't connect to ZooKeeper").initCause(e);
++      } catch (KeeperException e){
++        throw new ZooKeeperConnectionException("Can't connect to ZooKeeper", e);
++      } finally {
++        if (zkw != null) {
++          zkw.close();
++        }
++      }
++      // can throw MasterNotRunningException
+       connection.isMasterRunning();
+-    } catch (IOException e) {
+-      throw new ZooKeeperConnectionException("Can't connect to ZooKeeper", e);
+-    } catch (InterruptedException e) {
+-      throw (InterruptedIOException)
+-          new InterruptedIOException("Can't connect to ZooKeeper").initCause(e);
+-    } catch (KeeperException e) {
+-      throw new ZooKeeperConnectionException("Can't connect to ZooKeeper", e);
+     }
+   }
+ 
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Registry.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Registry.java
+index d20a4bd..412e4fa 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Registry.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Registry.java
+@@ -32,7 +32,7 @@ interface Registry {
+   /**
+    * @param connection
+    */
+-  void init(Connection connection) throws IOException;
++  void init(Connection connection);
+ 
+   /**
+    * @return Meta region location
+@@ -43,7 +43,7 @@ interface Registry {
+   /**
+    * @return Cluster id.
+    */
+-  String getClusterId() throws IOException;
++  String getClusterId();
+ 
+   /**
+    * @return Count of 'running' regionservers
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java
+index 9fca027..f38a3d3 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java
+@@ -26,6 +26,7 @@ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HRegionLocation;
+ import org.apache.hadoop.hbase.RegionLocations;
+ import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.zookeeper.MetaTableLocator;
+ import org.apache.hadoop.hbase.zookeeper.ZKClusterId;
+ import org.apache.hadoop.hbase.zookeeper.ZKUtil;
+@@ -34,6 +35,7 @@ import org.apache.zookeeper.KeeperException;
+ /**
+  * A cluster registry that stores to zookeeper.
+  */
++@InterfaceAudience.Private
+ class ZooKeeperRegistry implements Registry {
+   private static final Log LOG = LogFactory.getLog(ZooKeeperRegistry.class);
+   // Needs an instance of hci to function.  Set after construct this instance.
+@@ -50,7 +52,6 @@ class ZooKeeperRegistry implements Registry {
+   @Override
+   public RegionLocations getMetaRegionLocation() throws IOException {
+     ZooKeeperKeepAliveConnection zkw = hci.getKeepAliveZooKeeperWatcher();
+-
+     try {
+       if (LOG.isTraceEnabled()) {
+         LOG.trace("Looking up meta region location in ZK," + " connection=" + this);
+@@ -92,7 +93,7 @@ class ZooKeeperRegistry implements Registry {
+   private String clusterId = null;
+ 
+   @Override
+-  public String getClusterId() throws IOException  {
++  public String getClusterId() {
+     if (this.clusterId != null) return this.clusterId;
+     // No synchronized here, worse case we will retrieve it twice, that's
+     //  not an issue.
+@@ -105,10 +106,8 @@ class ZooKeeperRegistry implements Registry {
+       }
+     } catch (KeeperException e) {
+       LOG.warn("Can't retrieve clusterId from ZooKeeper", e);
+-      throw new IOException("ZooKeeperException ", e);
+     } catch (IOException e) {
+       LOG.warn("Can't retrieve clusterId from ZooKeeper", e);
+-      throw e;
+     } finally {
+       if (zkw != null) zkw.close();
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
+index 0c5d5f6..3fe5a90 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
+@@ -55,6 +55,19 @@ public class TableOutputFormat extends FileOutputFormat<ImmutableBytesWritable,
+     private BufferedMutator m_mutator;
+     private Connection conn;
+ 
++
++    /**
++     * Instantiate a TableRecordWriter with the HBase HClient for writing.
++     *
++     * @deprecated Please use {@code #TableRecordWriter(JobConf)}  This version does not clean up
++     * connections and will leak connections (removed in 2.0)
++     */
++    @Deprecated
++    public TableRecordWriter(final BufferedMutator mutator) throws IOException {
++      this.m_mutator = mutator;
++      this.conn = null;
++    }
++
+     /**
+      * Instantiate a TableRecordWriter with a BufferedMutator for batch writing.
+      */
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientTimeouts.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientTimeouts.java
+index 684d339..8f2a222 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientTimeouts.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientTimeouts.java
+@@ -33,8 +33,8 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.MasterNotRunningException;
+ import org.apache.hadoop.hbase.ServerName;
+-import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+ import org.apache.hadoop.hbase.ipc.AbstractRpcClient;
+ import org.apache.hadoop.hbase.ipc.RpcClientFactory;
+ import org.apache.hadoop.hbase.ipc.BlockingRpcClient;
+@@ -103,9 +103,9 @@ public class TestClientTimeouts {
+           // run some admin commands
+           HBaseAdmin.available(conf);
+           admin.setBalancerRunning(false, false);
+-        } catch (ZooKeeperConnectionException ex) {
++        } catch (MasterNotRunningException ex) {
+           // Since we are randomly throwing SocketTimeoutExceptions, it is possible to get
+-          // a ZooKeeperConnectionException.  It's a bug if we get other exceptions.
++          // a MasterNotRunningException.  It's a bug if we get other exceptions.
+           lastFailed = true;
+         } finally {
+           if(admin != null) {
+@@ -173,4 +173,4 @@ public class TestClientTimeouts {
+       return super.callBlockingMethod(md, controller, param, returnType);
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/TestShellNoCluster.java b/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/TestShellNoCluster.java
+new file mode 100644
+index 0000000..97c5a32
+--- /dev/null
++++ b/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/TestShellNoCluster.java
+@@ -0,0 +1,61 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.client;
++
++import org.apache.hadoop.hbase.testclassification.ClientTests;
++import org.apache.hadoop.hbase.testclassification.LargeTests;
++import org.jruby.embed.PathType;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++@Category({ ClientTests.class, LargeTests.class })
++public class TestShellNoCluster extends AbstractTestShell {
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    // no cluster
++    List<String> loadPaths = new ArrayList();
++    loadPaths.add("src/main/ruby");
++    loadPaths.add("src/test/ruby");
++    jruby.getProvider().setLoadPaths(loadPaths);
++    jruby.put("$TEST_CLUSTER", TEST_UTIL);
++    System.setProperty("jruby.jit.logging.verbose", "true");
++    System.setProperty("jruby.jit.logging", "true");
++    System.setProperty("jruby.native.verbose", "true");
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    // no cluster
++  }
++
++  @Test
++  public void testRunNoClusterShellTests() throws IOException {
++    // Start ruby tests without cluster
++    // System.setProperty("shell.test", "test_connection_no_cluster.rb");
++    jruby.runScriptlet(PathType.ABSOLUTE, "src/test/ruby/no_cluster_tests_runner.rb");
++  }
++
++}
+diff --git a/hbase-shell/src/test/ruby/hbase/test_connection_no_cluster.rb b/hbase-shell/src/test/ruby/hbase/test_connection_no_cluster.rb
+new file mode 100644
+index 0000000..d240ff8
+--- /dev/null
++++ b/hbase-shell/src/test/ruby/hbase/test_connection_no_cluster.rb
+@@ -0,0 +1,46 @@
++#
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++require 'shell'
++require 'stringio'
++require 'hbase_constants'
++require 'hbase/hbase'
++require 'hbase/table'
++
++include HBaseConstants
++
++module Hbase
++  class NoClusterConnectionTest < Test::Unit::TestCase
++    include TestHelpers
++
++    def setup
++      puts "starting shell"
++    end
++
++    def teardown
++      # nothing to teardown
++    end
++
++    define_test "start_hbase_shell_no_cluster" do
++      assert_nothing_raised do
++        setup_hbase
++      end
++    end
++  end
++end
+diff --git a/hbase-shell/src/test/ruby/no_cluster_tests_runner.rb b/hbase-shell/src/test/ruby/no_cluster_tests_runner.rb
+new file mode 100644
+index 0000000..542428d
+--- /dev/null
++++ b/hbase-shell/src/test/ruby/no_cluster_tests_runner.rb
+@@ -0,0 +1,89 @@
++#
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++require 'rubygems'
++require 'rake'
++require 'set'
++
++unless defined?($TEST_CLUSTER)
++  include Java
++
++  # Set logging level to avoid verboseness
++  org.apache.log4j.Logger.getRootLogger.setLevel(org.apache.log4j.Level::OFF)
++  org.apache.log4j.Logger.getLogger("org.apache.zookeeper").setLevel(org.apache.log4j.Level::OFF)
++  org.apache.log4j.Logger.getLogger("org.apache.hadoop.hdfs").setLevel(org.apache.log4j.Level::OFF)
++  org.apache.log4j.Logger.getLogger("org.apache.hadoop.hbase").setLevel(org.apache.log4j.Level::OFF)
++  org.apache.log4j.Logger.getLogger("org.apache.hadoop.ipc.HBaseServer").setLevel(org.apache.log4j.Level::OFF)
++
++  java_import org.apache.hadoop.hbase.HBaseTestingUtility
++
++  $TEST_CLUSTER = HBaseTestingUtility.new
++  $TEST_CLUSTER.configuration.setInt("hbase.regionserver.msginterval", 100)
++  $TEST_CLUSTER.configuration.setInt("hbase.client.pause", 250)
++  $TEST_CLUSTER.configuration.setInt(org.apache.hadoop.hbase.HConstants::HBASE_CLIENT_RETRIES_NUMBER, 6)
++end
++
++require 'test_helper'
++
++puts "Running tests without a cluster..."
++
++if java.lang.System.get_property('shell.test.include')
++  includes = Set.new(java.lang.System.get_property('shell.test.include').split(','))
++end
++
++if java.lang.System.get_property('shell.test.exclude')
++  excludes = Set.new(java.lang.System.get_property('shell.test.exclude').split(','))
++end
++
++files = Dir[ File.dirname(__FILE__) + "/**/*_no_cluster.rb" ]
++files.each do |file|
++  filename = File.basename(file)
++  if includes != nil && !includes.include?(filename)
++    puts "Skip #{filename} because of not included"
++    next
++  end
++  if excludes != nil && excludes.include?(filename)
++    puts "Skip #{filename} because of excluded"
++    next
++  end
++  begin
++    load(file)
++  rescue => e
++    puts "ERROR: #{e}"
++    raise
++  end
++end
++
++# If this system property is set, we'll use it to filter the test cases.
++runner_args = []
++if java.lang.System.get_property('shell.test')
++  shell_test_pattern = java.lang.System.get_property('shell.test')
++  puts "Only running tests that match #{shell_test_pattern}"
++  runner_args << "--testcase=#{shell_test_pattern}"
++end
++# first couple of args are to match the defaults, so we can pass options to limit the tests run
++if !(Test::Unit::AutoRunner.run(false, nil, runner_args))
++  raise "Shell unit tests failed. Check output file for details."
++end
++
++puts "Done with tests! Shutting down the cluster..."
++if @own_cluster
++  $TEST_CLUSTER.shutdownMiniCluster
++  java.lang.System.exit(0)
++end
+-- 
+2.10.0
+

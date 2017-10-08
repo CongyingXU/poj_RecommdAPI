@@ -1,0 +1,302 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityConstants.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityConstants.java
+index 570c203..dc3ceb2 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityConstants.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityConstants.java
+@@ -33,6 +33,7 @@ public final class VisibilityConstants {
+   /** Internal storage table for visibility labels */
+   public static final TableName LABELS_TABLE_NAME = TableName.valueOf(
+       NamespaceDescriptor.SYSTEM_NAMESPACE_NAME_STR, "labels");
++  public static final byte[] LABELS_GLOBAL_NAME = LABELS_TABLE_NAME.getName();
+ 
+   /** Family for the internal storage table for visibility labels */
+   public static final byte[] LABELS_TABLE_FAMILY = Bytes.toBytes("f");
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+index 4d22309..ee02bda 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+@@ -99,6 +99,7 @@ import org.apache.hadoop.hbase.security.AccessDeniedException;
+ import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.security.UserProvider;
+ import org.apache.hadoop.hbase.security.access.Permission.Action;
++import org.apache.hadoop.hbase.security.visibility.VisibilityConstants;
+ import org.apache.hadoop.hbase.snapshot.SnapshotDescriptionUtils;
+ import org.apache.hadoop.hbase.util.ByteRange;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -1111,31 +1112,63 @@ public class AccessController extends BaseMasterAndRegionObserver
+       @Override
+       public Void run() throws Exception {
+         UserPermission userperm = new UserPermission(Bytes.toBytes(owner),
+-          htd.getTableName(), null, Action.values());
++            htd.getTableName(), null, Action.values());
+         AccessControlLists.addUserPermission(conf, userperm);
+         return null;
+       }
+     });
+   }
+ 
++  private byte[] getReservedColumnIfMeta(byte[] tableName) {
++    if(Bytes.equals(tableName, AccessControlLists.ACL_GLOBAL_NAME))
++      return AccessControlLists.ACL_LIST_FAMILY;
++    if(Bytes.equals(tableName, VisibilityConstants.LABELS_GLOBAL_NAME))
++      return VisibilityConstants.LABELS_TABLE_FAMILY;
++    return null;
++  }
++
+   @Override
+   public void preAddColumn(ObserverContext<MasterCoprocessorEnvironment> c, TableName tableName,
+       HColumnDescriptor column) throws IOException {
++    byte[] col = getReservedColumnIfMeta(tableName.getName());
++    if (col != null) {
++      isSystemOrSuperUser(c.getEnvironment().getConfiguration());
++    }
+     requireTablePermission("addColumn", tableName, column.getName(), null, Action.ADMIN,
+         Action.CREATE);
+   }
+ 
+   @Override
+   public void preModifyColumn(ObserverContext<MasterCoprocessorEnvironment> c, TableName tableName,
+-      HColumnDescriptor descriptor) throws IOException {
+-    requirePermission("modifyColumn", tableName, descriptor.getName(), null, Action.ADMIN,
++      HColumnDescriptor column) throws IOException {
++    byte[] col = getReservedColumnIfMeta(tableName.getName());
++    if (col != null) {
++      if (Bytes.equals(col, column.getName())) {
++        String message = "Not allowed to modify " + tableName.getNameAsString() + ", family:"
++            + column.getNameAsString() + " table with AccessController installed";
++        LOG.warn(message);
++        throw new AccessDeniedException(message);
++      }
++      isSystemOrSuperUser(c.getEnvironment().getConfiguration());
++    }
++    requirePermission("modifyColumn", tableName, column.getName(), null, Action.ADMIN,
+       Action.CREATE);
+   }
+ 
+   @Override
+   public void preDeleteColumn(ObserverContext<MasterCoprocessorEnvironment> c, TableName tableName,
+-      byte[] col) throws IOException {
+-    requirePermission("deleteColumn", tableName, col, null, Action.ADMIN, Action.CREATE);
++      byte[] column) throws IOException {
++    byte[] col = getReservedColumnIfMeta(tableName.getName());
++    if(col != null) {
++      if(Bytes.equals(col, column)) {
++        String message = "Not allowed to delete " + tableName.getNameAsString() + ", family:"
++            + column.toString() + " table with AccessController installed";
++        LOG.warn(message);
++        throw new AccessDeniedException(message);
++      }
++      isSystemOrSuperUser(c.getEnvironment().getConfiguration());
++    }
++    requirePermission("deleteColumn", tableName, column, null, Action.ADMIN, Action.CREATE);
+   }
+ 
+   @Override
+@@ -1165,8 +1198,10 @@ public class AccessController extends BaseMasterAndRegionObserver
+       // even if not enforcing authorizations. We are still allowing grants and revocations,
+       // checking permissions and logging audit messages, etc. If the ACL table is not
+       // available we will fail random actions all over the place.
+-      throw new AccessDeniedException("Not allowed to disable "
+-          + AccessControlLists.ACL_TABLE_NAME + " table with AccessController installed");
++      String message = "Not allowed to disable "
++          + AccessControlLists.ACL_TABLE_NAME + " table with AccessController installed";
++      LOG.warn(message);
++      throw new AccessDeniedException(message);
+     }
+     requirePermission("disableTable", tableName, null, null, Action.ADMIN, Action.CREATE);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+index 11b9006..781643a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessController.java
+@@ -291,9 +291,9 @@ public class TestAccessController extends SecureTestUtil {
+     // Verify all table/namespace permissions are erased
+     assertEquals(0, AccessControlLists.getTablePermissions(conf, TEST_TABLE.getTableName()).size());
+     assertEquals(
+-      0,
+-      AccessControlLists.getNamespacePermissions(conf,
+-        TEST_TABLE.getTableName().getNamespaceAsString()).size());
++        0,
++        AccessControlLists.getNamespacePermissions(conf,
++            TEST_TABLE.getTableName().getNamespaceAsString()).size());
+   }
+ 
+   @Test
+@@ -324,7 +324,7 @@ public class TestAccessController extends SecureTestUtil {
+         htd.addFamily(new HColumnDescriptor(TEST_FAMILY));
+         htd.addFamily(new HColumnDescriptor("fam_" + User.getCurrent().getShortName()));
+         ACCESS_CONTROLLER.preModifyTable(ObserverContext.createAndPrepare(CP_ENV, null),
+-          TEST_TABLE.getTableName(), htd);
++            TEST_TABLE.getTableName(), htd);
+         return null;
+       }
+     };
+@@ -355,7 +355,7 @@ public class TestAccessController extends SecureTestUtil {
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER
+             .preTruncateTable(ObserverContext.createAndPrepare(CP_ENV, null),
+-              TEST_TABLE.getTableName());
++                TEST_TABLE.getTableName());
+         return null;
+       }
+     };
+@@ -371,7 +371,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preAddColumn(ObserverContext.createAndPrepare(CP_ENV, null), TEST_TABLE.getTableName(),
+-          hcd);
++            hcd);
+         return null;
+       }
+     };
+@@ -388,7 +388,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preModifyColumn(ObserverContext.createAndPrepare(CP_ENV, null),
+-          TEST_TABLE.getTableName(), hcd);
++            TEST_TABLE.getTableName(), hcd);
+         return null;
+       }
+     };
+@@ -403,7 +403,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preDeleteColumn(ObserverContext.createAndPrepare(CP_ENV, null),
+-          TEST_TABLE.getTableName(), TEST_FAMILY);
++            TEST_TABLE.getTableName(), TEST_FAMILY);
+         return null;
+       }
+     };
+@@ -467,7 +467,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preMove(ObserverContext.createAndPrepare(CP_ENV, null),
+-          hri, server, server);
++            hri, server, server);
+         return null;
+       }
+     };
+@@ -637,7 +637,7 @@ public class TestAccessController extends SecureTestUtil {
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preMerge(
+             ObserverContext.createAndPrepare(RSCP_ENV, null),
+-            regions.get(0),regions.get(1));
++            regions.get(0), regions.get(1));
+         return null;
+       }
+     };
+@@ -1372,7 +1372,7 @@ public class TestAccessController extends SecureTestUtil {
+ 
+     // revoke family level permission won't impact column level
+     revokeFromTable(TEST_UTIL, user.getShortName(),
+-      tableName, family1, qualifier);
++        tableName, family1, qualifier);
+ 
+     verifyDenied(user, getQualifierAction);
+     verifyDenied(user, putQualifierAction);
+@@ -1527,7 +1527,7 @@ public class TestAccessController extends SecureTestUtil {
+     UserPermission adminPerm = new UserPermission(Bytes.toBytes(USER_ADMIN.getShortName()),
+       AccessControlLists.ACL_TABLE_NAME, null, null, Bytes.toBytes("ACRW"));
+     assertTrue("Only user admin has permission on table _acl_ per setup",
+-      perms.size() == 1 && hasFoundUserPermission(adminPerm, perms));
++        perms.size() == 1 && hasFoundUserPermission(adminPerm, perms));
+   }
+ 
+   /** global operations */
+@@ -1774,7 +1774,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preDeleteSnapshot(ObserverContext.createAndPrepare(CP_ENV, null),
+-          snapshot);
++            snapshot);
+         return null;
+       }
+     };
+@@ -1792,7 +1792,7 @@ public class TestAccessController extends SecureTestUtil {
+       @Override
+       public Object run() throws Exception {
+         ACCESS_CONTROLLER.preCloneSnapshot(ObserverContext.createAndPrepare(CP_ENV, null),
+-          null, null);
++            null, null);
+         return null;
+       }
+     };
+@@ -2002,8 +2002,8 @@ public class TestAccessController extends SecureTestUtil {
+ 
+     // Grant TABLE ADMIN privs
+     grantOnTable(TEST_UTIL, TABLE_ADMIN.getShortName(),
+-      TEST_TABLE.getTableName(), null, null,
+-      Permission.Action.ADMIN);
++        TEST_TABLE.getTableName(), null, null,
++        Permission.Action.ADMIN);
+ 
+     AccessTestAction deleteTableAction = new AccessTestAction() {
+       @Override
+@@ -2504,4 +2504,68 @@ public class TestAccessController extends SecureTestUtil {
+     verifyAllowed(replicateLogEntriesAction, SUPERUSER, USER_ADMIN);
+     verifyDenied(replicateLogEntriesAction, USER_CREATE, USER_RW, USER_RO, USER_NONE, USER_OWNER);
+   }
++
++  @Test
++  public void testMetaTableOperations() throws Exception {
++    AccessTestAction addColumn = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        ACCESS_CONTROLLER.preAddColumn(ObserverContext.createAndPrepare(CP_ENV, null),
++            AccessControlLists.ACL_TABLE_NAME, new HColumnDescriptor(TEST_FAMILY));
++        return null;
++      }
++    };
++
++    AccessTestAction modifyReservedColumn = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        ACCESS_CONTROLLER.preModifyColumn(ObserverContext.createAndPrepare(CP_ENV, null),
++            AccessControlLists.ACL_TABLE_NAME,
++            new HColumnDescriptor(AccessControlLists.ACL_LIST_FAMILY).setMaxVersions(10));
++        return null;
++      }
++    };
++
++    AccessTestAction modifyNonReservedColumn = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        ACCESS_CONTROLLER.preModifyColumn(ObserverContext.createAndPrepare(CP_ENV, null),
++            AccessControlLists.ACL_TABLE_NAME,
++            new HColumnDescriptor(TEST_FAMILY).setMaxVersions(10));
++        return null;
++      }
++    };
++
++
++    AccessTestAction deleteReservedColumn = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        ACCESS_CONTROLLER.preDeleteColumn(ObserverContext.createAndPrepare(CP_ENV, null),
++            AccessControlLists.ACL_TABLE_NAME, AccessControlLists.ACL_LIST_FAMILY);
++        return null;
++      }
++    };
++
++    AccessTestAction deleteNonReservedColumn = new AccessTestAction() {
++      @Override
++      public Object run() throws Exception {
++        ACCESS_CONTROLLER.preDeleteColumn(ObserverContext.createAndPrepare(CP_ENV, null),
++            AccessControlLists.ACL_TABLE_NAME, TEST_FAMILY);
++        return null;
++      }
++    };
++
++    verifyAllowed(addColumn, SUPERUSER);
++    verifyDenied(addColumn, USER_ADMIN, USER_CREATE, USER_OWNER, USER_RW, USER_RO);
++
++    verifyDenied(modifyReservedColumn, SUPERUSER, USER_ADMIN, USER_CREATE,
++        USER_OWNER, USER_RW, USER_RO);
++    verifyAllowed(modifyNonReservedColumn, SUPERUSER);
++    verifyDenied(modifyNonReservedColumn, USER_ADMIN, USER_CREATE, USER_OWNER, USER_RW, USER_RO);
++
++    verifyDenied(deleteReservedColumn, SUPERUSER, USER_ADMIN, USER_CREATE,
++        USER_OWNER, USER_RW, USER_RO);
++    verifyAllowed(deleteNonReservedColumn, SUPERUSER);
++    verifyDenied(deleteNonReservedColumn, USER_ADMIN, USER_CREATE, USER_OWNER, USER_RW, USER_RO);
++  }
+ }

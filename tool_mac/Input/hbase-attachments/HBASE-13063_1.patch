@@ -1,0 +1,86 @@
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+index 2c0bd30..011b6e4 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+@@ -38,6 +38,7 @@ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.client.Durability;
++import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.BytesBytesPair;
+@@ -1101,6 +1102,9 @@ public class HTableDescriptor implements Comparable<HTableDescriptor> {
+    */
+   public HTableDescriptor setRegionMemstoreReplication(boolean memstoreReplication) {
+     setValue(REGION_MEMSTORE_REPLICATION_KEY, memstoreReplication ? TRUE : FALSE);
++    // If the memstore replication is setup, we do not have to wait for observing a flush event
++    // from primary before starting to serve reads, because gaps from replication is not applicable
++    setConfiguration(RegionReplicaUtil.REGION_REPLICA_WAIT_FOR_PRIMARY_FLUSH_CONF_KEY, "false");
+     return this;
+   }
+ 
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/RegionReplicaUtil.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/RegionReplicaUtil.java
+index 9cb0e48..c2dcbc0 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/RegionReplicaUtil.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/RegionReplicaUtil.java
+@@ -32,6 +32,19 @@ import org.apache.hadoop.hbase.util.Bytes;
+ public class RegionReplicaUtil {
+ 
+   /**
++   * Whether or not the secondary region will wait for observing a flush / region open event
++   * from the primary region via async wal replication before enabling read requests. Since replayed
++   * edits from async wal replication from primary is not persisted in WAL, the memstore of the
++   * secondary region might be non-empty at the time of close or crash. For ensuring seqId's not
++   * "going back in time" in the secondary region replica, this should be enabled. However, in some
++   * cases the above semantics might be ok for some application classes.
++   * See HBASE-11580 for more context.
++   */
++  public static final String REGION_REPLICA_WAIT_FOR_PRIMARY_FLUSH_CONF_KEY
++    = "hbase.region.replica.wait.for.primary.flush";
++  protected static final boolean DEFAULT_REGION_REPLICA_WAIT_FOR_PRIMARY_FLUSH = true;
++
++  /**
+    * The default replicaId for the region
+    */
+   static final int DEFAULT_REPLICA_ID = 0;
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 4b8939a..34c417d 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1951,9 +1951,9 @@ public class HRegionServer extends HasThread implements
+     if (ServerRegionReplicaUtil.isDefaultReplica(region.getRegionInfo())) {
+       return;
+     }
+-    if (!ServerRegionReplicaUtil.isRegionReplicaReplicationEnabled(getConfiguration()) ||
++    if (!ServerRegionReplicaUtil.isRegionReplicaReplicationEnabled(region.conf) ||
+         !ServerRegionReplicaUtil.isRegionReplicaWaitForPrimaryFlushEnabled(
+-          getConfiguration())) {
++          region.conf)) {
+       region.setReadsEnabled(true);
+       return;
+     }
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/util/ServerRegionReplicaUtil.java hbase-server/src/main/java/org/apache/hadoop/hbase/util/ServerRegionReplicaUtil.java
+index 4551722..67f8e84 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/util/ServerRegionReplicaUtil.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/util/ServerRegionReplicaUtil.java
+@@ -56,19 +56,6 @@ public class ServerRegionReplicaUtil extends RegionReplicaUtil {
+   private static final String REGION_REPLICA_REPLICATION_PEER = "region_replica_replication";
+ 
+   /**
+-   * Whether or not the secondary region will wait for observing a flush / region open event
+-   * from the primary region via async wal replication before enabling read requests. Since replayed
+-   * edits from async wal replication from primary is not persisted in WAL, the memstore of the
+-   * secondary region might be non-empty at the time of close or crash. For ensuring seqId's not
+-   * "going back in time" in the secondary region replica, this should be enabled. However, in some
+-   * cases the above semantics might be ok for some application classes.
+-   * See HBASE-11580 for more context.
+-   */
+-  public static final String REGION_REPLICA_WAIT_FOR_PRIMARY_FLUSH_CONF_KEY
+-    = "hbase.region.replica.wait.for.primary.flush";
+-  private static final boolean DEFAULT_REGION_REPLICA_WAIT_FOR_PRIMARY_FLUSH = true;
+-
+-  /**
+    * Enables or disables refreshing store files of secondary region replicas when the memory is
+    * above the global memstore lower limit. Refreshing the store files means that we will do a file
+    * list of the primary regions store files, and pick up new files. Also depending on the store

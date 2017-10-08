@@ -1,0 +1,795 @@
+From 0ac8f019cc9615f7b20141fae308fc80ee8b6df8 Mon Sep 17 00:00:00 2001
+From: chenheng <chenheng@fenbi.com>
+Date: Fri, 7 Aug 2015 15:01:43 +0800
+Subject: [PATCH] HBASE-14189 BlockCache options should consider CF Level
+ BlockCacheEnabled setting
+
+---
+ .../org/apache/hadoop/hbase/HColumnDescriptor.java |  21 +++
+ .../apache/hadoop/hbase/io/hfile/CacheConfig.java  | 196 +++++++++------------
+ .../io/encoding/TestLoadAndSwitchEncodeOnDisk.java |   2 +-
+ .../hbase/io/hfile/TestBlockCacheReporting.java    |   2 +-
+ .../hadoop/hbase/io/hfile/TestCacheConfig.java     |   3 +-
+ .../hadoop/hbase/io/hfile/TestCacheOnWrite.java    |  27 +--
+ .../io/hfile/TestForceCacheImportantBlocks.java    |   1 +
+ .../io/hfile/TestLazyDataBlockDecompression.java   |  22 ++-
+ .../apache/hadoop/hbase/io/hfile/TestPrefetch.java |   4 +-
+ .../hfile/TestScannerSelectionUsingKeyRange.java   |   1 -
+ .../regionserver/TestCacheOnWriteInSchema.java     |   8 +-
+ .../regionserver/TestCompoundBloomFilter.java      |   2 +-
+ .../hadoop/hbase/regionserver/TestStoreFile.java   |   9 +-
+ 13 files changed, 139 insertions(+), 159 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+index a22c536..5ae7a4e 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+@@ -79,10 +79,12 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+    * disabled.
+    */
+   public static final String BLOCKCACHE = "BLOCKCACHE";
++  public static final String CACHE_DATA_ON_READ = "CACHE_DATA_ON_READ";
+   public static final String CACHE_DATA_ON_WRITE = "CACHE_DATA_ON_WRITE";
+   public static final String CACHE_INDEX_ON_WRITE = "CACHE_INDEX_ON_WRITE";
+   public static final String CACHE_BLOOMS_ON_WRITE = "CACHE_BLOOMS_ON_WRITE";
+   public static final String EVICT_BLOCKS_ON_CLOSE = "EVICT_BLOCKS_ON_CLOSE";
++  public static final String CACHE_DATA_BLOCKS_COMPRESSED  = "CACHE_DATA_BLOCKS_COMPRESSED";
+   /**
+    * Key for cache data into L1 if cache is set up with more than one tier.
+    * To set in the shell, do something like this:
+@@ -183,6 +185,12 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+   public static final boolean DEFAULT_BLOCKCACHE = true;
+ 
+   /**
++   * Default setting for whether to cache data blocks on read if block caching
++   * is enabled.
++   */
++  public static final boolean DEFAULT_CACHE_DATA_ON_READ = true;
++
++  /**
+    * Default setting for whether to cache data blocks on write if block caching
+    * is enabled.
+    */
+@@ -201,6 +209,9 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+    */
+   public static final boolean DEFAULT_CACHE_INDEX_ON_WRITE = false;
+ 
++
++  public static final boolean DEFAULT_CACHE_DATA_BLOCKS_COMPRESSED = false;
++
+   /**
+    * Default size of blocks in files stored to the filesytem (hfiles).
+    */
+@@ -260,12 +271,14 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+       DEFAULT_VALUES.put(BLOCKCACHE, String.valueOf(DEFAULT_BLOCKCACHE));
+       DEFAULT_VALUES.put(KEEP_DELETED_CELLS, String.valueOf(DEFAULT_KEEP_DELETED));
+       DEFAULT_VALUES.put(DATA_BLOCK_ENCODING, String.valueOf(DEFAULT_DATA_BLOCK_ENCODING));
++      DEFAULT_VALUES.put(CACHE_DATA_ON_READ, String.valueOf(DEFAULT_CACHE_DATA_ON_READ));
+       DEFAULT_VALUES.put(CACHE_DATA_ON_WRITE, String.valueOf(DEFAULT_CACHE_DATA_ON_WRITE));
+       DEFAULT_VALUES.put(CACHE_DATA_IN_L1, String.valueOf(DEFAULT_CACHE_DATA_IN_L1));
+       DEFAULT_VALUES.put(CACHE_INDEX_ON_WRITE, String.valueOf(DEFAULT_CACHE_INDEX_ON_WRITE));
+       DEFAULT_VALUES.put(CACHE_BLOOMS_ON_WRITE, String.valueOf(DEFAULT_CACHE_BLOOMS_ON_WRITE));
+       DEFAULT_VALUES.put(EVICT_BLOCKS_ON_CLOSE, String.valueOf(DEFAULT_EVICT_BLOCKS_ON_CLOSE));
+       DEFAULT_VALUES.put(PREFETCH_BLOCKS_ON_OPEN, String.valueOf(DEFAULT_PREFETCH_BLOCKS_ON_OPEN));
++      DEFAULT_VALUES.put(CACHE_DATA_BLOCKS_COMPRESSED, String.valueOf(DEFAULT_CACHE_DATA_BLOCKS_COMPRESSED));
+       for (String s : DEFAULT_VALUES.keySet()) {
+         RESERVED_KEYWORDS.add(new Bytes(Bytes.toBytes(s)));
+       }
+@@ -809,6 +822,14 @@ public class HColumnDescriptor implements Comparable<HColumnDescriptor> {
+     return setAndGetBoolean(CACHE_DATA_ON_WRITE, DEFAULT_CACHE_DATA_ON_WRITE);
+   }
+ 
++  public boolean isCacheDataOnRead() {
++    return setAndGetBoolean(CACHE_DATA_ON_READ, DEFAULT_CACHE_DATA_ON_READ);
++  }
++
++  public boolean isCacheDataBlockCompressed() {
++    return setAndGetBoolean(CACHE_DATA_BLOCKS_COMPRESSED, DEFAULT_CACHE_DATA_BLOCKS_COMPRESSED);
++  }
++
+   /**
+    * @param value true if we should cache data blocks on write
+    * @return this (for chained invocation)
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
+index 08e9048..db6d5f7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
+@@ -44,38 +44,9 @@ import com.google.common.annotations.VisibleForTesting;
+ public class CacheConfig {
+   private static final Log LOG = LogFactory.getLog(CacheConfig.class.getName());
+ 
+-  /**
+-   * Configuration key to cache data blocks on write. There are separate
+-   * switches for bloom blocks and non-root index blocks.
+-   */
+-  public static final String CACHE_BLOCKS_ON_WRITE_KEY =
+-      "hbase.rs.cacheblocksonwrite";
++  public static final String BLOCK_CACHE_OPEN_KEY =
++          "hbase.rs.blockcacheopen";
+ 
+-  /**
+-   * Configuration key to cache leaf and intermediate-level index blocks on
+-   * write.
+-   */
+-  public static final String CACHE_INDEX_BLOCKS_ON_WRITE_KEY =
+-      "hfile.block.index.cacheonwrite";
+-
+-  /**
+-   * Configuration key to cache compound bloom filter blocks on write.
+-   */
+-  public static final String CACHE_BLOOM_BLOCKS_ON_WRITE_KEY =
+-      "hfile.block.bloom.cacheonwrite";
+-
+-  /**
+-   * Configuration key to cache data blocks in compressed and/or encrypted format.
+-   */
+-  public static final String CACHE_DATA_BLOCKS_COMPRESSED_KEY =
+-      "hbase.block.data.cachecompressed";
+-
+-  /**
+-   * Configuration key to evict all blocks of a given file from the block cache
+-   * when the file is closed.
+-   */
+-  public static final String EVICT_BLOCKS_ON_CLOSE_KEY =
+-      "hbase.rs.evictblocksonclose";
+ 
+   /**
+    * Configuration keys for Bucket cache
+@@ -112,12 +83,6 @@ public class CacheConfig {
+   public static final int DEFAULT_BUCKET_CACHE_WRITER_THREADS = 3;
+   public static final int DEFAULT_BUCKET_CACHE_WRITER_QUEUE = 64;
+ 
+- /**
+-   * Configuration key to prefetch all blocks of a given file into the block cache
+-   * when the file is opened.
+-   */
+-  public static final String PREFETCH_BLOCKS_ON_OPEN_KEY =
+-      "hbase.rs.prefetchblocksonopen";
+ 
+   /**
+    * The target block size used by blockcache instances. Defaults to
+@@ -146,18 +111,16 @@ public class CacheConfig {
+   }
+ 
+   // Defaults
+-  public static final boolean DEFAULT_CACHE_DATA_ON_READ = true;
+-  public static final boolean DEFAULT_CACHE_DATA_ON_WRITE = false;
+-  public static final boolean DEFAULT_IN_MEMORY = false;
+-  public static final boolean DEFAULT_CACHE_INDEXES_ON_WRITE = false;
+-  public static final boolean DEFAULT_CACHE_BLOOMS_ON_WRITE = false;
+-  public static final boolean DEFAULT_EVICT_ON_CLOSE = false;
+-  public static final boolean DEFAULT_CACHE_DATA_COMPRESSED = false;
+-  public static final boolean DEFAULT_PREFETCH_ON_OPEN = false;
++  public static final boolean DEFAULT_BLOCKCACHE_OPENED = true;
++
+ 
+   /** Local reference to the block cache, null if completely disabled */
+   private final BlockCache blockCache;
+ 
++
++  /** Block cache is opend on CF Level */
++  private boolean cfBlockCacheEnabled;
++
+   /**
+    * Whether blocks should be cached on read (default is on if there is a
+    * cache but this can be turned off on a per-family or per-request basis).
+@@ -167,25 +130,25 @@ public class CacheConfig {
+   private boolean cacheDataOnRead;
+ 
+   /** Whether blocks should be flagged as in-memory when being cached */
+-  private final boolean inMemory;
++  private boolean inMemory;
+ 
+   /** Whether data blocks should be cached when new files are written */
+   private boolean cacheDataOnWrite;
+ 
+   /** Whether index blocks should be cached when new files are written */
+-  private final boolean cacheIndexesOnWrite;
++  private boolean cacheIndexesOnWrite;
+ 
+   /** Whether compound bloom filter blocks should be cached on write */
+-  private final boolean cacheBloomsOnWrite;
++  private boolean cacheBloomsOnWrite;
+ 
+   /** Whether blocks of a file should be evicted when the file is closed */
+   private boolean evictOnClose;
+ 
+   /** Whether data blocks should be stored in compressed and/or encrypted form in the cache */
+-  private final boolean cacheDataCompressed;
++  private boolean cacheDataCompressed;
+ 
+   /** Whether data blocks should be prefetched into the cache */
+-  private final boolean prefetchOnOpen;
++  private boolean prefetchOnOpen;
+ 
+   /**
+    * If true and if more than one tier in this cache deploy -- e.g. CombinedBlockCache has an L1
+@@ -202,23 +165,16 @@ public class CacheConfig {
+    */
+   public CacheConfig(Configuration conf, HColumnDescriptor family) {
+     this(CacheConfig.instantiateBlockCache(conf),
+-        family.isBlockCacheEnabled(),
+-        family.isInMemory(),
+-        // For the following flags we enable them regardless of per-schema settings
+-        // if they are enabled in the global configuration.
+-        conf.getBoolean(CACHE_BLOCKS_ON_WRITE_KEY,
+-            DEFAULT_CACHE_DATA_ON_WRITE) || family.isCacheDataOnWrite(),
+-        conf.getBoolean(CACHE_INDEX_BLOCKS_ON_WRITE_KEY,
+-            DEFAULT_CACHE_INDEXES_ON_WRITE) || family.isCacheIndexesOnWrite(),
+-        conf.getBoolean(CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,
+-            DEFAULT_CACHE_BLOOMS_ON_WRITE) || family.isCacheBloomsOnWrite(),
+-        conf.getBoolean(EVICT_BLOCKS_ON_CLOSE_KEY,
+-            DEFAULT_EVICT_ON_CLOSE) || family.isEvictBlocksOnClose(),
+-        conf.getBoolean(CACHE_DATA_BLOCKS_COMPRESSED_KEY, DEFAULT_CACHE_DATA_COMPRESSED),
+-        conf.getBoolean(PREFETCH_BLOCKS_ON_OPEN_KEY,
+-            DEFAULT_PREFETCH_ON_OPEN) || family.isPrefetchBlocksOnOpen(),
+-        conf.getBoolean(HColumnDescriptor.CACHE_DATA_IN_L1,
+-            HColumnDescriptor.DEFAULT_CACHE_DATA_IN_L1) || family.isCacheDataInL1()
++            family.isBlockCacheEnabled(),
++            family.isCacheDataOnRead(),
++            family.isInMemory(),
++            family.isCacheDataOnWrite(),
++            family.isCacheIndexesOnWrite(),
++            family.isCacheBloomsOnWrite(),
++            family.isEvictBlocksOnClose(),
++            family.isCacheDataBlockCompressed(),
++            family.isPrefetchBlocksOnOpen(),
++            family.isCacheDataInL1()
+      );
+   }
+ 
+@@ -229,18 +185,7 @@ public class CacheConfig {
+    */
+   public CacheConfig(Configuration conf) {
+     this(CacheConfig.instantiateBlockCache(conf),
+-        DEFAULT_CACHE_DATA_ON_READ,
+-        DEFAULT_IN_MEMORY, // This is a family-level setting so can't be set
+-                           // strictly from conf
+-        conf.getBoolean(CACHE_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_DATA_ON_WRITE),
+-        conf.getBoolean(CACHE_INDEX_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_INDEXES_ON_WRITE),
+-        conf.getBoolean(CACHE_BLOOM_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_BLOOMS_ON_WRITE),
+-        conf.getBoolean(EVICT_BLOCKS_ON_CLOSE_KEY, DEFAULT_EVICT_ON_CLOSE),
+-        conf.getBoolean(CACHE_DATA_BLOCKS_COMPRESSED_KEY, DEFAULT_CACHE_DATA_COMPRESSED),
+-        conf.getBoolean(PREFETCH_BLOCKS_ON_OPEN_KEY, DEFAULT_PREFETCH_ON_OPEN),
+-        conf.getBoolean(HColumnDescriptor.CACHE_DATA_IN_L1,
+-          HColumnDescriptor.DEFAULT_CACHE_DATA_IN_L1)
+-     );
++            true, true, false, false, false, false,false, false, false, false);
+   }
+ 
+   /**
+@@ -259,13 +204,14 @@ public class CacheConfig {
+    * @param cacheDataInL1 If more than one cache tier deployed, if true, cache this column families
+    * data blocks up in the L1 tier.
+    */
+-  CacheConfig(final BlockCache blockCache,
++  CacheConfig(final BlockCache blockCache, final boolean cfBlockCacheOpened,
+       final boolean cacheDataOnRead, final boolean inMemory,
+       final boolean cacheDataOnWrite, final boolean cacheIndexesOnWrite,
+       final boolean cacheBloomsOnWrite, final boolean evictOnClose,
+       final boolean cacheDataCompressed, final boolean prefetchOnOpen,
+       final boolean cacheDataInL1) {
+     this.blockCache = blockCache;
++    this.cfBlockCacheEnabled = cfBlockCacheOpened;
+     this.cacheDataOnRead = cacheDataOnRead;
+     this.inMemory = inMemory;
+     this.cacheDataOnWrite = cacheDataOnWrite;
+@@ -283,7 +229,8 @@ public class CacheConfig {
+    * @param cacheConf
+    */
+   public CacheConfig(CacheConfig cacheConf) {
+-    this(cacheConf.blockCache, cacheConf.cacheDataOnRead, cacheConf.inMemory,
++    this(cacheConf.blockCache, cacheConf.cfBlockCacheEnabled,
++            cacheConf.cacheDataOnRead, cacheConf.inMemory,
+         cacheConf.cacheDataOnWrite, cacheConf.cacheIndexesOnWrite,
+         cacheConf.cacheBloomsOnWrite, cacheConf.evictOnClose,
+         cacheConf.cacheDataCompressed, cacheConf.prefetchOnOpen,
+@@ -297,6 +244,11 @@ public class CacheConfig {
+     return this.blockCache != null;
+   }
+ 
++
++  public boolean isCfBlockCacheEnabled() {
++    return isBlockCacheEnabled() && cfBlockCacheEnabled;
++  }
++
+   /**
+    * Returns the block cache.
+    * @return the block cache, or null if caching is completely disabled
+@@ -311,7 +263,7 @@ public class CacheConfig {
+    * @return true if blocks should be cached on read, false if not
+    */
+   public boolean shouldCacheDataOnRead() {
+-    return isBlockCacheEnabled() && cacheDataOnRead;
++    return isCfBlockCacheEnabled() && cacheDataOnRead;
+   }
+ 
+   /**
+@@ -320,27 +272,31 @@ public class CacheConfig {
+    * available.
+    */
+   public boolean shouldCacheBlockOnRead(BlockCategory category) {
+-    return isBlockCacheEnabled()
+-        && (cacheDataOnRead ||
+-            category == BlockCategory.INDEX ||
++    if (isCfBlockCacheEnabled()) {
++      return true;
++    }
++    if (!isBlockCacheEnabled()) {
++      return false;
++    }
++    return category == BlockCategory.INDEX ||
+             category == BlockCategory.BLOOM ||
+             (prefetchOnOpen &&
+                 (category != BlockCategory.META &&
+-                 category != BlockCategory.UNKNOWN)));
++                 category != BlockCategory.UNKNOWN));
+   }
+ 
+   /**
+    * @return true if blocks in this file should be flagged as in-memory
+    */
+   public boolean isInMemory() {
+-    return isBlockCacheEnabled() && this.inMemory;
++    return isCfBlockCacheEnabled() && this.inMemory;
+   }
+ 
+   /**
+    * @return True if cache data blocks in L1 tier (if more than one tier in block cache deploy).
+    */
+   public boolean isCacheDataInL1() {
+-    return isBlockCacheEnabled() && this.cacheDataInL1;
++    return isCfBlockCacheEnabled() && this.cacheDataInL1;
+   }
+ 
+   /**
+@@ -348,7 +304,7 @@ public class CacheConfig {
+    *         written, false if not
+    */
+   public boolean shouldCacheDataOnWrite() {
+-    return isBlockCacheEnabled() && this.cacheDataOnWrite;
++    return isCfBlockCacheEnabled() && this.cacheDataOnWrite;
+   }
+ 
+   /**
+@@ -376,7 +332,7 @@ public class CacheConfig {
+    *         is written, false if not
+    */
+   public boolean shouldCacheIndexesOnWrite() {
+-    return isBlockCacheEnabled() && this.cacheIndexesOnWrite;
++    return isCfBlockCacheEnabled() && this.cacheIndexesOnWrite;
+   }
+ 
+   /**
+@@ -384,7 +340,7 @@ public class CacheConfig {
+    *         is written, false if not
+    */
+   public boolean shouldCacheBloomsOnWrite() {
+-    return isBlockCacheEnabled() && this.cacheBloomsOnWrite;
++    return isCfBlockCacheEnabled() && this.cacheBloomsOnWrite;
+   }
+ 
+   /**
+@@ -392,7 +348,7 @@ public class CacheConfig {
+    *         reader is closed, false if not
+    */
+   public boolean shouldEvictOnClose() {
+-    return isBlockCacheEnabled() && this.evictOnClose;
++    return isCfBlockCacheEnabled() && this.evictOnClose;
+   }
+ 
+   /**
+@@ -408,14 +364,14 @@ public class CacheConfig {
+    * @return true if data blocks should be compressed in the cache, false if not
+    */
+   public boolean shouldCacheDataCompressed() {
+-    return isBlockCacheEnabled() && this.cacheDataCompressed;
++    return isCfBlockCacheEnabled() && this.cacheDataCompressed;
+   }
+ 
+   /**
+    * @return true if this {@link BlockCategory} should be compressed in blockcache, false otherwise
+    */
+   public boolean shouldCacheCompressed(BlockCategory category) {
+-    if (!isBlockCacheEnabled()) return false;
++    if (!isCfBlockCacheEnabled()) return false;
+     switch (category) {
+       case DATA:
+         return this.cacheDataCompressed;
+@@ -428,28 +384,14 @@ public class CacheConfig {
+    * @return true if blocks should be prefetched into the cache on open, false if not
+    */
+   public boolean shouldPrefetchOnOpen() {
+-    return isBlockCacheEnabled() && this.prefetchOnOpen;
++    return isCfBlockCacheEnabled() && this.prefetchOnOpen;
+   }
+ 
+   /**
+    * Return true if we may find this type of block in block cache.
+-   * <p>
+-   * TODO: today {@code family.isBlockCacheEnabled()} only means {@code cacheDataOnRead}, so here we
+-   * consider lots of other configurations such as {@code cacheDataOnWrite}. We should fix this in
+-   * the future, {@code cacheDataOnWrite} should honor the CF level {@code isBlockCacheEnabled}
+-   * configuration.
+    */
+   public boolean shouldReadBlockFromCache(BlockType blockType) {
+-    if (!isBlockCacheEnabled()) {
+-      return false;
+-    }
+-    if (cacheDataOnRead) {
+-      return true;
+-    }
+-    if (prefetchOnOpen) {
+-      return true;
+-    }
+-    if (cacheDataOnWrite) {
++    if (isCfBlockCacheEnabled()) {
+       return true;
+     }
+     if (blockType == null) {
+@@ -473,6 +415,30 @@ public class CacheConfig {
+     return shouldCacheBlockOnRead(blockType.getCategory());
+   }
+ 
++  public void setCacheDataOnRead(boolean cacheDataOnRead) {
++    this.cacheDataOnRead = cacheDataOnRead;
++  }
++
++  public void setInMemory(boolean inMemory) {
++    this.inMemory = inMemory;
++  }
++
++  public void setCacheIndexesOnWrite(boolean cacheIndexesOnWrite) {
++    this.cacheIndexesOnWrite = cacheIndexesOnWrite;
++  }
++
++  public void setCacheBloomsOnWrite(boolean cacheBloomsOnWrite) {
++    this.cacheBloomsOnWrite = cacheBloomsOnWrite;
++  }
++
++  public void setCacheDataCompressed(boolean cacheDataCompressed) {
++    this.cacheDataCompressed = cacheDataCompressed;
++  }
++
++  public void setPrefetchOnOpen(boolean prefetchOnOpen) {
++    this.prefetchOnOpen = prefetchOnOpen;
++  }
++
+   @Override
+   public String toString() {
+     if (!isBlockCacheEnabled()) {
+@@ -498,15 +464,12 @@ public class CacheConfig {
+   @VisibleForTesting
+   static BlockCache GLOBAL_BLOCK_CACHE_INSTANCE;
+ 
+-  /** Boolean whether we have disabled the block cache entirely. */
+-  @VisibleForTesting
+-  static boolean blockCacheDisabled = false;
+ 
+   static long getLruCacheSize(final Configuration conf, final MemoryUsage mu) {
+     float cachePercentage = conf.getFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY,
+       HConstants.HFILE_BLOCK_CACHE_SIZE_DEFAULT);
+     if (cachePercentage <= 0.0001f) {
+-      blockCacheDisabled = true;
++      LOG.warn("Notice: The cache percentage is low than 0.0001! init Lru cache will failed! ");
+       return -1;
+     }
+     if (cachePercentage > 1.0) {
+@@ -629,11 +592,12 @@ public class CacheConfig {
+    */
+   public static synchronized BlockCache instantiateBlockCache(Configuration conf) {
+     if (GLOBAL_BLOCK_CACHE_INSTANCE != null) return GLOBAL_BLOCK_CACHE_INSTANCE;
+-    if (blockCacheDisabled) return null;
++    boolean blockCacheOpened = conf.getBoolean(BLOCK_CACHE_OPEN_KEY, DEFAULT_BLOCKCACHE_OPENED);
++    if (!blockCacheOpened) return null;
+     MemoryUsage mu = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+     LruBlockCache l1 = getL1(conf, mu);
+     // blockCacheDisabled is set as a side-effect of getL1(), so check it again after the call.
+-    if (blockCacheDisabled) return null;
++    if (l1 == null) return null;
+     BlockCache l2 = getL2(conf, mu);
+     if (l2 == null) {
+       GLOBAL_BLOCK_CACHE_INSTANCE = l1;
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestLoadAndSwitchEncodeOnDisk.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestLoadAndSwitchEncodeOnDisk.java
+index a7cb4a3..dbe2268 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestLoadAndSwitchEncodeOnDisk.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/encoding/TestLoadAndSwitchEncodeOnDisk.java
+@@ -63,7 +63,6 @@ public class TestLoadAndSwitchEncodeOnDisk extends
+ 
+   public TestLoadAndSwitchEncodeOnDisk() {
+     super(USE_MULTI_PUT, DataBlockEncoding.PREFIX);
+-    conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, true);
+   }
+ 
+   protected int numKeys() {
+@@ -78,6 +77,7 @@ public class TestLoadAndSwitchEncodeOnDisk extends
+     super.loadTest();
+ 
+     HColumnDescriptor hcd = getColumnDesc(admin);
++    hcd.setCacheDataOnWrite(true);
+     System.err.println("\nDisabling encode-on-disk. Old column descriptor: " + hcd + "\n");
+     Table t = TEST_UTIL.getConnection().getTable(TABLE);
+     assertAllOnLine(t);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestBlockCacheReporting.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestBlockCacheReporting.java
+index 4080249..53a135c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestBlockCacheReporting.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestBlockCacheReporting.java
+@@ -96,9 +96,9 @@ public class TestBlockCacheReporting {
+ 
+   @Test
+   public void testLruBlockCache() throws JsonGenerationException, JsonMappingException, IOException {
++    conf.setBoolean(CacheConfig.BLOCK_CACHE_OPEN_KEY, true);
+     CacheConfig cc = new CacheConfig(this.conf);
+     assertTrue(cc.isBlockCacheEnabled());
+-    assertTrue(CacheConfig.DEFAULT_IN_MEMORY == cc.isInMemory());
+     assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+     logPerBlock(cc.getBlockCache());
+     addDataAndHits(cc.getBlockCache(), 3);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheConfig.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheConfig.java
+index 959cf4d..827dbb2 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheConfig.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheConfig.java
+@@ -176,7 +176,6 @@ public class TestCacheConfig {
+   void basicBlockCacheOps(final CacheConfig cc, final boolean doubling,
+       final boolean sizing) {
+     assertTrue(cc.isBlockCacheEnabled());
+-    assertTrue(CacheConfig.DEFAULT_IN_MEMORY == cc.isInMemory());
+     BlockCache bc = cc.getBlockCache();
+     BlockCacheKey bck = new BlockCacheKey("f", 0);
+     Cacheable c = new DataCacheEntry();
+@@ -215,7 +214,7 @@ public class TestCacheConfig {
+   public void testCacheConfigDefaultLRUBlockCache() {
+     CacheConfig cc = new CacheConfig(this.conf);
+     assertTrue(cc.isBlockCacheEnabled());
+-    assertTrue(CacheConfig.DEFAULT_IN_MEMORY == cc.isInMemory());
++    assertTrue(false == cc.isInMemory());
+     basicBlockCacheOps(cc, false, true);
+     assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheOnWrite.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheOnWrite.java
+index 5823dfb..67f03de 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheOnWrite.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestCacheOnWrite.java
+@@ -109,38 +109,30 @@ public class TestCacheOnWrite {
+       KeyValue.Type.values().length - 2;
+ 
+   private static enum CacheOnWriteType {
+-    DATA_BLOCKS(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY,
++    DATA_BLOCKS(
+         BlockType.DATA, BlockType.ENCODED_DATA),
+-    BLOOM_BLOCKS(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,
++    BLOOM_BLOCKS(
+         BlockType.BLOOM_CHUNK),
+-    INDEX_BLOCKS(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY,
++    INDEX_BLOCKS(
+         BlockType.LEAF_INDEX, BlockType.INTERMEDIATE_INDEX);
+ 
+-    private final String confKey;
+     private final BlockType blockType1;
+     private final BlockType blockType2;
+ 
+-    private CacheOnWriteType(String confKey, BlockType blockType) {
+-      this(confKey, blockType, blockType);
++    private CacheOnWriteType(BlockType blockType) {
++      this(blockType, blockType);
+     }
+ 
+-    private CacheOnWriteType(String confKey, BlockType blockType1,
++    private CacheOnWriteType(BlockType blockType1,
+         BlockType blockType2) {
+       this.blockType1 = blockType1;
+       this.blockType2 = blockType2;
+-      this.confKey = confKey;
++
+     }
+ 
+     public boolean shouldBeCached(BlockType blockType) {
+       return blockType == blockType1 || blockType == blockType2;
+     }
+-
+-    public void modifyConf(Configuration conf) {
+-      for (CacheOnWriteType cowType : CacheOnWriteType.values()) {
+-        conf.setBoolean(cowType.confKey, cowType == this);
+-      }
+-    }
+-
+   }
+ 
+   private static final DataBlockEncoding ENCODING_ALGO =
+@@ -249,12 +241,11 @@ public class TestCacheOnWrite {
+     conf.setInt(HFileBlockIndex.MAX_CHUNK_SIZE_KEY, INDEX_BLOCK_SIZE);
+     conf.setInt(BloomFilterFactory.IO_STOREFILE_BLOOM_BLOCK_SIZE,
+         BLOOM_BLOCK_SIZE);
+-    conf.setBoolean(CacheConfig.CACHE_DATA_BLOCKS_COMPRESSED_KEY, cacheCompressedData);
+-    cowType.modifyConf(conf);
++
+     fs = HFileSystem.get(conf);
+     CacheConfig.GLOBAL_BLOCK_CACHE_INSTANCE = blockCache;
+     cacheConf =
+-        new CacheConfig(blockCache, true, true, cowType.shouldBeCached(BlockType.DATA),
++        new CacheConfig(blockCache, true, true, true, cowType.shouldBeCached(BlockType.DATA),
+         cowType.shouldBeCached(BlockType.LEAF_INDEX),
+         cowType.shouldBeCached(BlockType.BLOOM_CHUNK), false, cacheCompressedData, false, false);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestForceCacheImportantBlocks.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestForceCacheImportantBlocks.java
+index cf2aca5..1896fcc 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestForceCacheImportantBlocks.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestForceCacheImportantBlocks.java
+@@ -90,6 +90,7 @@ public class TestForceCacheImportantBlocks {
+   public TestForceCacheImportantBlocks(int hfileVersion, boolean cfCacheEnabled) {
+     this.hfileVersion = hfileVersion;
+     this.cfCacheEnabled = cfCacheEnabled;
++    System.out.println(hfileVersion+ "," + cfCacheEnabled);
+     TEST_UTIL.getConfiguration().setInt(HFile.FORMAT_VERSION_KEY, hfileVersion);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestLazyDataBlockDecompression.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestLazyDataBlockDecompression.java
+index 0067417..ee4c1b6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestLazyDataBlockDecompression.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestLazyDataBlockDecompression.java
+@@ -146,13 +146,15 @@ public class TestLazyDataBlockDecompression {
+ 
+     // setup cache with lazy-decompression disabled.
+     Configuration lazyCompressDisabled = HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+-    lazyCompressDisabled.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressDisabled.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressDisabled.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressDisabled.setBoolean(CacheConfig.CACHE_DATA_BLOCKS_COMPRESSED_KEY, false);
++
+     CacheConfig.GLOBAL_BLOCK_CACHE_INSTANCE =
+       new LruBlockCache(maxSize, HConstants.DEFAULT_BLOCKSIZE, false, lazyCompressDisabled);
+     CacheConfig cc = new CacheConfig(lazyCompressDisabled);
++    cc.setCacheDataOnWrite(cacheOnWrite);
++    cc.setCacheBloomsOnWrite(cacheOnWrite);
++    cc.setCacheIndexesOnWrite(cacheOnWrite);
++    cc.setCacheDataCompressed(false);
++
+     assertFalse(cc.shouldCacheDataCompressed());
+     assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+     LruBlockCache disabledBlockCache = (LruBlockCache) cc.getBlockCache();
+@@ -166,9 +168,10 @@ public class TestLazyDataBlockDecompression {
+     // 2000 kv's is ~3.6 full unencoded data blocks.
+     // Requires a conf and CacheConfig but should not be specific to this instance's cache settings
+     writeHFile(lazyCompressDisabled, cc, fs, hfilePath, context, 2000);
+-
++    LOG.info("disabledBlockCache=" + disabledBlockCache);
+     // populate the cache
+     cacheBlocks(lazyCompressDisabled, cc, fs, hfilePath, context);
++    LOG.info("disabledBlockCache=" + disabledBlockCache);
+     long disabledBlockCount = disabledBlockCache.getBlockCount();
+     assertTrue("blockcache should contain blocks. disabledBlockCount=" + disabledBlockCount,
+       disabledBlockCount > 0);
+@@ -181,13 +184,14 @@ public class TestLazyDataBlockDecompression {
+ 
+     // count blocks with lazy decompression
+     Configuration lazyCompressEnabled = HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+-    lazyCompressEnabled.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressEnabled.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressEnabled.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY, cacheOnWrite);
+-    lazyCompressEnabled.setBoolean(CacheConfig.CACHE_DATA_BLOCKS_COMPRESSED_KEY, true);
++
+     CacheConfig.GLOBAL_BLOCK_CACHE_INSTANCE =
+       new LruBlockCache(maxSize, HConstants.DEFAULT_BLOCKSIZE, false, lazyCompressEnabled);
+     cc = new CacheConfig(lazyCompressEnabled);
++    cc.setCacheDataOnWrite(cacheOnWrite);
++    cc.setCacheBloomsOnWrite(cacheOnWrite);
++    cc.setCacheIndexesOnWrite(cacheOnWrite);
++    cc.setCacheDataCompressed(true);
+     assertTrue("test improperly configured.", cc.shouldCacheDataCompressed());
+     assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+     LruBlockCache enabledBlockCache = (LruBlockCache) cc.getBlockCache();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestPrefetch.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestPrefetch.java
+index 053a27e..a9cb39e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestPrefetch.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestPrefetch.java
+@@ -54,10 +54,10 @@ public class TestPrefetch {
+   @Before
+   public void setUp() throws IOException {
+     conf = TEST_UTIL.getConfiguration();
+-    conf.setBoolean(CacheConfig.PREFETCH_BLOCKS_ON_OPEN_KEY, true);
+     fs = HFileSystem.get(conf);
+-    CacheConfig.blockCacheDisabled = false;
++    conf.setBoolean(CacheConfig.BLOCK_CACHE_OPEN_KEY, true);
+     cacheConf = new CacheConfig(conf);
++    cacheConf.setPrefetchOnOpen(true);
+   }
+ 
+   @Test(timeout=60000)
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestScannerSelectionUsingKeyRange.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestScannerSelectionUsingKeyRange.java
+index 7584cf2..a8b9147 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestScannerSelectionUsingKeyRange.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestScannerSelectionUsingKeyRange.java
+@@ -115,7 +115,6 @@ public class TestScannerSelectionUsingKeyRange {
+     }
+ 
+     Scan scan = new Scan(Bytes.toBytes("aaa"), Bytes.toBytes("aaz"));
+-    CacheConfig.blockCacheDisabled = false;
+     CacheConfig cacheConf = new CacheConfig(conf);
+     LruBlockCache cache = (LruBlockCache) cacheConf.getBlockCache();
+     cache.clearCache();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
+index b7ebd23..2c8243d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCacheOnWriteInSchema.java
+@@ -151,15 +151,15 @@ public class TestCacheOnWriteInSchema {
+ 
+     conf = TEST_UTIL.getConfiguration();
+     conf.setInt(HFile.FORMAT_VERSION_KEY, HFile.MAX_FORMAT_VERSION);
+-    conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, false);
+-    conf.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY, false);
+-    conf.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY, false);
+-
+     fs = HFileSystem.get(conf);
+ 
+     // Create the schema
+     HColumnDescriptor hcd = new HColumnDescriptor(family);
+     hcd.setBloomFilterType(BloomType.ROWCOL);
++    hcd.setCacheDataOnWrite(false);
++    hcd.setCacheIndexesOnWrite(false);
++    hcd.setCacheBloomsOnWrite(false);
++
+     cowType.modifyFamilySchema(hcd);
+     HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(table));
+     htd.addFamily(hcd);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompoundBloomFilter.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompoundBloomFilter.java
+index 5b86169..2bce692 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompoundBloomFilter.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompoundBloomFilter.java
+@@ -294,8 +294,8 @@ public class TestCompoundBloomFilter {
+       throws IOException {
+     conf.setInt(BloomFilterFactory.IO_STOREFILE_BLOOM_BLOCK_SIZE,
+         BLOOM_BLOCK_SIZES[t]);
+-    conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, true);
+     cacheConf = new CacheConfig(conf);
++    cacheConf.setCacheDataOnWrite(true);
+     HFileContext meta = new HFileContextBuilder().withBlockSize(BLOCK_SIZES[t]).build();
+     StoreFile.Writer w = new StoreFile.WriterBuilder(conf, cacheConf, fs)
+             .withOutputDir(TEST_UTIL.getDataTestDir())
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+index b763a22..3d98828 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+@@ -852,8 +852,9 @@ public class TestStoreFile extends HBaseTestCase {
+     long startEvicted = cs.getEvictedCount();
+ 
+     // Let's write a StoreFile with three blocks, with cache on write off
+-    conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, false);
++
+     CacheConfig cacheConf = new CacheConfig(conf);
++    cacheConf.setCacheDataOnWrite(false);
+     Path pathCowOff = new Path(baseDir, "123456789");
+     StoreFile.Writer writer = writeStoreFile(conf, cacheConf, pathCowOff, 3);
+     StoreFile hsf = new StoreFile(this.fs, writer.getPath(), conf, cacheConf,
+@@ -874,8 +875,8 @@ public class TestStoreFile extends HBaseTestCase {
+     reader.close(cacheConf.shouldEvictOnClose());
+ 
+     // Now write a StoreFile with three blocks, with cache on write on
+-    conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY, true);
+     cacheConf = new CacheConfig(conf);
++    cacheConf.setCacheDataOnWrite(true);
+     Path pathCowOn = new Path(baseDir, "123456788");
+     writer = writeStoreFile(conf, cacheConf, pathCowOn, 3);
+     hsf = new StoreFile(this.fs, writer.getPath(), conf, cacheConf,
+@@ -931,8 +932,8 @@ public class TestStoreFile extends HBaseTestCase {
+     readerTwo.close(cacheConf.shouldEvictOnClose());
+ 
+     // Let's close the first file with evict on close turned on
+-    conf.setBoolean("hbase.rs.evictblocksonclose", true);
+     cacheConf = new CacheConfig(conf);
++    cacheConf.setEvictOnClose(true);
+     hsf = new StoreFile(this.fs, pathCowOff, conf, cacheConf,
+       BloomType.NONE);
+     reader = hsf.createReader();
+@@ -945,8 +946,8 @@ public class TestStoreFile extends HBaseTestCase {
+     startEvicted += 3;
+ 
+     // Let's close the second file with evict on close turned off
+-    conf.setBoolean("hbase.rs.evictblocksonclose", false);
+     cacheConf = new CacheConfig(conf);
++    cacheConf.setEvictOnClose(false);
+     hsf = new StoreFile(this.fs, pathCowOn, conf, cacheConf,
+       BloomType.NONE);
+     reader = hsf.createReader();
+-- 
+1.9.3 (Apple Git-50)
+

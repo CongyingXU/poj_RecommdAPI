@@ -1,0 +1,932 @@
+From aa23d20ddf3ba9fdd665908ee818e8ef468047cc Mon Sep 17 00:00:00 2001
+From: Andrew Purtell <apurtell@apache.org>
+Date: Thu, 2 Oct 2014 18:43:26 -0700
+Subject: [PATCH] HBASE-11907 Use the joni byte[] regex engine in place of
+ j.u.regex
+
+---
+ hbase-client/pom.xml                               |   4 +
+ .../hadoop/hbase/filter/RegexStringComparator.java | 309 ++++++++++++++++++---
+ .../hbase/protobuf/generated/ComparatorProtos.java | 177 +++++++++++-
+ hbase-protocol/src/main/protobuf/Comparator.proto  |   1 +
+ .../hadoop/hbase/filter/TestRegexComparator.java   | 197 +++++++++++++
+ pom.xml                                            |   6 +
+ 6 files changed, 653 insertions(+), 41 deletions(-)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestRegexComparator.java
+
+diff --git a/hbase-client/pom.xml b/hbase-client/pom.xml
+index 49be81c..60b39e6 100644
+--- a/hbase-client/pom.xml
++++ b/hbase-client/pom.xml
+@@ -135,6 +135,10 @@
+       <artifactId>jackson-mapper-asl</artifactId>
+     </dependency>
+     <dependency>
++      <groupId>org.jruby.joni</groupId>
++      <artifactId>joni</artifactId>
++    </dependency>
++    <dependency>
+       <groupId>log4j</groupId>
+       <artifactId>log4j</artifactId>
+       <scope>test</scope>
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/filter/RegexStringComparator.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/filter/RegexStringComparator.java
+index 9f50621..6e4f7d0 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/filter/RegexStringComparator.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/filter/RegexStringComparator.java
+@@ -19,19 +19,27 @@
+ package org.apache.hadoop.hbase.filter;
+ 
+ import com.google.protobuf.InvalidProtocolBufferException;
++
++import java.nio.charset.Charset;
++import java.nio.charset.IllegalCharsetNameException;
++import java.util.Arrays;
++import java.util.regex.Pattern;
++
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+-import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.protobuf.generated.ComparatorProtos;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+-import java.nio.charset.Charset;
+-import java.nio.charset.IllegalCharsetNameException;
+-import java.util.Arrays;
+-import java.util.regex.Pattern;
++import org.jcodings.Encoding;
++import org.jcodings.EncodingDB;
++import org.jcodings.specific.UTF8Encoding;
++import org.joni.Matcher;
++import org.joni.Option;
++import org.joni.Regex;
++import org.joni.Syntax;
+ 
+ /**
+  * This comparator is for use with {@link CompareFilter} implementations, such
+@@ -69,9 +77,13 @@ public class RegexStringComparator extends ByteArrayComparable {
+ 
+   private static final Log LOG = LogFactory.getLog(RegexStringComparator.class);
+ 
+-  private Charset charset = HConstants.UTF8_CHARSET;
++  private Engine engine;
+ 
+-  private Pattern pattern;
++  /** Engine implementation type (default=JAVA) */
++  public enum EngineType {
++    JAVA,
++    JONI
++  }
+ 
+   /**
+    * Constructor
+@@ -84,12 +96,39 @@ public class RegexStringComparator extends ByteArrayComparable {
+ 
+   /**
+    * Constructor
++   * Adds Pattern.DOTALL to the underlying Pattern
++   * @param expr a valid regular expression
++   * @param engine engine implementation type
++   */
++  public RegexStringComparator(String expr, EngineType engine) {
++    this(expr, Pattern.DOTALL, engine);
++  }
++
++  /**
++   * Constructor
+    * @param expr a valid regular expression
+    * @param flags java.util.regex.Pattern flags
+    */
+   public RegexStringComparator(String expr, int flags) {
++    this(expr, flags, EngineType.JAVA);
++  }
++
++  /**
++   * Constructor
++   * @param expr a valid regular expression
++   * @param flags java.util.regex.Pattern flags
++   * @param engine engine implementation type
++   */
++  public RegexStringComparator(String expr, int flags, EngineType engine) {
+     super(Bytes.toBytes(expr));
+-    this.pattern = Pattern.compile(expr, flags);
++    switch (engine) {
++      case JAVA:
++        this.engine = new JavaRegexEngine(expr, flags);
++        break;
++      case JONI:
++        this.engine = new JoniRegexEngine(expr, flags);
++        break;
++    }
+   }
+ 
+   /**
+@@ -104,34 +143,19 @@ public class RegexStringComparator extends ByteArrayComparable {
+    * @param charset The charset to use.
+    */
+   public void setCharset(final Charset charset) {
+-    this.charset = charset;
++    engine.setCharset(charset.name());
+   }
+ 
+   @Override
+   public int compareTo(byte[] value, int offset, int length) {
+-    // Use find() for subsequence match instead of matches() (full sequence
+-    // match) to adhere to the principle of least surprise.
+-    String tmp;
+-    if (length < value.length / 2) {
+-      // See HBASE-9428. Make a copy of the relevant part of the byte[],
+-      // or the JDK will copy the entire byte[] during String decode
+-      tmp = new String(Arrays.copyOfRange(value, offset, offset + length), charset);
+-    } else {
+-      tmp = new String(value, offset, length, charset);
+-    }
+-    return pattern.matcher(tmp).find() ? 0 : 1;
++    return engine.compareTo(value, offset, length);
+   }
+ 
+   /**
+    * @return The comparator serialized using pb
+    */
+   public byte [] toByteArray() {
+-    ComparatorProtos.RegexStringComparator.Builder builder =
+-      ComparatorProtos.RegexStringComparator.newBuilder();
+-    builder.setPattern(pattern.toString());
+-    builder.setPatternFlags(pattern.flags());
+-    builder.setCharset(charset.name());
+-    return builder.build().toByteArray();
++    return engine.toByteArray();
+   }
+ 
+   /**
+@@ -148,13 +172,18 @@ public class RegexStringComparator extends ByteArrayComparable {
+     } catch (InvalidProtocolBufferException e) {
+       throw new DeserializationException(e);
+     }
+-
+-    RegexStringComparator comparator =
+-      new RegexStringComparator(proto.getPattern(), proto.getPatternFlags());
+-    final String charset = proto.getCharset();
++    RegexStringComparator comparator;
++    if (proto.hasEngine()) {
++      EngineType engine = EngineType.valueOf(proto.getEngine());
++      comparator = new RegexStringComparator(proto.getPattern(), proto.getPatternFlags(),
++        engine);      
++    } else {
++      comparator = new RegexStringComparator(proto.getPattern(), proto.getPatternFlags());
++    }
++    String charset = proto.getCharset();
+     if (charset.length() > 0) {
+       try {
+-        comparator.setCharset(Charset.forName(charset));
++        comparator.getEngine().setCharset(charset);
+       } catch (IllegalCharsetNameException e) {
+         LOG.error("invalid charset", e);
+       }
+@@ -170,11 +199,221 @@ public class RegexStringComparator extends ByteArrayComparable {
+   boolean areSerializedFieldsEqual(ByteArrayComparable other) {
+     if (other == this) return true;
+     if (!(other instanceof RegexStringComparator)) return false;
+-
+     RegexStringComparator comparator = (RegexStringComparator)other;
+     return super.areSerializedFieldsEqual(comparator)
+-      && this.pattern.toString().equals(comparator.pattern.toString())
+-      && this.pattern.flags() == comparator.pattern.flags()
+-      && this.charset.equals(comparator.charset);
++      && engine.getClass().isInstance(comparator.getEngine())
++      && engine.getPattern().equals(comparator.getEngine().getPattern())
++      && engine.getFlags() == comparator.getEngine().getFlags()
++      && engine.getCharset().equals(comparator.getEngine().getCharset());
++  }
++
++  Engine getEngine() {
++    return engine;
++  }
++
++  /**
++   * This is an internal interface for abstracting access to different regular
++   * expression matching engines. 
++   */
++  static interface Engine {
++    /**
++     * Returns the string representation of the configured regular expression
++     * for matching
++     */
++    String getPattern();
++    
++    /**
++     * Returns the set of configured match flags, a bit mask that may include
++     * {@link Pattern} flags
++     */
++    int getFlags();
++
++    /**
++     * Returns the name of the configured charset
++     */
++    String getCharset();
++
++    /**
++     * Set the charset used when matching
++     * @param charset the name of the desired charset for matching
++     */
++    void setCharset(final String charset);
++
++    /**
++     * Return the serialized form of the configured matcher
++     */
++    byte [] toByteArray();
++
++    /**
++     * Match the given input against the configured pattern
++     * @param value the data to be matched
++     * @param offset offset of the data to be matched
++     * @param length length of the data to be matched
++     * @return 0 if a match was made, 1 otherwise
++     */
++    int compareTo(byte[] value, int offset, int length);
++  }
++
++  /**
++   * Implementation of the Engine interface using Java's Pattern.
++   * <p>
++   * This is the default engine.
++   */
++  static class JavaRegexEngine implements Engine {
++    private Charset charset = Charset.forName("UTF-8");
++    private Pattern pattern;
++
++    public JavaRegexEngine(String regex, int flags) {
++      this.pattern = Pattern.compile(regex, flags);
++    }
++
++    @Override
++    public String getPattern() {
++      return pattern.toString();
++    }
++
++    @Override
++    public int getFlags() {
++      return pattern.flags();
++    }
++
++    @Override
++    public String getCharset() {
++      return charset.name();
++    }
++
++    @Override
++    public void setCharset(String charset) {
++      this.charset = Charset.forName(charset);
++    }
++
++    @Override
++    public int compareTo(byte[] value, int offset, int length) {
++      // Use find() for subsequence match instead of matches() (full sequence
++      // match) to adhere to the principle of least surprise.
++      String tmp;
++      if (length < value.length / 2) {
++        // See HBASE-9428. Make a copy of the relevant part of the byte[],
++        // or the JDK will copy the entire byte[] during String decode
++        tmp = new String(Arrays.copyOfRange(value, offset, offset + length), charset);
++      } else {
++        tmp = new String(value, offset, length, charset);
++      }
++      return pattern.matcher(tmp).find() ? 0 : 1;
++    }
++
++    @Override
++    public byte[] toByteArray() {
++      ComparatorProtos.RegexStringComparator.Builder builder =
++          ComparatorProtos.RegexStringComparator.newBuilder();
++      builder.setPattern(pattern.pattern());
++      builder.setPatternFlags(pattern.flags());
++      builder.setCharset(charset.name());
++      builder.setEngine(EngineType.JAVA.name());
++      return builder.build().toByteArray();
++    }
++  }
++
++  /**
++   * Implementation of the Engine interface using Jruby's joni regex engine.
++   * <p>
++   * This engine operates on byte arrays directly so is expected to be more GC
++   * friendly, and reportedly is twice as fast as Java's Pattern engine.
++   * <p>
++   * NOTE: Only the {@link Pattern} flags CASE_INSENSITIVE, DOTALL, and
++   * MULTILINE are supported.
++   */
++  static class JoniRegexEngine implements Engine {
++    private Encoding encoding = UTF8Encoding.INSTANCE;
++    private String regex;
++    private Regex pattern;
++
++    public JoniRegexEngine(String regex, int flags) {
++      this.regex = regex;
++      byte[] b = Bytes.toBytes(regex);
++      this.pattern = new Regex(b, 0, b.length, patternToJoniFlags(flags), encoding, Syntax.Java);
++    }
++
++    @Override
++    public String getPattern() {
++      return regex;
++    }
++
++    @Override
++    public int getFlags() {
++      return pattern.getOptions();
++    }
++
++    @Override
++    public String getCharset() {
++      return encoding.getCharsetName();
++    }
++
++    @Override
++    public void setCharset(String name) {
++      setEncoding(name);
++    }
++
++    @Override
++    public int compareTo(byte[] value, int offset, int length) {
++      // Use subsequence match instead of full sequence match to adhere to the
++      // principle of least surprise.
++      Matcher m = pattern.matcher(value);
++      return m.search(offset, length, pattern.getOptions()) < 0 ? 1 : 0;
++    }
++
++    @Override
++    public byte[] toByteArray() {
++      ComparatorProtos.RegexStringComparator.Builder builder =
++          ComparatorProtos.RegexStringComparator.newBuilder();
++        builder.setPattern(regex);
++        builder.setPatternFlags(joniToPatternFlags(pattern.getOptions()));
++        builder.setCharset(encoding.getCharsetName());
++        builder.setEngine(EngineType.JONI.name());
++        return builder.build().toByteArray();
++    }
++
++    private int patternToJoniFlags(int flags) {
++      int newFlags = 0;
++      if ((flags & Pattern.CASE_INSENSITIVE) != 0) {
++        newFlags |= Option.IGNORECASE;
++      }
++      if ((flags & Pattern.DOTALL) != 0) {
++        // This does NOT mean Pattern.MULTILINE
++        newFlags |= Option.MULTILINE;
++      }
++      if ((flags & Pattern.MULTILINE) != 0) {
++        // This is what Java 8's Nashorn engine does when using joni and
++        // translating Pattern's MULTILINE flag
++        newFlags &= ~Option.SINGLELINE;
++        newFlags |= Option.NEGATE_SINGLELINE;
++      }
++      return newFlags;
++    }
++
++    private int joniToPatternFlags(int flags) {
++      int newFlags = 0;
++      if ((flags & Option.IGNORECASE) != 0) {
++        newFlags |= Pattern.CASE_INSENSITIVE;
++      }
++      // This does NOT mean Pattern.MULTILINE, this is equivalent to Pattern.DOTALL
++      if ((flags & Option.MULTILINE) != 0) {
++        newFlags |= Pattern.DOTALL;
++      }
++      // This means Pattern.MULTILINE. Nice
++      if ((flags & Option.NEGATE_SINGLELINE) != 0) {
++        newFlags |= Pattern.MULTILINE;
++      }
++      return newFlags;
++    }
++
++    private void setEncoding(String name) {
++      EncodingDB.Entry e = EncodingDB.getEncodings().get(Bytes.toBytes(name));
++      if (e != null) {
++        encoding = e.getEncoding();
++      } else {
++        throw new IllegalCharsetNameException(name);
++      }    
++    }
+   }
+ }
+diff --git a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ComparatorProtos.java b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ComparatorProtos.java
+index a12d0ff..d4b850e 100644
+--- a/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ComparatorProtos.java
++++ b/hbase-protocol/src/main/java/org/apache/hadoop/hbase/protobuf/generated/ComparatorProtos.java
+@@ -3292,6 +3292,21 @@ public final class ComparatorProtos {
+      */
+     com.google.protobuf.ByteString
+         getCharsetBytes();
++
++    // optional string engine = 4;
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    boolean hasEngine();
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    java.lang.String getEngine();
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    com.google.protobuf.ByteString
++        getEngineBytes();
+   }
+   /**
+    * Protobuf type {@code RegexStringComparator}
+@@ -3359,6 +3374,11 @@ public final class ComparatorProtos {
+               charset_ = input.readBytes();
+               break;
+             }
++            case 34: {
++              bitField0_ |= 0x00000008;
++              engine_ = input.readBytes();
++              break;
++            }
+           }
+         }
+       } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -3501,10 +3521,54 @@ public final class ComparatorProtos {
+       }
+     }
+ 
++    // optional string engine = 4;
++    public static final int ENGINE_FIELD_NUMBER = 4;
++    private java.lang.Object engine_;
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    public boolean hasEngine() {
++      return ((bitField0_ & 0x00000008) == 0x00000008);
++    }
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    public java.lang.String getEngine() {
++      java.lang.Object ref = engine_;
++      if (ref instanceof java.lang.String) {
++        return (java.lang.String) ref;
++      } else {
++        com.google.protobuf.ByteString bs = 
++            (com.google.protobuf.ByteString) ref;
++        java.lang.String s = bs.toStringUtf8();
++        if (bs.isValidUtf8()) {
++          engine_ = s;
++        }
++        return s;
++      }
++    }
++    /**
++     * <code>optional string engine = 4;</code>
++     */
++    public com.google.protobuf.ByteString
++        getEngineBytes() {
++      java.lang.Object ref = engine_;
++      if (ref instanceof java.lang.String) {
++        com.google.protobuf.ByteString b = 
++            com.google.protobuf.ByteString.copyFromUtf8(
++                (java.lang.String) ref);
++        engine_ = b;
++        return b;
++      } else {
++        return (com.google.protobuf.ByteString) ref;
++      }
++    }
++
+     private void initFields() {
+       pattern_ = "";
+       patternFlags_ = 0;
+       charset_ = "";
++      engine_ = "";
+     }
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+@@ -3539,6 +3603,9 @@ public final class ComparatorProtos {
+       if (((bitField0_ & 0x00000004) == 0x00000004)) {
+         output.writeBytes(3, getCharsetBytes());
+       }
++      if (((bitField0_ & 0x00000008) == 0x00000008)) {
++        output.writeBytes(4, getEngineBytes());
++      }
+       getUnknownFields().writeTo(output);
+     }
+ 
+@@ -3560,6 +3627,10 @@ public final class ComparatorProtos {
+         size += com.google.protobuf.CodedOutputStream
+           .computeBytesSize(3, getCharsetBytes());
+       }
++      if (((bitField0_ & 0x00000008) == 0x00000008)) {
++        size += com.google.protobuf.CodedOutputStream
++          .computeBytesSize(4, getEngineBytes());
++      }
+       size += getUnknownFields().getSerializedSize();
+       memoizedSerializedSize = size;
+       return size;
+@@ -3598,6 +3669,11 @@ public final class ComparatorProtos {
+         result = result && getCharset()
+             .equals(other.getCharset());
+       }
++      result = result && (hasEngine() == other.hasEngine());
++      if (hasEngine()) {
++        result = result && getEngine()
++            .equals(other.getEngine());
++      }
+       result = result &&
+           getUnknownFields().equals(other.getUnknownFields());
+       return result;
+@@ -3623,6 +3699,10 @@ public final class ComparatorProtos {
+         hash = (37 * hash) + CHARSET_FIELD_NUMBER;
+         hash = (53 * hash) + getCharset().hashCode();
+       }
++      if (hasEngine()) {
++        hash = (37 * hash) + ENGINE_FIELD_NUMBER;
++        hash = (53 * hash) + getEngine().hashCode();
++      }
+       hash = (29 * hash) + getUnknownFields().hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -3738,6 +3818,8 @@ public final class ComparatorProtos {
+         bitField0_ = (bitField0_ & ~0x00000002);
+         charset_ = "";
+         bitField0_ = (bitField0_ & ~0x00000004);
++        engine_ = "";
++        bitField0_ = (bitField0_ & ~0x00000008);
+         return this;
+       }
+ 
+@@ -3778,6 +3860,10 @@ public final class ComparatorProtos {
+           to_bitField0_ |= 0x00000004;
+         }
+         result.charset_ = charset_;
++        if (((from_bitField0_ & 0x00000008) == 0x00000008)) {
++          to_bitField0_ |= 0x00000008;
++        }
++        result.engine_ = engine_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -3807,6 +3893,11 @@ public final class ComparatorProtos {
+           charset_ = other.charset_;
+           onChanged();
+         }
++        if (other.hasEngine()) {
++          bitField0_ |= 0x00000008;
++          engine_ = other.engine_;
++          onChanged();
++        }
+         this.mergeUnknownFields(other.getUnknownFields());
+         return this;
+       }
+@@ -4027,6 +4118,80 @@ public final class ComparatorProtos {
+         return this;
+       }
+ 
++      // optional string engine = 4;
++      private java.lang.Object engine_ = "";
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public boolean hasEngine() {
++        return ((bitField0_ & 0x00000008) == 0x00000008);
++      }
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public java.lang.String getEngine() {
++        java.lang.Object ref = engine_;
++        if (!(ref instanceof java.lang.String)) {
++          java.lang.String s = ((com.google.protobuf.ByteString) ref)
++              .toStringUtf8();
++          engine_ = s;
++          return s;
++        } else {
++          return (java.lang.String) ref;
++        }
++      }
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public com.google.protobuf.ByteString
++          getEngineBytes() {
++        java.lang.Object ref = engine_;
++        if (ref instanceof String) {
++          com.google.protobuf.ByteString b = 
++              com.google.protobuf.ByteString.copyFromUtf8(
++                  (java.lang.String) ref);
++          engine_ = b;
++          return b;
++        } else {
++          return (com.google.protobuf.ByteString) ref;
++        }
++      }
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public Builder setEngine(
++          java.lang.String value) {
++        if (value == null) {
++    throw new NullPointerException();
++  }
++  bitField0_ |= 0x00000008;
++        engine_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public Builder clearEngine() {
++        bitField0_ = (bitField0_ & ~0x00000008);
++        engine_ = getDefaultInstance().getEngine();
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional string engine = 4;</code>
++       */
++      public Builder setEngineBytes(
++          com.google.protobuf.ByteString value) {
++        if (value == null) {
++    throw new NullPointerException();
++  }
++  bitField0_ |= 0x00000008;
++        engine_ = value;
++        onChanged();
++        return this;
++      }
++
+       // @@protoc_insertion_point(builder_scope:RegexStringComparator)
+     }
+ 
+@@ -4614,12 +4779,12 @@ public final class ComparatorProtos {
+       "\002(\0132\024.ByteArrayComparable\022,\n\nbitwise_op\030" +
+       "\002 \002(\0162\030.BitComparator.BitwiseOp\"%\n\tBitwi" +
+       "seOp\022\007\n\003AND\020\001\022\006\n\002OR\020\002\022\007\n\003XOR\020\003\"\020\n\016NullCo",
+-      "mparator\"P\n\025RegexStringComparator\022\017\n\007pat" +
++      "mparator\"`\n\025RegexStringComparator\022\017\n\007pat" +
+       "tern\030\001 \002(\t\022\025\n\rpattern_flags\030\002 \002(\005\022\017\n\007cha" +
+-      "rset\030\003 \002(\t\"%\n\023SubstringComparator\022\016\n\006sub" +
+-      "str\030\001 \002(\tBF\n*org.apache.hadoop.hbase.pro" +
+-      "tobuf.generatedB\020ComparatorProtosH\001\210\001\001\240\001" +
+-      "\001"
++      "rset\030\003 \002(\t\022\016\n\006engine\030\004 \001(\t\"%\n\023SubstringC" +
++      "omparator\022\016\n\006substr\030\001 \002(\tBF\n*org.apache." +
++      "hadoop.hbase.protobuf.generatedB\020Compara" +
++      "torProtosH\001\210\001\001\240\001\001"
+     };
+     com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+       new com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner() {
+@@ -4667,7 +4832,7 @@ public final class ComparatorProtos {
+           internal_static_RegexStringComparator_fieldAccessorTable = new
+             com.google.protobuf.GeneratedMessage.FieldAccessorTable(
+               internal_static_RegexStringComparator_descriptor,
+-              new java.lang.String[] { "Pattern", "PatternFlags", "Charset", });
++              new java.lang.String[] { "Pattern", "PatternFlags", "Charset", "Engine", });
+           internal_static_SubstringComparator_descriptor =
+             getDescriptor().getMessageTypes().get(7);
+           internal_static_SubstringComparator_fieldAccessorTable = new
+diff --git a/hbase-protocol/src/main/protobuf/Comparator.proto b/hbase-protocol/src/main/protobuf/Comparator.proto
+index f6daf81..202de85 100644
+--- a/hbase-protocol/src/main/protobuf/Comparator.proto
++++ b/hbase-protocol/src/main/protobuf/Comparator.proto
+@@ -61,6 +61,7 @@ message RegexStringComparator {
+   required string pattern = 1;
+   required int32 pattern_flags = 2;
+   required string charset = 3;
++  optional string engine = 4;
+ }
+ 
+ message SubstringComparator {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestRegexComparator.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestRegexComparator.java
+new file mode 100644
+index 0000000..9dbe432
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/filter/TestRegexComparator.java
+@@ -0,0 +1,197 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.filter;
++
++import static org.junit.Assert.*;
++
++import java.util.regex.Pattern;
++
++import org.apache.hadoop.hbase.filter.RegexStringComparator.EngineType;
++import org.apache.hadoop.hbase.testclassification.FilterTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category({FilterTests.class, SmallTests.class})
++public class TestRegexComparator {
++
++  @Test
++  public void testSerialization() throws Exception {
++    // Default engine is the Java engine
++    RegexStringComparator a = new RegexStringComparator("a|b");
++    RegexStringComparator b = RegexStringComparator.parseFrom(a.toByteArray());
++    assertTrue(a.areSerializedFieldsEqual(b));
++    assertTrue(b.getEngine() instanceof RegexStringComparator.JavaRegexEngine);
++
++    // joni engine
++    a = new RegexStringComparator("a|b", EngineType.JONI);
++    b = RegexStringComparator.parseFrom(a.toByteArray());
++    assertTrue(a.areSerializedFieldsEqual(b));
++    assertTrue(b.getEngine() instanceof RegexStringComparator.JoniRegexEngine);
++  }
++
++  @Test
++  public void testJavaEngine() throws Exception {
++    for (TestCase t: TEST_CASES) {
++      boolean result = new RegexStringComparator(t.regex, t.flags, EngineType.JAVA)
++        .compareTo(Bytes.toBytes(t.haystack)) == 0;
++      assertEquals("Regex '" + t.regex + "' failed test '" + t.haystack + "'", result,
++        t.expected);
++    }
++  }
++
++  @Test
++  public void testJoniEngine() throws Exception {
++    for (TestCase t: TEST_CASES) {
++      boolean result = new RegexStringComparator(t.regex, t.flags, EngineType.JONI)
++        .compareTo(Bytes.toBytes(t.haystack)) == 0;
++      assertEquals("Regex '" + t.regex + "' failed test '" + t.haystack + "'", result,
++        t.expected);
++    }
++  }
++
++  private static class TestCase {
++    String regex;
++    String haystack;
++    int flags;
++    boolean expected;
++
++    public TestCase(String regex, String haystack, boolean expected) {
++      this(regex, Pattern.DOTALL, haystack, expected);
++    }
++
++    public TestCase(String regex, int flags, String haystack, boolean expected) {
++      this.regex = regex;
++      this.flags = flags;
++      this.haystack = haystack;
++      this.expected = expected;
++    }
++  }
++
++  // These are a subset of the regex tests from OpenJDK 7
++  private static TestCase TEST_CASES[] = {
++    new TestCase("a|b", "a", true),
++    new TestCase("a|b", "b", true),
++    new TestCase("a|b", Pattern.CASE_INSENSITIVE, "A", true),
++    new TestCase("a|b", Pattern.CASE_INSENSITIVE, "B", true),
++    new TestCase("a|b", "z", false),
++    new TestCase("a|b|cd", "cd", true),
++    new TestCase("z(a|ac)b", "zacb", true),
++    new TestCase("[abc]+", "ababab", true),
++    new TestCase("[abc]+", "defg", false),
++    new TestCase("[abc]+[def]+[ghi]+", "zzzaaddggzzz", true),
++    new TestCase("[a-\\u4444]+", "za-9z", true),
++    new TestCase("[^abc]+", "ababab", false),
++    new TestCase("[^abc]+", "aaabbbcccdefg", true),
++    new TestCase("[abc^b]", "b", true),
++    new TestCase("[abc[def]]", "b", true),
++    new TestCase("[abc[def]]", "e", true),
++    new TestCase("[a-c[d-f[g-i]]]", "h", true),
++    new TestCase("[a-c[d-f[g-i]]m]", "m", true),
++    new TestCase("[a-c&&[d-f]]", "a", false),
++    new TestCase("[a-c&&[d-f]]", "z", false),
++    new TestCase("[a-m&&m-z&&a-c]", "m", false),
++    new TestCase("[a-m&&m-z&&a-z]", "m", true),
++    new TestCase("[[a-m]&&[^a-c]]", "a", false),
++    new TestCase("[[a-m]&&[^a-c]]", "d", true),
++    new TestCase("[[a-c][d-f]&&abc[def]]", "e", true),
++    new TestCase("[[a-c]&&[b-d]&&[c-e]]", "c", true),
++    new TestCase("[[a-c]&&[b-d][c-e]&&[u-z]]", "c", false),
++    new TestCase("[[a]&&[b][c][a]&&[^d]]", "a", true),
++    new TestCase("[[a]&&[b][c][a]&&[^d]]", "d", false),
++    new TestCase("[[[a-d]&&[c-f]]&&[c]&&c&&[cde]]", "c", true),
++    new TestCase("[x[[wz]abc&&bcd[z]]&&[u-z]]", "z", true),
++    new TestCase("a.c.+", "a#c%&", true),
++    new TestCase("ab.", "ab\n", true),
++    new TestCase("(?s)ab.", "ab\n", true),
++    new TestCase("ab\\wc", "abcc", true),
++    new TestCase("\\W\\w\\W", "#r#", true),
++    new TestCase("\\W\\w\\W", "rrrr#ggg", false),
++    new TestCase("abc[\\sdef]*", "abc  def", true),
++    new TestCase("abc[\\sy-z]*", "abc y z", true),
++    new TestCase("abc[a-d\\sm-p]*", "abcaa mn  p", true),
++    new TestCase("\\s\\s\\s", "blah  err", false),
++    new TestCase("\\S\\S\\s", "blah  err", true),
++    new TestCase("ab\\dc", "ab9c", true),
++    new TestCase("\\d\\d\\d", "blah45", false),
++    new TestCase("^abc", "abcdef", true),
++    new TestCase("^abc", "bcdabc", false),
++    new TestCase("^(a)?a", "a", true),
++    new TestCase("^(aa(bb)?)+$", "aabbaa", true),
++    new TestCase("((a|b)?b)+", "b", true),
++    new TestCase("^(a(b)?)+$", "aba", true),
++    new TestCase("^(a(b(c)?)?)?abc", "abc", true),
++    new TestCase("^(a(b(c))).*", "abc", true),
++    new TestCase("a?b", "aaaab", true),
++    new TestCase("a?b", "aaacc", false),
++    new TestCase("a??b", "aaaab", true),
++    new TestCase("a??b", "aaacc", false),
++    new TestCase("a?+b", "aaaab", true),
++    new TestCase("a?+b", "aaacc", false),
++    new TestCase("a+b", "aaaab", true),
++    new TestCase("a+b", "aaacc", false),
++    new TestCase("a+?b", "aaaab", true),
++    new TestCase("a+?b", "aaacc", false),
++    new TestCase("a++b", "aaaab", true),
++    new TestCase("a++b", "aaacc", false),
++    new TestCase("a{2,3}", "a", false),
++    new TestCase("a{2,3}", "aa", true),
++    new TestCase("a{2,3}", "aaa", true),
++    new TestCase("a{3,}", "zzzaaaazzz", true),
++    new TestCase("a{3,}", "zzzaazzz", false),
++    new TestCase("abc(?=d)", "zzzabcd", true),
++    new TestCase("abc(?=d)", "zzzabced", false),
++    new TestCase("abc(?!d)", "zzabcd", false),
++    new TestCase("abc(?!d)", "zzabced", true),
++    new TestCase("\\w(?<=a)", "###abc###", true),
++    new TestCase("\\w(?<=a)", "###ert###", false),
++    new TestCase("(?<!a)c", "bc", true),
++    new TestCase("(?<!a)c", "ac", false),
++    new TestCase("(a+b)+", "ababab", true),
++    new TestCase("(a+b)+", "accccd", false),
++    new TestCase("(ab)+", "ababab", true),
++    new TestCase("(ab)+", "accccd", false),
++    new TestCase("(ab)(cd*)", "zzzabczzz", true),
++    new TestCase("abc(d)*abc", "abcdddddabc", true),
++    new TestCase("a*b", "aaaab", true),
++    new TestCase("a*b", "b", true),
++    new TestCase("a*b", "aaaac", false),
++    new TestCase(".*?b", "aaaab", true),
++    new TestCase("a*+b", "aaaab", true),
++    new TestCase("a*+b", "b", true),
++    new TestCase("a*+b", "aaaac", false),
++    new TestCase("(?i)foobar", "fOobAr", true),
++    new TestCase("f(?i)oobar", "fOobAr", true),
++    new TestCase("f(?i)oobar", "FOobAr", false),
++    new TestCase("foo(?i)bar", "fOobAr", false),
++    new TestCase("(?i)foo[bar]+", "foObAr", true),
++    new TestCase("(?i)foo[a-r]+", "foObAr", true),
++    new TestCase("abc(?x)blah", "abcblah", true),
++    new TestCase("abc(?x)  blah", "abcblah", true),
++    new TestCase("abc(?x)  blah  blech", "abcblahblech", true),
++    new TestCase("[\\n-#]", "!", true),
++    new TestCase("[\\n-#]", "-", false),
++    new TestCase("[\\043]+", "blahblah#blech", true),
++    new TestCase("[\\042-\\044]+", "blahblah#blech", true),
++    new TestCase("[\\u1234-\\u1236]", "blahblah\u1235blech", true),
++    new TestCase("[^\043]*", "blahblah#blech", true),
++    new TestCase("(|f)?+", "foo", true),
++  };
++}
+diff --git a/pom.xml b/pom.xml
+index 3df27cd..079033c 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -898,6 +898,7 @@
+     <jamon-runtime.version>2.3.1</jamon-runtime.version>
+     <jettison.version>1.3.1</jettison.version>
+     <netty.version>4.0.19.Final</netty.version>
++    <joni.version>2.1.2</joni.version>
+     <!-- Plugin Dependencies -->
+     <maven.assembly.version>2.4</maven.assembly.version>
+     <maven.antrun.version>1.6</maven.antrun.version>
+@@ -1193,6 +1194,11 @@
+         </exclusions>
+       </dependency>
+       <dependency>
++        <groupId>org.jruby.joni</groupId>
++        <artifactId>joni</artifactId>
++        <version>${joni.version}</version>
++      </dependency>
++      <dependency>
+         <groupId>org.mortbay.jetty</groupId>
+         <artifactId>jetty-util</artifactId>
+         <version>${jetty.version}</version>
+-- 
+1.9.1
+

@@ -1,0 +1,173 @@
+From 159432e6820af2e5d1a6c7fe4486500c8f133f32 Mon Sep 17 00:00:00 2001
+From: Nick Dimiduk <ndimiduk@apache.org>
+Date: Wed, 5 Nov 2014 18:27:59 -0800
+Subject: [PATCH] HBASE-12432 RpcRetryingCaller should log after fixed number
+ of retries like AsyncProcess
+
+---
+ .../org/apache/hadoop/hbase/client/AsyncProcess.java     | 16 ++++++++++++----
+ .../apache/hadoop/hbase/client/RpcRetryingCaller.java    | 16 ++++++++++------
+ .../hadoop/hbase/client/RpcRetryingCallerFactory.java    |  5 ++++-
+ .../org/apache/hadoop/hbase/client/TestAsyncProcess.java |  6 +++---
+ .../hadoop/hbase/client/TestFastFailWithoutTestUtil.java |  2 +-
+ 5 files changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+index 3d40dd5..3806115 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+@@ -97,6 +97,16 @@ class AsyncProcess {
+   public static final String PRIMARY_CALL_TIMEOUT_KEY = "hbase.client.primaryCallTimeout.multiget";
+ 
+   /**
++   * Configure the number of failures after which the client will start logging. A few failures
++   * is fine: region moved, then is not opened, then is overloaded. We try to have an acceptable
++   * heuristic for the number of errors we don't log. 9 was chosen because we wait for 1s at
++   * this stage.
++   */
++  public static final String START_LOG_ERRORS_AFTER_COUNT_KEY =
++      "hbase.client.start.log.errors.counter";
++  public static final int DEFAULT_START_LOG_ERRORS_AFTER_COUNT = 9;
++
++  /**
+    * The context used to wait for results from one submit call.
+    * 1) If AsyncProcess is set to track errors globally, and not per call (for HTable puts),
+    *    then errors and failed operations in this object will reflect global errors.
+@@ -255,10 +265,8 @@ class AsyncProcess {
+     this.maxConcurrentTasksPerRegion = conf.getInt(HConstants.HBASE_CLIENT_MAX_PERREGION_TASKS,
+           HConstants.DEFAULT_HBASE_CLIENT_MAX_PERREGION_TASKS);
+ 
+-    // A few failure is fine: region moved, then is not opened, then is overloaded. We try
+-    //  to have an acceptable heuristic for the number of errors we don't log.
+-    //  9 was chosen because we wait for 1s at this stage.
+-    this.startLogErrorsCnt = conf.getInt("hbase.client.start.log.errors.counter", 9);
++    this.startLogErrorsCnt =
++        conf.getInt(START_LOG_ERRORS_AFTER_COUNT_KEY, DEFAULT_START_LOG_ERRORS_AFTER_COUNT);
+ 
+     if (this.maxTotalConcurrentTasks <= 0) {
+       throw new IllegalArgumentException("maxTotalConcurrentTasks=" + maxTotalConcurrentTasks);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCaller.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCaller.java
+index 97e6381..a2c4d99 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCaller.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCaller.java
+@@ -58,6 +58,8 @@ public class RpcRetryingCaller<T> {
+    * Start and end times for a single call.
+    */
+   private final static int MIN_RPC_TIMEOUT = 2000;
++  /** How many retries are allowed before we start to log */
++  private final int startLogErrorsCnt;
+ 
+   private final long pause;
+   private final int retries;
+@@ -65,16 +67,17 @@ public class RpcRetryingCaller<T> {
+   private final RetryingCallerInterceptor interceptor;
+   private final RetryingCallerInterceptorContext context;
+ 
+-  public RpcRetryingCaller(long pause, int retries) {
+-    this(pause, retries, RetryingCallerInterceptorFactory.NO_OP_INTERCEPTOR);
++  public RpcRetryingCaller(long pause, int retries, int startLogErrorsCnt) {
++    this(pause, retries, RetryingCallerInterceptorFactory.NO_OP_INTERCEPTOR, startLogErrorsCnt);
+   }
+   
+   public RpcRetryingCaller(long pause, int retries,
+-      RetryingCallerInterceptor interceptor) {
++      RetryingCallerInterceptor interceptor, int startLogErrorsCnt) {
+     this.pause = pause;
+     this.retries = retries;
+     this.interceptor = interceptor;
+     context = interceptor.createEmptyContext();
++    this.startLogErrorsCnt = startLogErrorsCnt;
+   }
+ 
+   private int getRemainingTime(int callTimeout) {
+@@ -125,10 +128,11 @@ public class RpcRetryingCaller<T> {
+         throw e;
+       } catch (Throwable t) {
+         ExceptionUtil.rethrowIfInterrupt(t);
+-        if (LOG.isTraceEnabled()) {
+-          LOG.trace("Call exception, tries=" + tries + ", retries=" + retries + ", started=" +
++        if (tries > startLogErrorsCnt) {
++          LOG.info("Call exception, tries=" + tries + ", retries=" + retries + ", started=" +
+               (EnvironmentEdgeManager.currentTime() - this.globalStartTime) + " ms ago, "
+-              + "cancelled=" + cancelled.get(), t);
++              + "cancelled=" + cancelled.get() + ", msg="
++              + callable.getExceptionMessageAdditionalDetail());
+         }
+ 
+         // translateException throws exception when should not retry: i.e. when request is bad.
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java
+index f482262..f594a8c 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java
+@@ -32,6 +32,7 @@ public class RpcRetryingCallerFactory {
+   private final long pause;
+   private final int retries;
+   private final RetryingCallerInterceptor interceptor;
++  private final int startLogErrorsCnt;
+ 
+   public RpcRetryingCallerFactory(Configuration conf) {
+     this(conf, RetryingCallerInterceptorFactory.NO_OP_INTERCEPTOR);
+@@ -43,13 +44,15 @@ public class RpcRetryingCallerFactory {
+         HConstants.DEFAULT_HBASE_CLIENT_PAUSE);
+     retries = conf.getInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,
+         HConstants.DEFAULT_HBASE_CLIENT_RETRIES_NUMBER);
++    startLogErrorsCnt = conf.getInt(AsyncProcess.START_LOG_ERRORS_AFTER_COUNT_KEY,
++        AsyncProcess.DEFAULT_START_LOG_ERRORS_AFTER_COUNT);
+     this.interceptor = interceptor;
+   }
+ 
+   public <T> RpcRetryingCaller<T> newCaller() {
+     // We store the values in the factory instance. This way, constructing new objects
+     //  is cheap as it does not require parsing a complex structure.
+-    return new RpcRetryingCaller<T>(pause, retries, interceptor);
++      return new RpcRetryingCaller<T>(pause, retries, interceptor, startLogErrorsCnt);
+   }
+ 
+   public static RpcRetryingCallerFactory instantiate(Configuration configuration) {
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+index abf3da8..8d77d7a 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+@@ -190,7 +190,7 @@ public class TestAsyncProcess {
+             }
+           });
+ 
+-      return new RpcRetryingCaller<MultiResponse>(100, 10) {
++      return new RpcRetryingCaller<MultiResponse>(100, 10, 9) {
+         @Override
+         public MultiResponse callWithoutRetries(RetryingCallable<MultiResponse> callable,
+                                                 int callTimeout)
+@@ -211,7 +211,7 @@ public class TestAsyncProcess {
+   static class CallerWithFailure extends RpcRetryingCaller<MultiResponse>{
+ 
+     public CallerWithFailure() {
+-      super(100, 100);
++      super(100, 100, 9);
+     }
+ 
+     @Override
+@@ -294,7 +294,7 @@ public class TestAsyncProcess {
+         replicaCalls.incrementAndGet();
+       }
+ 
+-      return new RpcRetryingCaller<MultiResponse>(100, 10) {
++      return new RpcRetryingCaller<MultiResponse>(100, 10, 9) {
+         @Override
+         public MultiResponse callWithoutRetries(RetryingCallable<MultiResponse> callable, int callTimeout)
+         throws IOException, RuntimeException {
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestFastFailWithoutTestUtil.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestFastFailWithoutTestUtil.java
+index a9f5b27..080cd8b 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestFastFailWithoutTestUtil.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestFastFailWithoutTestUtil.java
+@@ -564,7 +564,7 @@ public class TestFastFailWithoutTestUtil {
+ 
+   public RpcRetryingCaller<Void> getRpcRetryingCaller(int pauseTime,
+       int retries, RetryingCallerInterceptor interceptor) {
+-    return new RpcRetryingCaller<Void>(pauseTime, retries, interceptor) {
++    return new RpcRetryingCaller<Void>(pauseTime, retries, interceptor, 9) {
+       @Override
+       public Void callWithRetries(RetryingCallable<Void> callable,
+           int callTimeout) throws IOException, RuntimeException {
+-- 
+1.9.3 (Apple Git-50)
+

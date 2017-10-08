@@ -1,0 +1,245 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 89bfbf3..257e724 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1906,6 +1906,11 @@ public class HRegionServer extends HasThread implements
+   private static final byte[] UNSPECIFIED_REGION = new byte[]{};
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    return walFactory.getWALs();
++  }
++
++  @Override
+   public WAL getWAL(HRegionInfo regionInfo) throws IOException {
+     WAL wal;
+     LogRoller roller = walRoller;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+index 356a88b..bfd0431 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hbase.regionserver;
+ 
+ import java.io.IOException;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentMap;
+@@ -55,6 +56,11 @@ public interface RegionServerServices extends OnlineRegions, FavoredNodesForRegi
+    * default (common) WAL */
+   WAL getWAL(HRegionInfo regionInfo) throws IOException;
+ 
++  /** @return the List of WALs that are used by this server
++   *  Doesn't include the meta WAL
++   */
++  List<WAL> getWALs() throws IOException;
++
+   /**
+    * @return Implementation of {@link CompactionRequestor} or null.
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
+index 3aafc23..e33ae33 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
+@@ -239,6 +239,10 @@ public abstract class AbstractFSWAL<W> implements WAL {
+    */
+   private final ConcurrentMap<Thread, SyncFuture> syncFuturesByHandler;
+ 
++  public long getFilenum() {
++    return this.filenum.get();
++  }
++
+   /**
+    * A log file has a creation timestamp (in ms) in its file name ({@link #filenum}. This helper
+    * method returns the creation timestamp from a given log file. It extracts the timestamp assuming
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AbstractFSWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AbstractFSWALProvider.java
+index e495e99..51d7417 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AbstractFSWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AbstractFSWALProvider.java
+@@ -18,6 +18,8 @@
+ package org.apache.hadoop.hbase.wal;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.regex.Pattern;
+@@ -109,6 +111,16 @@ public abstract class AbstractFSWALProvider<T extends AbstractFSWAL<?>> implemen
+   }
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    if (wal == null) {
++      return Collections.emptyList();
++    }
++    List<WAL> wals = new ArrayList<WAL>();
++    wals.add(wal);
++    return wals;
++  }
++
++  @Override
+   public T getWAL(byte[] identifier, byte[] namespace) throws IOException {
+     T walCopy = wal;
+     if (walCopy == null) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+index b5ddd00..0725c4e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hbase.wal;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.CopyOnWriteArrayList;
+@@ -65,6 +66,13 @@ class DisabledWALProvider implements WALProvider {
+   }
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    List<WAL> wals = new ArrayList<WAL>();
++    wals.add(disabled);
++    return wals;
++  }
++
++  @Override
+   public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+     return disabled;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
+index b447e94..25e70d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/RegionGroupingProvider.java
+@@ -22,6 +22,7 @@ import static org.apache.hadoop.hbase.wal.AbstractFSWALProvider.META_WAL_PROVIDE
+ import static org.apache.hadoop.hbase.wal.AbstractFSWALProvider.WAL_FILE_NAME_DELIMITER;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -168,6 +169,15 @@ public class RegionGroupingProvider implements WALProvider {
+     }
+   }
+ 
++  @Override
++  public List<WAL> getWALs() throws IOException {
++    List<WAL> wals = new ArrayList<WAL>();
++    for (WALProvider provider : cached.values()) {
++      wals.addAll(provider.getWALs());
++    }
++    return wals;
++  }
++
+   private WAL getWAL(final String group) throws IOException {
+     WALProvider provider = cached.get(group);
+     if (provider == null) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+index 26c4ea1..8ed9bfb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+@@ -233,6 +233,10 @@ public class WALFactory {
+     }
+   }
+ 
++  public List<WAL> getWALs() throws IOException {
++    return provider.getWALs();
++  }
++
+   /**
+    * @param identifier may not be null, contents will not be altered
+    * @param namespace could be null, and will use default namespace if null
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+index 96bc023..1a5b140 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+@@ -58,6 +58,10 @@ public interface WALProvider {
+    */
+   WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException;
+ 
++  /** @return the List of WALs that are used by this server
++   */
++  List<WAL> getWALs() throws IOException;
++
+   /**
+    * persist outstanding WALs to storage and stop accepting new appends.
+    * This method serves as shorthand for sending a sync to every WAL provided by a given
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+index 6f225d6..e330093 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase;
+ 
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -246,6 +247,11 @@ public class MockRegionServerServices implements RegionServerServices {
+   }
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    return Collections.emptyList();
++  }
++
++  @Override
+   public WAL getWAL(HRegionInfo regionInfo) throws IOException {
+     return null;
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+index 2927023..1940afa 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.master;
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -568,8 +569,12 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
+   }
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    return Collections.emptyList();
++  }
++
++  @Override
+   public WAL getWAL(HRegionInfo regionInfo) throws IOException {
+-    // TODO Auto-generated method stub
+     return null;
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+index 0a732a7..ec5f037 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+@@ -23,6 +23,7 @@ import static org.apache.hadoop.hbase.wal.AbstractFSWALProvider.META_WAL_PROVIDE
+ import static org.apache.hadoop.hbase.wal.AbstractFSWALProvider.WAL_FILE_NAME_DELIMITER;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+ 
+@@ -106,6 +107,13 @@ public class IOTestProvider implements WALProvider {
+   }
+ 
+   @Override
++  public List<WAL> getWALs() throws IOException {
++    List<WAL> wals = new ArrayList<WAL>();
++    wals.add(log);
++    return wals;
++  }
++
++  @Override
+   public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {
+    return log;
+   }

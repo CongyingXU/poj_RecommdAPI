@@ -1,0 +1,301 @@
+Index: modules/kernel/src/org/apache/axis2/deployment/DeploymentEngine.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/deployment/DeploymentEngine.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/deployment/DeploymentEngine.java	(working copy)
+@@ -597,6 +597,17 @@
+         if (isServiceGroupReadyToDeploy(serviceGroup, serviceList, serviceLocation,
+                 currentDeploymentFile, axisConfiguration)) {
+ 
++            // Add the hierarchical path to the service group
++            String serviceHierarchy = Utils.getServiceHierarchy(serviceLocation.getPath());
++            if (!"".equals(serviceHierarchy)) {
++                serviceGroup.setServiceGroupName(serviceHierarchy
++                        + serviceGroup.getServiceGroupName());
++                for (Object o : serviceList) {
++                    AxisService axisService = (AxisService) o;
++                    axisService.setName(serviceHierarchy + axisService.getName());
++                }
++            }
++
+             fillServiceGroup(serviceGroup, serviceList, serviceLocation, axisConfiguration);
+             axisConfiguration.addServiceGroup(serviceGroup);
+ 
+Index: modules/kernel/src/org/apache/axis2/deployment/RepositoryListener.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/deployment/RepositoryListener.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/deployment/RepositoryListener.java	(working copy)
+@@ -25,6 +25,7 @@
+ import org.apache.axis2.deployment.repository.util.WSInfoList;
+ import org.apache.axis2.deployment.util.Utils;
+ import org.apache.axis2.util.Loader;
++import org.apache.axis2.i18n.Messages;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
+@@ -248,7 +249,7 @@
+ 
+     /** Finds a list of services in the folder and adds to wsInfoList. */
+     public void checkServices() {
+-        findServicesInDirectory();
++        findServicesInDirectory(deploymentEngine.getServicesDir());
+         loadOtherDirectories();
+         update();
+     }
+@@ -305,21 +306,37 @@
+         }
+     }
+ 
+-    /** Searches a given folder for jar files and adds them to a list in the WSInfolist class. */
+-    protected void findServicesInDirectory() {
+-        File root = deploymentEngine.getServicesDir();
++    /**
++     * Searches a given folder for jar files and adds them to a list in the WSInfolist class.
++     * If sub folders found, those are also searched for services.
++     * Ex : repository/services/foo/1.0.0/echo.aar
++     *      repository/services/foo/1.0.1/echo.aar
++     *      repository/services/echo.aar 
++     * @param root - directory from which we start searching for services
++     */
++    protected void findServicesInDirectory(File root) {
++        // flag to identify whether this is the repository/services folder
++        boolean servicesDir = false;
++        if (deploymentEngine.getServicesDir().getAbsolutePath().equals(root.getAbsolutePath())) {
++            servicesDir = true;
++        }
+         File[] files = root.listFiles();
+ 
+         if (files != null && files.length > 0) {
+-            for (int i = 0; i < files.length; i++) {
+-                File file = files[i];
++            /**
++             * This noServicesXML flag is used to check whether this folder (root) doesn't contain
++             * any deployable artifacts.
++             */
++            boolean noServicesXML = true;
++            for (File file : files) {
+                 if (isSourceControlDir(file)) {
+                     continue;
+                 }
+                 if (!file.isDirectory()) {
+                     if (DeploymentFileData.isServiceArchiveFile(file.getName())) {
+                         addFileToDeploy(file, deploymentEngine.getServiceDeployer(),
+-                                        WSInfo.TYPE_SERVICE);
++                                WSInfo.TYPE_SERVICE);
++                        noServicesXML = false;
+                     } else {
+                         String ext = DeploymentFileData.getFileExtension(file.getName());
+                         Deployer deployer = deploymentEngine.getDeployerForExtension(ext);
+@@ -327,15 +344,29 @@
+                         // ignore the file.
+                         if (deployer != null) {
+                             addFileToDeploy(file, deployer, WSInfo.TYPE_SERVICE);
++                            noServicesXML = false;
+                         }
+                     }
+                 } else {
+-                    if (!"lib".equalsIgnoreCase(file.getName())) {
+-                        addFileToDeploy(file, deploymentEngine.getServiceDeployer(),
+-                                        WSInfo.TYPE_SERVICE);
++                    if (!(servicesDir && "lib".equalsIgnoreCase(file.getName()))) {
++                        File servicesXML = new File(file, DeploymentConstants.SERVICES_XML);
++                        if (!servicesXML.exists()) {
++                            servicesXML =
++                                    new File(file, DeploymentConstants.SERVICES_XML.toLowerCase());
++                        }
++                        if (servicesXML.exists()) {
++                            addFileToDeploy(file, deploymentEngine.getServiceDeployer(),
++                                    WSInfo.TYPE_SERVICE);
++                        } else {
++                            findServicesInDirectory(file);
++                        }
++                        noServicesXML = false;
+                     }
+                 }
+             }
++            if (noServicesXML) {
++                log.error(Messages.getMessage(DeploymentErrorMsgs.SERVICE_XML_NOT_FOUND));
++            }
+         }
+     }
+ 
+@@ -351,7 +382,7 @@
+     }
+ 
+     public void updateRemote() throws Exception {
+-        findServicesInDirectory();
++        findServicesInDirectory(deploymentEngine.getServicesDir());
+         update();
+     }
+ 
+Index: modules/kernel/src/org/apache/axis2/deployment/util/Utils.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/deployment/util/Utils.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/deployment/util/Utils.java	(working copy)
+@@ -1875,4 +1875,25 @@
+             }
+         }
+     }
++
++    /**
++     * Computes the hierarchical part of the service name if this is such a service path
++     * Ex:  filePath = .../repository/services/foo/1.0.0/version.aar -> "foo/1.0.0"
++     *      filePath = .../repository/services/version.aar -> ""
++     * @param filePath - input file path of the deploying file
++     * @return hierarchical path
++     */
++    public static String getServiceHierarchy(String filePath) {
++        String[] splited = filePath.split("services/");
++        String serviceHierarchy = null;
++        if (splited.length > 1) {
++            String temp = splited[splited.length - 1];
++            //if this is not a hierarchical path, return a 0 length string
++            if (temp.charAt(temp.length() - 1) == '/' || temp.lastIndexOf('/') == -1) {
++                return "";
++            }
++            serviceHierarchy = temp.substring(0, temp.lastIndexOf('/') + 1);
++        }
++        return serviceHierarchy;
++    }
+ }
+Index: modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedOperationDispatcher.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedOperationDispatcher.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedOperationDispatcher.java	(working copy)
+@@ -59,7 +59,15 @@
+                 log.debug(messageContext.getLogIDString() +
+                         " Checking for Operation using QName(target endpoint URI fragment) : " +
+                         operationName);
+-                return service.getOperation(operationName);
++                AxisOperation operation = service.getOperation(operationName);
++
++                //If the operation is null, check whether this is a hierarchical service path
++                if (operation == null && !values[0].equals(values[2])) {
++                    values = Utils.parseHierarchicalServiceName(values);
++                    operationName = new QName(values[1]);
++                    operation = service.getOperation(operationName);
++                }
++                return operation;
+             } else {
+                 log.debug(messageContext.getLogIDString() +
+                         " Attempted to check for Operation using target endpoint URI, but the operation fragment was missing");
+Index: modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedServiceDispatcher.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedServiceDispatcher.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/dispatchers/RequestURIBasedServiceDispatcher.java	(working copy)
+@@ -65,6 +65,32 @@
+ 
+             	AxisService axisService = registry.getService(values[0]);
+ 
++                /**
++                 * values[2] gives the hierarchical path of the service. if axis service is not
++                 * found in the normal way, check whether this is a service with a hierarchical
++                 * service name (Ex: foo/1.0.0/echo)
++                 */
++                if (axisService == null) {
++                    axisService = registry.getService(values[2]);
++                    /**
++                     * values[0] holds the actual service name. now the service name is in values[2]
++                     * But value[0] is used to get the endpoint below. Value[2] can be like
++                     * foo/1.0.0/echo.echoEndpoint. There can be more than one '.'. Therefore
++                     * assign only 'echo.echoEndpoint' part to value[0]
++                     */
++                    values[0] = values[2].substring(values[2].lastIndexOf('/') + 1);
++                }
++
++                /**
++                 * If still we can't find the service, check whether this is a REST call.
++                 * Ex : foo/1.0.0/echo/echoString
++                 */
++                if (axisService == null) {
++                    Utils.parseHierarchicalServiceName(values);
++                    axisService = registry.getService(values[0]);
++                    values[0] = values[0].substring(values[0].lastIndexOf('/') + 1);
++                }
++
+             	// If the axisService is not null we get the binding that the request came to add
+             	// add it as a property to the messageContext
+             	if (axisService != null) {
+Index: modules/kernel/src/org/apache/axis2/util/Utils.java
+===================================================================
+--- modules/kernel/src/org/apache/axis2/util/Utils.java	(revision 808762)
++++ modules/kernel/src/org/apache/axis2/util/Utils.java	(working copy)
+@@ -198,7 +198,8 @@
+      * Break a full path into pieces
+      *
+      * @return an array where element [0] always contains the service, and element 1, if not null, contains
+-     *         the path after the first element. all ? parameters are discarded.
++     *         the path after the first element. element 2, entire path before separating the
++     *         operation name. all ? parameters are discarded.
+      */
+     public static String[] parseRequestURLForServiceAndOperation(String path, String servicePath) {
+         if (log.isDebugEnabled()) {
+@@ -207,7 +208,13 @@
+         if (path == null) {
+             return null;
+         }
+-        String[] values = new String[2];
++        /**
++         * we need 3 values. service name, operation name and service name before separating the
++         * operation name
++         * Ex : services/echo/echoString --> values[0] = echo, values[1] = echoString
++         * values[2] = echo/echoString
++         */
++        String[] values = new String[3];
+ 
+         // TODO. This is kind of brittle. Any service with the name /services would cause fun.
+         int index = path.lastIndexOf(servicePath);
+@@ -225,6 +232,12 @@
+                     service = service.substring(0, queryIndex);
+                 }
+ 
++                // take value[2] before separating operation name
++                values[2] = service;
++                if (service.endsWith("/")) {
++                    values[2] = service.substring(0, service.length() - 1);
++                }
++
+                 int operationIndex = service.indexOf('/');
+ 
+                 if (operationIndex > 0) {
+@@ -247,6 +260,23 @@
+         return values;
+     }
+ 
++    /**
++     * Find service name (value[0]) and operation name (value[1]) from the full hierarchical path
++     * (value[2]).
++     * @param values - existing values
++     * @return new values
++     */
++    public static String[] parseHierarchicalServiceName(String[] values) {
++        if (values[2] != null) {
++            int index = values[2].lastIndexOf('/');
++            if (index > 0) {
++                values[0] = values[2].substring(0, index);
++                values[1] = values[2].substring(index + 1);
++            }
++        }
++        return values;
++    }
++
+     public static ConfigurationContext getNewConfigurationContext(String repositry)
+             throws Exception {
+         final File file = new File(repositry);
+Index: modules/transport/http/src/org/apache/axis2/transport/http/HTTPWorker.java
+===================================================================
+--- modules/transport/http/src/org/apache/axis2/transport/http/HTTPWorker.java	(revision 808762)
++++ modules/transport/http/src/org/apache/axis2/transport/http/HTTPWorker.java	(working copy)
+@@ -125,7 +125,12 @@
+                 }
+             }
+             if (uri.endsWith("?wsdl")) {
+-                String serviceName = uri.substring(uri.lastIndexOf("/") + 1, uri.length() - 5);
++                /**
++                 * service name can be hierarchical (services/foo/1.0.0/Version?wsdl) or
++                 * normal (services/Version?wsdl).
++                 */
++                String[] temp = uri.split("services/");
++                String serviceName = temp[1].substring(0, temp[1].length() - 5);
+                 HashMap services = configurationContext.getAxisConfiguration().getServices();
+                 AxisService service = (AxisService) services.get(serviceName);
+                 if (service != null) {

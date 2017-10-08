@@ -1,0 +1,182 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index a8ffa8d..89ab823 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -214,6 +214,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   private final int maxWaitForSeqId;
+   private static final String MAX_WAIT_FOR_SEQ_ID_KEY = "hbase.hregion.max.wait.for.sequenceid.ms";
+   private static final int DEFAULT_MAX_WAIT_FOR_SEQ_ID = 30000;
++  protected HRegionConfiguration hRegionConfiguration;
+ 
+   /**
+    * This is the global default value for durability. All tables/mutations not
+@@ -655,6 +656,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+ 
+     // 'conf' renamed to 'confParam' b/c we use this.conf in the constructor
+     this.baseConf = confParam;
++    hRegionConfiguration = new HRegionConfiguration(baseConf);
+     this.conf = new CompoundConfiguration()
+       .add(confParam)
+       .addStringMap(htd.getConfiguration())
+@@ -7444,7 +7446,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   public static final long FIXED_OVERHEAD = ClassSize.align(
+       ClassSize.OBJECT +
+       ClassSize.ARRAY +
+-      43 * ClassSize.REFERENCE + 3 * Bytes.SIZEOF_INT +
++      44 * ClassSize.REFERENCE + 3 * Bytes.SIZEOF_INT +
+       (14 * Bytes.SIZEOF_LONG) +
+       5 * Bytes.SIZEOF_BOOLEAN);
+ 
+@@ -8071,4 +8073,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     return this.getRegionInfo().isMetaRegion() ? CellComparator.META_COMPARATOR
+         : CellComparator.COMPARATOR;
+   }
++
++  public HRegionConfiguration getHRegionConfiguration() {
++      return hRegionConfiguration;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionConfiguration.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionConfiguration.java
+new file mode 100644
+index 0000000..64827b8
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionConfiguration.java
+@@ -0,0 +1,72 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HConstants;
++
++/**
++ *
++ * Placeholder for configuration access for the HRegion.  Hopefully we can slowly
++ * add the configuration options for the region into this class.  The main purpose is to keep
++ * the StoreScanner from calling Configuration#getProps which is synchronized.
++ *
++ */
++public class HRegionConfiguration {
++    protected Configuration config;
++    protected long tableMaxRowSizeKey;
++    protected boolean usePread;
++    protected long tmpCellsPerTimeoutCheck;
++    protected boolean parallelSeekEnabled;
++
++
++    public HRegionConfiguration(Configuration config) {
++        this.config = config;
++        this.tableMaxRowSizeKey = config.getLong(HConstants.TABLE_MAX_ROWSIZE_KEY,
++                HConstants.TABLE_MAX_ROWSIZE_DEFAULT);
++        this.usePread = config.getBoolean("hbase.storescanner.use.pread", false);
++        this.tmpCellsPerTimeoutCheck =
++                config.getLong(StoreScanner.HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK,
++                        StoreScanner.DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK);
++        this.parallelSeekEnabled = config.getBoolean(
++                StoreScanner.STORESCANNER_PARALLEL_SEEK_ENABLE, false);
++    }
++
++    public Configuration getConfig() {
++        return config;
++    }
++
++    public void setConfig(Configuration config) {
++        this.config = config;
++    }
++
++    public long getTableMaxRowSizeKey() {
++        return tableMaxRowSizeKey;
++    }
++
++    public void setTableMaxRowSizeKey(long tableMaxRowSizeKey) {
++        this.tableMaxRowSizeKey = tableMaxRowSizeKey;
++    }
++
++    public boolean isUsePread() {
++        return usePread;
++    }
++
++    public void setUsePread(boolean usePread) {
++        this.usePread = usePread;
++    }
++
++    public long getTmpCellsPerTimeoutCheck() {
++        return tmpCellsPerTimeoutCheck;
++    }
++
++    public void setTmpCellsPerTimeoutCheck(long tmpCellsPerTimeoutCheck) {
++        this.tmpCellsPerTimeoutCheck = tmpCellsPerTimeoutCheck;
++    }
++
++    public boolean isParallelSeekEnabled() {
++        return parallelSeekEnabled;
++    }
++
++    public void setParallelSeekEnabled(boolean parallelSeekEnabled) {
++        this.parallelSeekEnabled = parallelSeekEnabled;
++    }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index 2cb0b61..bf2570a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -149,42 +149,36 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+     this.oldestUnexpiredTS = now - ttl;
+     this.minVersions = minVersions;
+ 
++     // We look up row-column Bloom filters for multi-column queries as part of
++     // the seek operation. However, we also look the row-column Bloom filter
++     // for multi-row (non-"get") scans because this is not done in
++     // StoreFile.passesBloomFilter(Scan, SortedSet<byte[]>).
++     useRowColBloom = numCol > 1 || (!isGet && numCol == 1);
++
+     if (store != null && ((HStore)store).getHRegion() != null
+         && ((HStore)store).getHRegion().getBaseConf() != null) {
+-      Configuration conf = ((HStore) store).getHRegion().getBaseConf();
+-      this.maxRowSize =
+-          conf.getLong(HConstants.TABLE_MAX_ROWSIZE_KEY, HConstants.TABLE_MAX_ROWSIZE_DEFAULT);
+-      this.scanUsePread = conf.getBoolean("hbase.storescanner.use.pread", scan.isSmall());
+-
+-      long tmpCellsPerTimeoutCheck =
+-          conf.getLong(HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK,
+-            DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK);
++      HRegionConfiguration conf = ((HStore) store).getHRegion().getHRegionConfiguration();
++      this.maxRowSize = conf.getTableMaxRowSizeKey();
++      this.scanUsePread = scan.isSmall()?true:conf.usePread;
+       this.cellsPerHeartbeatCheck =
+-          tmpCellsPerTimeoutCheck > 0 ? tmpCellsPerTimeoutCheck
++          conf.tmpCellsPerTimeoutCheck > 0 ? conf.tmpCellsPerTimeoutCheck
+               : DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK;
++      if (store.getStorefilesCount() > 1) {
++          // The parallel-seeking is on :
++          // 1) the config value is *true*
++          // 2) store has more than one store file
++          RegionServerServices rsService = ((HStore)store).getHRegion().getRegionServerServices();
++          if (rsService == null || !conf.parallelSeekEnabled) return;
++          isParallelSeekEnabled = true;
++          executor = rsService.getExecutorService();
++      }
+     } else {
+       this.maxRowSize = HConstants.TABLE_MAX_ROWSIZE_DEFAULT;
+       this.scanUsePread = scan.isSmall();
+       this.cellsPerHeartbeatCheck = DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK;
+     }
+ 
+-    // We look up row-column Bloom filters for multi-column queries as part of
+-    // the seek operation. However, we also look the row-column Bloom filter
+-    // for multi-row (non-"get") scans because this is not done in
+-    // StoreFile.passesBloomFilter(Scan, SortedSet<byte[]>).
+-    useRowColBloom = numCol > 1 || (!isGet && numCol == 1);
+ 
+-    // The parallel-seeking is on :
+-    // 1) the config value is *true*
+-    // 2) store has more than one store file
+-    if (store != null && ((HStore)store).getHRegion() != null
+-        && store.getStorefilesCount() > 1) {
+-      RegionServerServices rsService = ((HStore)store).getHRegion().getRegionServerServices();
+-      if (rsService == null || !rsService.getConfiguration().getBoolean(
+-            STORESCANNER_PARALLEL_SEEK_ENABLE, false)) return;
+-      isParallelSeekEnabled = true;
+-      executor = rsService.getExecutorService();
+-    }
+   }
+ 
+   /**

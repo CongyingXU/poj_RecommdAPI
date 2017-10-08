@@ -1,0 +1,153 @@
+From c8e70fd723416a16fce641ffc6f0f49c1963520a Mon Sep 17 00:00:00 2001
+From: Matt Warhaftig <mwarhaftig@gmail.com>
+Date: Thu, 21 Apr 2016 21:56:39 -0400
+Subject: [PATCH] HBASE-15641 Combine shell alter modify table operations.
+
+---
+ hbase-shell/src/main/ruby/hbase/admin.rb      | 44 +++++++++++----------------
+ hbase-shell/src/test/ruby/hbase/admin_test.rb | 17 ++++++++++-
+ 2 files changed, 34 insertions(+), 27 deletions(-)
+
+diff --git a/hbase-shell/src/main/ruby/hbase/admin.rb b/hbase-shell/src/main/ruby/hbase/admin.rb
+index 89131fb..a91d45d 100644
+--- a/hbase-shell/src/main/ruby/hbase/admin.rb
++++ b/hbase-shell/src/main/ruby/hbase/admin.rb
+@@ -545,6 +545,7 @@ module Hbase
+ 
+       # Get table descriptor
+       htd = @admin.getTableDescriptor(TableName.valueOf(table_name))
++      hasTableUpdate = false
+ 
+       # Process all args
+       args.each do |arg|
+@@ -565,18 +566,11 @@ module Hbase
+ 
+           # If column already exist, then try to alter it. Create otherwise.
+           if htd.hasFamily(column_name.to_java_bytes)
+-            @admin.modifyColumn(table_name, descriptor)
++            htd.modifyFamily(descriptor)
+           else
+-            @admin.addColumn(table_name, descriptor)
+-          end
+-
+-          if wait == true
+-            puts "Updating all regions with the new schema..."
+-            alter_status(table_name)
++            htd.addFamily(descriptor)
+           end
+-
+-          # We bypass descriptor when adding column families; refresh it to apply other args correctly.
+-          htd = @admin.getTableDescriptor(TableName.valueOf(table_name))
++          hasTableUpdate = true
+           next
+         end
+ 
+@@ -586,7 +580,8 @@ module Hbase
+           # Delete column family
+           if method == "delete"
+             raise(ArgumentError, "NAME parameter missing for delete method") unless name
+-            @admin.deleteColumn(table_name, name)
++            htd.removeFamily(name.to_java_bytes)
++            hasTableUpdate = true
+           # Unset table attributes
+           elsif method == "table_att_unset"
+             raise(ArgumentError, "NAME parameter missing for table_att_unset method") unless name
+@@ -603,7 +598,7 @@ module Hbase
+               end
+               htd.remove(name)
+             end
+-            @admin.modifyTable(table_name.to_java_bytes, htd)
++            hasTableUpdate = true
+           # Unknown method
+           else
+             raise ArgumentError, "Unknown method: #{method}"
+@@ -613,15 +608,6 @@ module Hbase
+             puts("Unknown argument ignored: %s" % [unknown_key])
+           end
+ 
+-          if wait == true
+-            puts "Updating all regions with the new schema..."
+-            alter_status(table_name)
+-          end
+-
+-          if method == "delete"
+-            # We bypass descriptor when deleting column families; refresh it to apply other args correctly.
+-            htd = @admin.getTableDescriptor(TableName.valueOf(table_name))
+-          end
+           next
+         end
+ 
+@@ -666,19 +652,25 @@ module Hbase
+             arg.delete(key)
+           end
+ 
+-          @admin.modifyTable(table_name.to_java_bytes, htd)
++          hasTableUpdate = true
+ 
+           arg.each_key do |unknown_key|
+             puts("Unknown argument ignored: %s" % [unknown_key])
+           end
+ 
+-          if wait == true
+-            puts "Updating all regions with the new schema..."
+-            alter_status(table_name)
+-          end
+           next
+         end
+       end
++
++      # Bulk apply all table modifications.
++      if hasTableUpdate
++        @admin.modifyTable(table_name, htd)
++
++        if wait == true
++          puts "Updating all regions with the new schema..."
++          alter_status(table_name)
++        end
++      end
+     end
+ 
+     def status(format, type)
+diff --git a/hbase-shell/src/test/ruby/hbase/admin_test.rb b/hbase-shell/src/test/ruby/hbase/admin_test.rb
+index 0a1a92e..330ec2e 100644
+--- a/hbase-shell/src/test/ruby/hbase/admin_test.rb
++++ b/hbase-shell/src/test/ruby/hbase/admin_test.rb
+@@ -19,6 +19,7 @@
+ 
+ require 'shell'
+ require 'shell/formatter'
++require 'stringio'
+ require 'hbase'
+ require 'hbase/hbase'
+ require 'hbase/table'
+@@ -295,12 +296,26 @@ module Hbase
+ 
+     define_test "alter should support more than one alteration in one call" do
+       assert_equal(['x:', 'y:'], table(@test_name).get_all_columns.sort)
+-      admin.alter(@test_name, true, { NAME => 'z' }, { METHOD => 'delete', NAME => 'y' }, 'MAX_FILESIZE' => 12345678)
++      alterOutput = capture_stdout { admin.alter(@test_name, true, { NAME => 'z' },
++        { METHOD => 'delete', NAME => 'y' }, 'MAX_FILESIZE' => 12345678) }
+       admin.enable(@test_name)
++      assert_equal(1, /Updating all regions/.match(alterOutput).size,
++        "HBASE-15641 - Should only perform one table modification per alter.")
+       assert_equal(['x:', 'z:'], table(@test_name).get_all_columns.sort)
+       assert_match(/12345678/, admin.describe(@test_name))
+     end
+ 
++    def capture_stdout
++      begin
++        old_stdout = $stdout
++        $stdout = StringIO.new('','w')
++        yield
++        $stdout.string
++      ensure
++        $stdout = old_stdout
++      end
++    end
++
+     define_test 'alter should support shortcut DELETE alter specs' do
+       assert_equal(['x:', 'y:'], table(@test_name).get_all_columns.sort)
+       admin.alter(@test_name, true, 'delete' => 'y')
+-- 
+2.6.4 (Apple Git-63)
+

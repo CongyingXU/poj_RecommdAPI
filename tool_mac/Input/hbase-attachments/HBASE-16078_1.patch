@@ -1,0 +1,274 @@
+From 1467245111e0e4471e433308658ec1ae88e3d754 Mon Sep 17 00:00:00 2001
+From: Samir Ahmic <samir@personal.com>
+Date: Wed, 22 Jun 2016 19:01:18 +0200
+Subject: [PATCH] HBASE-16078 Create java cli tool for managing balancer states
+ for scripts usage
+
+---
+ bin/graceful_stop.sh                               |   5 +-
+ bin/rolling-restart.sh                             |   4 +-
+ .../hadoop/hbase/util/HBaseBalancerTool.java       | 119 +++++++++++++++++++++
+ .../hadoop/hbase/util/TestHBaseBalancerTool.java   |  80 ++++++++++++++
+ 4 files changed, 204 insertions(+), 4 deletions(-)
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseBalancerTool.java
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseBalancerTool.java
+
+diff --git a/bin/graceful_stop.sh b/bin/graceful_stop.sh
+index 8d08cc9..e7ba6e2 100755
+--- a/bin/graceful_stop.sh
++++ b/bin/graceful_stop.sh
+@@ -106,7 +106,7 @@ if [ "$nob" == "true"  ]; then
+   HBASE_BALANCER_STATE=false
+ else
+   log "Disabling load balancer"
+-  HBASE_BALANCER_STATE=$(echo 'balance_switch false' | "$bin"/hbase --config "${HBASE_CONF_DIR}" shell | tail -3 | head -1)
++  HBASE_BALANCER_STATE=$("$bin"/hbase --config "${HBASE_CONF_DIR}" org.apache.hadoop.hbase.util.HBaseBalancerTool -off 2>/dev/null)
+   log "Previous balancer state was $HBASE_BALANCER_STATE"
+ fi
+ 
+@@ -177,7 +177,8 @@ fi
+ # Restore balancer state
+ if [ "$HBASE_BALANCER_STATE" != "false" ] && [ "$nob" != "true"  ]; then
+   log "Restoring balancer state to $HBASE_BALANCER_STATE"
+-  echo "balance_switch $HBASE_BALANCER_STATE" | "$bin"/hbase --config ${HBASE_CONF_DIR} shell &> /dev/null
++  HBASE_BALANCER_STATE_BEFORE=$("$bin"/hbase --config "${HBASE_CONF_DIR}" org.apache.hadoop.hbase.util.HBaseBalancerTool -on 2>/dev/null)
++  log "Balancer status restored from $HBASE_BALANCER_STATE_BEFORE to $HBASE_BALANCER_STATE"
+ else
+   log "[ $0 ] skipping restoring balancer"
+ fi
+diff --git a/bin/rolling-restart.sh b/bin/rolling-restart.sh
+index 530b76b..fd8f751 100755
+--- a/bin/rolling-restart.sh
++++ b/bin/rolling-restart.sh
+@@ -189,7 +189,7 @@ else
+     zkrs="$zparent/$zkrs"
+     online_regionservers=`$bin/hbase zkcli ls $zkrs 2>&1 | tail -1 | sed "s/\[//" | sed "s/\]//"`
+     echo "Disabling load balancer"
+-    HBASE_BALANCER_STATE=$(echo 'balance_switch false' | "$bin"/hbase --config "${HBASE_CONF_DIR}" shell | tail -3 | head -1)
++    HBASE_BALANCER_STATE=$("$bin"/hbase --config "${HBASE_CONF_DIR}" org.apache.hadoop.hbase.util.HBaseBalancerTool -off 2>/dev/null)
+     echo "Previous balancer state was $HBASE_BALANCER_STATE"
+ 
+     for rs in $online_regionservers
+@@ -209,7 +209,7 @@ else
+     done
+     if [ "$HBASE_BALANCER_STATE" != "false" ]; then
+       echo "Restoring balancer state to $HBASE_BALANCER_STATE"
+-      echo "balance_switch $HBASE_BALANCER_STATE" | "$bin"/hbase --config "${HBASE_CONF_DIR}" shell &> /dev/null
++      "$bin"/hbase --config "${HBASE_CONF_DIR}" org.apache.hadoop.hbase.util.HBaseBalancerTool -on >/dev/null 2>&1
+     fi
+   fi
+ fi
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseBalancerTool.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseBalancerTool.java
+new file mode 100644
+index 0000000..691789a
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseBalancerTool.java
+@@ -0,0 +1,119 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.util;
++
++import java.io.IOException;
++
++import org.apache.commons.cli.CommandLine;
++import org.apache.commons.cli.CommandLineParser;
++import org.apache.commons.cli.HelpFormatter;
++import org.apache.commons.cli.Option;
++import org.apache.commons.cli.Options;
++import org.apache.commons.cli.ParseException;
++import org.apache.commons.cli.PosixParser;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
++import org.apache.hadoop.util.Tool;
++import org.apache.hadoop.util.ToolRunner;
++
++@InterfaceAudience.Private
++public class HBaseBalancerTool implements Tool {
++
++  private Configuration conf;
++  public static final String NAME = "HBaseBalancerTool";
++
++  @Override
++  public void setConf(Configuration conf) {
++    this.conf = conf;
++  }
++
++  @Override
++  public Configuration getConf() {
++    return this.conf;
++  }
++
++  private static CommandLine parseArgs(String[] args) {
++    Options options = new Options();
++
++    Option o = new Option("status", "Return balancer status");
++    options.addOption(o);
++
++    o = new Option("off", "Turn HBase blancer off");
++    options.addOption(o);
++
++    o = new Option("on", "Turn HBase balancer on");
++    options.addOption(o);
++
++    o = new Option("help", "Print help message");
++    options.addOption(o);
++
++    CommandLineParser parser = new PosixParser();
++    CommandLine cmd = null;
++    try {
++      cmd = parser.parse(options, args);
++    } catch(ParseException pe) {
++      System.err.println("ERROR: " + pe.getMessage() + "\n");
++      HelpFormatter formatter = new HelpFormatter();
++      formatter.printHelp(NAME + " ", options, true);
++      return null;
++    }
++
++    return cmd;
++  }
++
++  private static void printUsage() {
++    System.out.println("usage: HBaseBalancerTool  [-off] [-on] [-status]");
++    System.out.println("  -off         Turn off HBase balancer");
++    System.out.println("  -on          Turn on HBase balancer");
++    System.out.println("  -status      Retun HBase balancer status");
++    System.out.println("  -help        Print help message");
++  }
++
++  @Override
++  public int run(String[] args) throws IOException {
++    Configuration conf = this.getConf();
++    Connection connection = ConnectionFactory.createConnection(conf);
++    Admin admin = connection.getAdmin();
++    CommandLine cmd = parseArgs(args);
++    if(cmd == null) return 1;
++    if(cmd.hasOption("status")) {
++      System.out.print(admin.isBalancerEnabled());
++    } else if (cmd.hasOption("off")) {
++      System.out.print(admin.setBalancerRunning(false, false));
++    } else if (cmd.hasOption("on")) {
++      System.out.print(admin.setBalancerRunning(true, false));
++    } else if(cmd.hasOption("help")) {
++      printUsage();
++    } else {
++      System.err.println("UNEXPECTED argument");
++      printUsage();
++      return 1;
++    }
++    connection.close();
++    admin.close();
++    return 0;
++  }
++
++  public static void main(String args[]) throws Exception {
++    ToolRunner.run(HBaseConfiguration.create(), new HBaseBalancerTool(), args);
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseBalancerTool.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseBalancerTool.java
+new file mode 100644
+index 0000000..8533b44
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseBalancerTool.java
+@@ -0,0 +1,80 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.util;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotEquals;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.testclassification.ClientTests;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.util.ToolRunner;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category({MediumTests.class, ClientTests.class})
++public class TestHBaseBalancerTool {
++  private static final Log LOG = LogFactory.getLog(TestHBaseBalancerTool.class);
++  private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  private Admin admin;
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    TEST_UTIL.getConfiguration().setInt("hbase.regionserver.msginterval", 100);
++    TEST_UTIL.getConfiguration().setInt("hbase.client.pause", 250);
++    TEST_UTIL.getConfiguration().setInt("hbase.client.retries.number", 6);
++    TEST_UTIL.getConfiguration().setBoolean("hbase.master.enabletable.roundrobin", true);
++    TEST_UTIL.startMiniCluster(3);
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++  @Before
++  public void setUp() throws Exception {
++    this.admin = TEST_UTIL.getAdmin();
++  }
++
++  @Test
++  public void testHBaseBalancerTool() throws Exception {
++    String[] balancerOff = {"-off"};
++    String[] balancerOn = {"-on"};
++    String[] balancerStatus = {"-status"};
++    String[] badArguments = {"-bad"};
++    int status = ToolRunner.run(TEST_UTIL.getConfiguration(), new HBaseBalancerTool(), balancerOff);
++    assertEquals(status, 0);
++    assertEquals(admin.isBalancerEnabled(), false);
++    status = ToolRunner.run(TEST_UTIL.getConfiguration(), new HBaseBalancerTool(), balancerOn);
++    assertEquals(status, 0);
++    assertEquals(admin.isBalancerEnabled(), true);
++    status = ToolRunner.run(TEST_UTIL.getConfiguration(), new HBaseBalancerTool(), balancerStatus);
++    assertEquals(status, 0);
++    status = ToolRunner.run(TEST_UTIL.getConfiguration(), new HBaseBalancerTool(), badArguments);
++    assertNotEquals(status, 0);
++
++  }
++}
+-- 
+2.7.4
+

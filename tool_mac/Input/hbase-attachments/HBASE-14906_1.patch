@@ -1,0 +1,148 @@
+commit c37838637aef31606ab5bcde57284cacc7562ce4
+Author: Yu Li <jueding.ly@alibaba-inc.com>
+Date:   Thu Dec 3 12:24:08 2015 +0800
+
+    HBASE-14906 Improvements on FlushLargeStoresPolicy
+
+diff --git a/hbase-common/src/main/resources/hbase-default.xml b/hbase-common/src/main/resources/hbase-default.xml
+index fa5d522..37a6298 100644
+--- a/hbase-common/src/main/resources/hbase-default.xml
++++ b/hbase-common/src/main/resources/hbase-default.xml
+@@ -612,16 +612,17 @@ possible configurations would overwhelm and obscure the important.
+     every hbase.server.thread.wakefrequency.</description>
+   </property>
+   <property>
+-    <name>hbase.hregion.percolumnfamilyflush.size.lower.bound</name>
++    <name>hbase.hregion.percolumnfamilyflush.size.lower.bound.min</name>
+     <value>16777216</value>
+     <description>
+-    If FlushLargeStoresPolicy is used, then every time that we hit the
+-    total memstore limit, we find out all the column families whose memstores
+-    exceed this value, and only flush them, while retaining the others whose
+-    memstores are lower than this limit. If none of the families have their
+-    memstore size more than this, all the memstores will be flushed
+-    (just as usual). This value should be less than half of the total memstore
+-    threshold (hbase.hregion.memstore.flush.size).
++    If FlushLargeStoresPolicy is used and there are multiple column families,
++    then every time that we hit the total memstore limit, we find out all the
++    column families whose memstores exceed a "lower bound" and only flush them
++    while retaining the others in memory. The "lower bound" will be
++    "hbase.hregion.memstore.flush.size / column_family_number" by default
++    unless value of this property is larger than that. If none of the families
++    have their memstore size more than lower bound, all the memstores will be
++    flushed (just as usual).
+     </description>
+   </property>
+   <property>
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushLargeStoresPolicy.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushLargeStoresPolicy.java
+index 328e890..dc6cac9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushLargeStoresPolicy.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushLargeStoresPolicy.java
+@@ -38,35 +38,49 @@ public class FlushLargeStoresPolicy extends FlushPolicy {
+   public static final String HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND =
+       "hbase.hregion.percolumnfamilyflush.size.lower.bound";
+ 
+-  private static final long DEFAULT_HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND = 1024 * 1024 * 16L;
++  public static final String HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN =
++      "hbase.hregion.percolumnfamilyflush.size.lower.bound.min";
+ 
+-  private long flushSizeLowerBound;
++  private static final long DEFAULT_HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN =
++      1024 * 1024 * 16L;
++
++  private long flushSizeLowerBound = -1;
+ 
+   @Override
+   protected void configureForRegion(HRegion region) {
+     super.configureForRegion(region);
+-    long flushSizeLowerBound;
++    int familyNumber = region.getTableDesc().getFamilies().size();
++    if (familyNumber == 1) {
++      // no need to parse and set flush size lower bound if only one family
++      return;
++    }
++    // For multiple families, lower bound is the "average flush size" by default
++    // unless setting in configuration is larger.
++    long flushSizeLowerBound = region.getMemstoreFlushSize() / familyNumber;
++    long minimumLowerBound =
++        getConf().getLong(HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN,
++          DEFAULT_HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN);
++    if (minimumLowerBound > flushSizeLowerBound) {
++      flushSizeLowerBound = minimumLowerBound;
++    }
++    // use the setting in table description if any
+     String flushedSizeLowerBoundString =
+         region.getTableDesc().getValue(HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND);
+     if (flushedSizeLowerBoundString == null) {
+-      flushSizeLowerBound =
+-          getConf().getLong(HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND,
+-            DEFAULT_HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND);
+       if (LOG.isDebugEnabled()) {
+-        LOG.debug(HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND
+-            + " is not specified, use global config(" + flushSizeLowerBound + ") instead");
++        LOG.debug("No " + HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND
++            + " set in description of table " + region.getTableDesc().getTableName()
++            + ", use config (" + flushSizeLowerBound + ") instead");
+       }
+     } else {
+       try {
+         flushSizeLowerBound = Long.parseLong(flushedSizeLowerBoundString);
+       } catch (NumberFormatException nfe) {
+-        flushSizeLowerBound =
+-            getConf().getLong(HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND,
+-              DEFAULT_HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND);
++        // fall back for fault setting
+         LOG.warn("Number format exception when parsing "
+             + HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND + " for table "
+             + region.getTableDesc().getTableName() + ":" + flushedSizeLowerBoundString + ". " + nfe
+-            + ", use global config(" + flushSizeLowerBound + ") instead");
++            + ", use config (" + flushSizeLowerBound + ") instead");
+ 
+       }
+     }
+@@ -87,6 +101,11 @@ public class FlushLargeStoresPolicy extends FlushPolicy {
+ 
+   @Override
+   public Collection<Store> selectStoresToFlush() {
++    // no need to select stores if only one family
++    if (region.getTableDesc().getFamilies().size() == 1) {
++      return region.stores.values();
++    }
++    // start selection
+     Collection<Store> stores = region.stores.values();
+     Set<Store> specificStoresToFlush = new HashSet<Store>();
+     for (Store store : stores) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 557edd9..eba1d9f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -8159,4 +8159,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     return this.getRegionInfo().isMetaRegion() ? CellComparator.META_COMPARATOR
+         : CellComparator.COMPARATOR;
+   }
++
++  public long getMemstoreFlushSize() {
++    return this.memstoreFlushSize;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
+index 0df2799..e0c92ff 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
+@@ -568,7 +568,6 @@ public class TestPerColumnFamilyFlush {
+     Configuration conf = TEST_UTIL.getConfiguration();
+     conf.setLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, memstoreFlushSize);
+     conf.set(FlushPolicyFactory.HBASE_FLUSH_POLICY_KEY, FlushAllStoresPolicy.class.getName());
+-    conf.setLong(FlushLargeStoresPolicy.HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND, 400 * 1024);
+     conf.setInt(HStore.BLOCKING_STOREFILES_KEY, 10000);
+     conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,
+       ConstantSizeRegionSplitPolicy.class.getName());
+@@ -608,6 +607,8 @@ public class TestPerColumnFamilyFlush {
+ 
+     LOG.info("==============Test with selective flush enabled===============");
+     conf.set(FlushPolicyFactory.HBASE_FLUSH_POLICY_KEY, FlushLargeStoresPolicy.class.getName());
++    // default value of per-cf flush lower bound is too big, set to a small enough value
++    conf.setLong(FlushLargeStoresPolicy.HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND, 0);
+     try {
+       TEST_UTIL.startMiniCluster(1);
+       TEST_UTIL.getHBaseAdmin().createNamespace(

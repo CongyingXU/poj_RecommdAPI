@@ -1,0 +1,699 @@
+From d8fca4408b13465e413673223676db5970c229ac Mon Sep 17 00:00:00 2001
+From: leochen4891 <leochen4891@gmail.com>
+Date: Mon, 6 Jul 2015 11:24:20 -0400
+Subject: [PATCH] HBASE-13965, added MRU to avoid OOM caused by ever growing
+ map in a dynamic cluster
+
+---
+ .../balancer/MetricsStochasticBalancerSource.java  |  34 ++++
+ .../MetricsStochasticBalancerSourceImpl.java       |  89 +++++++++++
+ ...master.balancer.MetricsStochasticBalancerSource |   1 +
+ .../hbase/master/balancer/BaseLoadBalancer.java    |  21 ++-
+ .../hbase/master/balancer/MetricsBalancer.java     |  10 +-
+ .../master/balancer/MetricsStochasticBalancer.java |  64 ++++++++
+ .../master/balancer/StochasticLoadBalancer.java    | 107 ++++++++++++-
+ .../hbase/TestStochasticBalancerJmxMetrics.java    | 178 +++++++++++++++++++++
+ 8 files changed, 494 insertions(+), 10 deletions(-)
+ create mode 100644 hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSource.java
+ create mode 100644 hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSourceImpl.java
+ create mode 100644 hbase-hadoop2-compat/src/main/resources/META-INF/services/org.apache.hadoop.hbase.master.balancer.MetricsStochasticBalancerSource
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancer.java
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/TestStochasticBalancerJmxMetrics.java
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSource.java
+new file mode 100644
+index 0000000..99db341
+--- /dev/null
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSource.java
+@@ -0,0 +1,34 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.master.balancer;
++
++/**
++ * This interface extends the basic metrics balancer source to add a function 
++ * to report metrics that related to stochastic load balancer. The purpose is to 
++ * offer an insight to the internal cost calculations that can be useful to tune
++ * the balancer. For details, refer to HBASE-13965
++ */
++public interface MetricsStochasticBalancerSource extends MetricsBalancerSource {
++
++  /**
++   * The function that report stochastic load balancer costs to JMX
++   */
++  public void updateStochasticCost(String tableName, String costFunctionName,
++      String costFunctionDesc, Double value);
++}
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSourceImpl.java
+new file mode 100644
+index 0000000..3530358
+--- /dev/null
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancerSourceImpl.java
+@@ -0,0 +1,89 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.master.balancer;
++
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.apache.hadoop.metrics2.MetricsCollector;
++import org.apache.hadoop.metrics2.MetricsRecordBuilder;
++import org.apache.hadoop.metrics2.lib.Interns;
++
++public class MetricsStochasticBalancerSourceImpl extends MetricsBalancerSourceImpl implements
++    MetricsStochasticBalancerSource {
++  private static final String TABLE_FUNCTION_SEP = "_";
++  
++  // TODO this MRU_SIZE is the limit of how many metrics can be reported for stochastic load balancer
++  // It is hard-coded right now, and may be better if is configurable
++  private static final int MRU_SIZE = 1000;
++  private static final float MRU_LOAD_FACTOR = 0.75f;
++  private static final int MRU_CAPACITY = (int)Math.ceil(MRU_SIZE/MRU_LOAD_FACTOR) + 1;
++
++  private Map<String, Map<String, Double>> stochasticCosts = null; 
++  
++  public MetricsStochasticBalancerSourceImpl() {
++    stochasticCosts = Collections.synchronizedMap(
++        new LinkedHashMap<String, Map<String, Double>>(MRU_CAPACITY, MRU_LOAD_FACTOR, true) {
++          private static final long serialVersionUID = 8204713453436906599L;
++
++          @Override
++          protected boolean removeEldestEntry(Map.Entry<String, Map<String, Double>> eldest) {
++            return size() > MRU_SIZE;
++          }
++        });
++  }
++
++  /**
++   * The function that report stochastic load balancer costs to JMX
++   */
++  public void updateStochasticCost(String tableName, String costFunctionName,
++      String costFunctionDesc, Double value) {
++    if (tableName == null || costFunctionName == null) {
++      return;
++    }
++
++    Map<String, Double> costs= stochasticCosts.get(tableName);
++    if (costs== null) {
++      costs= new ConcurrentHashMap<String, Double>();
++    }
++
++    costs.put(costFunctionName, value);
++    stochasticCosts.put(tableName, costs);
++  }
++
++  @Override
++  public void getMetrics(MetricsCollector metricsCollector, boolean all) {
++    MetricsRecordBuilder metricsRecordBuilder = metricsCollector.addRecord(metricsName);
++
++    if (stochasticCosts != null) {
++      for (String tableName : stochasticCosts.keySet()) {
++        Map<String, Double> costs = stochasticCosts.get(tableName);
++        for (String key : costs.keySet()) {
++          double cost = costs.get(key);
++          String attrName = tableName + ((tableName.length() <= 0) ? "" : TABLE_FUNCTION_SEP) + key;
++          metricsRecordBuilder.addGauge(Interns.info(attrName, attrName), cost);
++        }
++      }
++    }
++    metricsRegistry.snapshot(metricsRecordBuilder, all);
++  }
++}
+diff --git a/hbase-hadoop2-compat/src/main/resources/META-INF/services/org.apache.hadoop.hbase.master.balancer.MetricsStochasticBalancerSource b/hbase-hadoop2-compat/src/main/resources/META-INF/services/org.apache.hadoop.hbase.master.balancer.MetricsStochasticBalancerSource
+new file mode 100644
+index 0000000..c3edc48
+--- /dev/null
++++ b/hbase-hadoop2-compat/src/main/resources/META-INF/services/org.apache.hadoop.hbase.master.balancer.MetricsStochasticBalancerSource
+@@ -0,0 +1 @@
++org.apache.hadoop.hbase.master.balancer.MetricsStochasticBalancerSourceImpl
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+index f527931..1e040ff 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+@@ -45,7 +45,6 @@ import org.apache.hadoop.hbase.RegionLoad;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.RegionReplicaUtil;
+-import org.apache.hadoop.hbase.conf.ConfigurationObserver;
+ import org.apache.hadoop.hbase.master.LoadBalancer;
+ import org.apache.hadoop.hbase.master.MasterServices;
+ import org.apache.hadoop.hbase.master.RackManager;
+@@ -80,6 +79,24 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+       return UNKNOWN_RACK;
+     }
+   }
++  
++  /**
++   * The constructor that uses the basic MetricsBalancer
++   */
++  protected BaseLoadBalancer() {
++    metricsBalancer = new MetricsBalancer();
++  }
++  
++  /**
++   * This constructor that accepts an instance of MetricsBalancer, 
++   * which will be used instead of creating a new one
++   */
++  protected BaseLoadBalancer(MetricsBalancer metricsBalancer) {
++    if (metricsBalancer != null)
++      this.metricsBalancer = metricsBalancer; 
++    else
++      this.metricsBalancer = new MetricsBalancer();
++  }
+ 
+   /**
+    * An efficient array based implementation similar to ClusterState for keeping
+@@ -803,7 +820,7 @@ public abstract class BaseLoadBalancer implements LoadBalancer {
+     "hbase.balancer.tablesOnMaster";
+ 
+   protected final Set<String> tablesOnMaster = new HashSet<String>();
+-  protected final MetricsBalancer metricsBalancer = new MetricsBalancer();
++  protected MetricsBalancer metricsBalancer = null;
+   protected ClusterStatus clusterStatus = null;
+   protected ServerName masterServerName;
+   protected MasterServices services;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsBalancer.java
+index 518c2f0..3707536 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsBalancer.java
+@@ -25,9 +25,17 @@ import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
+  */
+ public class MetricsBalancer {
+ 
+-  private final MetricsBalancerSource source;
++  private MetricsBalancerSource source = null;
+ 
+   public MetricsBalancer() {
++    initSource();
++  }
++  
++  /**
++   * A function to instantiate the metrics source. This function can be overridden in its 
++   * subclasses to provide extended sources
++   */
++  protected void initSource() {
+     source = CompatibilitySingletonFactory.getInstance(MetricsBalancerSource.class);
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancer.java
+new file mode 100644
+index 0000000..1d6bd70
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/MetricsStochasticBalancer.java
+@@ -0,0 +1,64 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.master.balancer;
++
++import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
++
++/**
++ * This metrics balancer uses extended source for stochastic load balancer
++ * to report its related metrics to JMX. For details, refer to HBASE-13965
++ */
++public class MetricsStochasticBalancer extends MetricsBalancer {
++  /**
++   * Use the stochastic source instead of the default source.
++   */
++  private MetricsStochasticBalancerSource stochasticSource = null;
++
++  public MetricsStochasticBalancer() {
++    initSource();
++  }
++
++  /**
++   * This function overrides the initSource in the MetricsBalancer, use
++   * MetricsStochasticBalancerSource instead of the MetricsBalancerSource.
++   */
++  @Override
++  protected void initSource() {
++    stochasticSource =
++        CompatibilitySingletonFactory.getInstance(MetricsStochasticBalancerSource.class);
++  }
++
++  @Override
++  public void balanceCluster(long time) {
++    stochasticSource.updateBalanceCluster(time);
++  }
++
++  @Override
++  public void incrMiscInvocations() {
++    stochasticSource.incrMiscInvocations();
++  }
++
++  /**
++   * The function that report stochastic load balancer costs to JMX
++   */
++  public void updateStochasticCost(String tableName, String costFunctionName,
++      String costFunctionDesc, Double value) {
++    stochasticSource.updateStochasticCost(tableName, costFunctionName, costFunctionDesc, value);
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+index 4955cfa..5f0079c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+@@ -38,6 +38,7 @@ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.RegionLoad;
+ import org.apache.hadoop.hbase.ServerLoad;
+ import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.master.MasterServices;
+ import org.apache.hadoop.hbase.master.RegionPlan;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action;
+@@ -117,12 +118,26 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   private CandidateGenerator[] candidateGenerators;
+   private CostFromRegionLoadFunction[] regionLoadFunctions;
+   private CostFunction[] costFunctions;
++
++  // to save and report costs to JMX
++  private Double curOverallCost;
++  private Double[] lastSubcosts;
++  private Double[] curSubcosts;
++
+   // Keep locality based picker and cost function to alert them
+   // when new services are offered
+   private LocalityBasedCandidateGenerator localityCandidateGenerator;
+   private LocalityCostFunction localityCost;
+   private RegionReplicaHostCostFunction regionReplicaHostCostFunction;
+   private RegionReplicaRackCostFunction regionReplicaRackCostFunction;
++  
++  /**
++   * The constructor that pass a MetricsStochasticBalancer to BaseLoadBalancer to replace its
++   * default MetricsBalancer
++   */
++  public StochasticLoadBalancer() {
++    super(new MetricsStochasticBalancer());
++  }
+ 
+   @Override
+   public void onConfigurationChange(Configuration conf) {
+@@ -177,6 +192,10 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       regionLoadFunctions[2],
+       regionLoadFunctions[3],
+     };
++    
++    lastSubcosts = new Double[costFunctions.length];
++    curSubcosts = new Double[costFunctions.length];
++
+   }
+ 
+   @Override
+@@ -277,6 +296,11 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       // Should this be kept?
+       if (newCost < currentCost) {
+         currentCost = newCost;
++
++        curOverallCost = currentCost;
++        for (int i = 0; i < this.curSubcosts.length; i++) {
++          curSubcosts[i] = lastSubcosts[i];
++        }
+       } else {
+         // Put things back the way they were before.
+         // TODO: undo by remembering old values
+@@ -304,6 +328,23 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+             + plans.size() + " regions; Going from a computed cost of "
+             + initCost + " to a new cost of " + currentCost);
+       }
++
++      // check if the metricsBalancer is MetricsStochasticBalancer before casting
++      if (metricsBalancer instanceof MetricsStochasticBalancer) {
++        String tableName = getTableNameFromCluster(clusterState);
++        // overall cost
++        ((MetricsStochasticBalancer) metricsBalancer).updateStochasticCost(tableName, "Overall",
++          "Overall cost", curOverallCost);
++
++        // each cost function
++        for (int i = 0; i < costFunctions.length; i++) {
++          CostFunction costFunction = costFunctions[i];
++          String costFunctionName = costFunction.getClass().getSimpleName();
++          ((MetricsStochasticBalancer) metricsBalancer).updateStochasticCost(tableName,
++            costFunctionName, costFunctionName, curSubcosts[i]);
++        }
++      }
++
+       return plans;
+     }
+     if (LOG.isDebugEnabled()) {
+@@ -390,6 +431,20 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   }
+ 
+   /**
++   * Get the names of the cost functions
++   */
++  public String[] getCostFunctionNames() {
++    if (costFunctions == null) return null;
++    String[] ret = new String[costFunctions.length];
++    for (int i = 0; i < costFunctions.length; i++) {
++      CostFunction c = costFunctions[i];
++      ret[i] = c.getClass().getSimpleName();
++    }
++
++    return ret;
++  }
++
++  /**
+    * This is the main cost function.  It will compute a cost associated with a proposed cluster
+    * state.  All different costs will be combined with their multipliers to produce a double cost.
+    *
+@@ -401,17 +456,25 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   protected double computeCost(Cluster cluster, double previousCost) {
+     double total = 0;
+ 
+-    for (CostFunction c:costFunctions) {
++    for (int i = 0; i < costFunctions.length; i++) {
++      CostFunction c = costFunctions[i];
++      this.lastSubcosts[i] = 0.0;
++      
+       if (c.getMultiplier() <= 0) {
+         continue;
+       }
+ 
+-      total += c.getMultiplier() * c.cost();
++      Float multiplier = c.getMultiplier();
++      Double cost = c.cost();
++
++      this.lastSubcosts[i] = multiplier*cost;
++      total += multiplier * cost;
+ 
+       if (total > previousCost) {
+-        return total;
++        break;
+       }
+     }
++    
+     return total;
+   }
+ 
+@@ -502,7 +565,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       return getAction(thisServer, thisRegion, otherServer, otherRegion);
+     }
+ 
+-    protected Cluster.Action getAction (int fromServer, int fromRegion,
++    protected Cluster.Action getAction(int fromServer, int fromRegion,
+         int toServer, int toRegion) {
+       if (fromServer < 0 || toServer < 0) {
+         return Cluster.NullAction;
+@@ -710,7 +773,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+ 
+       int toServerIndex = pickOtherRandomServer(cluster, serverIndex);
+       int toRegionIndex = pickRandomRegion(cluster, toServerIndex, 0.9f);
+-      return getAction (serverIndex, regionIndex, toServerIndex, toRegionIndex);
++      return getAction(serverIndex, regionIndex, toServerIndex, toRegionIndex);
+     }
+   }
+ 
+@@ -743,7 +806,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       int rand = RANDOM.nextInt(cluster.serversPerRack[toRackIndex].length);
+       int toServerIndex = cluster.serversPerRack[toRackIndex][rand];
+       int toRegionIndex = pickRandomRegion(cluster, toServerIndex, 0.9f);
+-      return getAction (serverIndex, regionIndex, toServerIndex, toRegionIndex);
++      return getAction(serverIndex, regionIndex, toServerIndex, toRegionIndex);
+     }
+   }
+ 
+@@ -1277,7 +1340,8 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+ 
+     public RegionReplicaRackCostFunction(Configuration conf) {
+       super(conf);
+-      this.setMultiplier(conf.getFloat(REGION_REPLICA_RACK_COST_KEY, DEFAULT_REGION_REPLICA_RACK_COST_KEY));
++      this.setMultiplier(conf.getFloat(REGION_REPLICA_RACK_COST_KEY, 
++        DEFAULT_REGION_REPLICA_RACK_COST_KEY));
+     }
+ 
+     @Override
+@@ -1349,4 +1413,33 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+       return rl.getStorefileSizeMB();
+     }
+   }
++  
++  /**
++   * Get the table name used as key in assignmentsByTable in HMaster's balance()
++   * // TODO: find better way to get the table name? 
++   */
++  public static String getTableNameFromCluster(Map<ServerName, List<HRegionInfo>> clusterState) {
++    String tableName = null;
++
++      // find the first region with not empty table name
++      for (List<HRegionInfo> list: clusterState.values()) {
++        for(HRegionInfo info : list) {
++          TableName name = info.getTable();
++          if (name != null) tableName = name.getNameAsString();
++          if (tableName != null) break;
++        }
++          if (tableName != null) break;
++      }
++      
++      // table name cannot be null
++      return (tableName==null?"":tableName);
++  }
++
++  /**
++   * A helper function to compose the attribute name from tablename and costfunction name
++   */
++  public static String composeAttributeName(String tableName, String costFunctionName) {
++    if (tableName == null) tableName = "";
++    return tableName + ((tableName.length() <= 0) ? "" : "_") + costFunctionName;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/TestStochasticBalancerJmxMetrics.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestStochasticBalancerJmxMetrics.java
+new file mode 100644
+index 0000000..894c267
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestStochasticBalancerJmxMetrics.java
+@@ -0,0 +1,178 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase;
++
++
++import static org.junit.Assert.assertTrue;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
++import org.apache.hadoop.hbase.master.balancer.BalancerTestBase;
++import org.apache.hadoop.hbase.master.balancer.StochasticLoadBalancer;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.hbase.testclassification.MiscTests;
++import org.apache.hadoop.net.DNSToSwitchMapping;
++
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.FixMethodOrder;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++import org.junit.runners.MethodSorters;
++
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Hashtable;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import javax.management.MBeanAttributeInfo;
++import javax.management.MBeanInfo;
++import javax.management.MBeanServerConnection;
++import javax.management.ObjectName;
++import javax.management.remote.JMXConnector;
++import javax.management.remote.JMXConnectorFactory;
++
++
++
++@Category({ MiscTests.class, MediumTests.class })
++@FixMethodOrder(MethodSorters.NAME_ASCENDING)
++public class TestStochasticBalancerJmxMetrics extends BalancerTestBase {
++  private static final Log LOG = LogFactory.getLog(TestStochasticBalancerJmxMetrics.class);
++  private static HBaseTestingUtility UTIL = new HBaseTestingUtility();
++  private static int connectorPort = 61120;
++  private static StochasticLoadBalancer loadBalancer;
++  /**
++   * a simple cluster for testing JMX.
++   */
++  private static int[] mockCluster = new int[] { 0, 1, 2, 3 };
++
++  /**
++   * Setup the environment for the test.
++   */
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++
++    Configuration conf = UTIL.getConfiguration();
++
++    conf.setClass("hbase.util.ip.to.rack.determiner", MockMapping.class, DNSToSwitchMapping.class);
++    conf.setFloat("hbase.master.balancer.stochastic.maxMovePercent", 0.75f);
++    conf.setFloat("hbase.regions.slop", 0.0f);
++    conf.set(CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY, JMXListener.class.getName());
++    conf.setInt("regionserver.rmi.registry.port", connectorPort);
++
++    loadBalancer = new StochasticLoadBalancer();
++    loadBalancer.setConf(conf);
++
++    UTIL.startMiniCluster();
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    UTIL.shutdownMiniCluster();
++  }
++
++  /**
++   * To test if the attributes of stochastic load balancer are added to JMX.
++   */
++  @Test
++  public void testJmxAttributes() throws Exception {
++
++    Map<ServerName, List<HRegionInfo>> clusterState = mockClusterServers(mockCluster);
++    loadBalancer.balanceCluster(clusterState);
++
++    String tableName = StochasticLoadBalancer.getTableNameFromCluster(clusterState);
++
++    JMXConnector connector =
++        JMXConnectorFactory.connect(JMXListener.buildJMXServiceURL(connectorPort, connectorPort));
++    MBeanServerConnection mb = connector.getMBeanServerConnection();
++
++    // confirm that all the attributes are in the attribute list
++    // create the object name
++    Hashtable<String, String> pairs = new Hashtable<>();
++    pairs.put("service", "HBase");
++    pairs.put("name", "Master");
++    pairs.put("sub", "Balancer");
++    ObjectName target = new ObjectName("Hadoop", pairs);
++    MBeanInfo beanInfo = mb.getMBeanInfo(target);
++    
++    // put all the attributes in a hashset for quick search
++    Set<String> existingAttrs= new HashSet<String>();
++    for (MBeanAttributeInfo attrInfo : beanInfo.getAttributes()) {
++      existingAttrs.add(attrInfo.getName());
++    }
++    // printAttributesToLog(mb, target);
++
++    // confirm that all the required attributes are in the set
++    String[] functionNames = loadBalancer.getCostFunctionNames();
++    for (String functionName : functionNames) {
++      String attrName = StochasticLoadBalancer.composeAttributeName(tableName, functionName);
++      assertTrue("Attribute " + attrName + " can not be found in " + target, 
++          existingAttrs.contains(attrName));
++    }
++
++    connector.close();
++  }
++
++  /**
++   * Print all the domains in the JMX.
++   */
++  private static void printDomainsToLog(MBeanServerConnection mb) {
++    try {
++      String[] domains = mb.getDomains();
++      Arrays.sort(domains);
++      for (int i = 0; i < domains.length; i++) {
++        LOG.info("++++ domain[" + i + "] = " + domains[i]);
++      }
++      LOG.info("++++ default domain = " + mb.getDefaultDomain());
++
++      LOG.info("++++");
++      LOG.info("++++ MBean count = " + mb.getMBeanCount());
++      int index = 0;
++      Set<ObjectName> names = new HashSet<ObjectName>(mb.queryNames(null, null));
++      for (ObjectName name : names) {
++        LOG.info("++++   " + index + ":" + name);
++        index++;
++      }
++    } catch (Exception e) {
++      LOG.info("++++ printDomainsToLog got exception: " + e.getMessage());
++    }
++  }
++
++  /** 
++   * Print all the attributes in the MBean.
++   */
++  private static void printAttributesToLog(MBeanServerConnection mb, ObjectName target) {
++    try {
++      MBeanInfo beanInfo = mb.getMBeanInfo(target);
++      LOG.info("++++ Attribute count = " + beanInfo.getAttributes().length);
++      int index = 0;
++      for (MBeanAttributeInfo attrInfo : beanInfo.getAttributes()) {
++        LOG.info("++++   " + index + ":" + attrInfo.getName() + ":"
++            + mb.getAttribute(target, attrInfo.getName()));
++        index++;
++      }
++    } catch (Exception e) {
++      LOG.info("++++ printAttributesToLog got exception: " + e.getMessage());
++    }
++  }
++}
+\ No newline at end of file
+-- 
+2.1.4
+

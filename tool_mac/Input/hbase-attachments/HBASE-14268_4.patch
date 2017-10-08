@@ -1,0 +1,324 @@
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/KeyLocker.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/KeyLocker.java
+index 5398582..fce5e32 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/KeyLocker.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/KeyLocker.java
+@@ -18,49 +18,45 @@
+ 
+ package org.apache.hadoop.hbase.util;
+ 
+-
+-import java.util.HashMap;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.SortedSet;
+-import java.util.TreeSet;
+-import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ 
+ /**
+  * A utility class to manage a set of locks. Each lock is identified by a String which serves
+- * as a key. Typical usage is: <p>
+- * class Example{
+- * private final static KeyLocker&lt;String&gt; locker = new Locker&lt;String&gt;();
+- * </p>
+- * <p>
+- * public void foo(String s){
+- * Lock lock = locker.acquireLock(s);
+- * try {
+- * // whatever
+- * }finally{
+- * lock.unlock();
+- * }
+- * }
++ * as a key. Typical usage is: <pre>
++ * class Example {
++ *   private final static KeyLocker&lt;String&gt; locker = new Locker&lt;String&gt;();
++ *   public void foo(String s){
++ *     Lock lock = locker.acquireLock(s);
++ *     try {
++ *       // whatever
++ *     }finally{
++ *       lock.unlock();
++ *     }
++ *   }
+  * }
+- * </p>
++ * </pre>
+  */
+ @InterfaceAudience.Private
+ public class KeyLocker<K extends Comparable<? super K>> {
+-  private static final Log LOG = LogFactory.getLog(KeyLocker.class);
+-
+   // The number of lock we want to easily support. It's not a maximum.
+   private static final int NB_CONCURRENT_LOCKS = 1000;
+ 
+-  // We need an atomic counter to manage the number of users using the lock and free it when
+-  //  it's equal to zero.
+-  private final Map<K, Pair<KeyLock<K>, AtomicInteger>> locks =
+-    new HashMap<K, Pair<KeyLock<K>, AtomicInteger>>(NB_CONCURRENT_LOCKS);
++  private final WeakObjectPool<K, ReentrantLock> lockPool =
++      new WeakObjectPool<K, ReentrantLock> (
++          NB_CONCURRENT_LOCKS,
++          new WeakObjectPool.ObjectFactory<K, ReentrantLock>() {
++            @Override
++            public ReentrantLock createObject(K key) { return new ReentrantLock(); }
++          });
+ 
+   /**
+    * Return a lock for the given key. The lock is already locked.
+@@ -70,67 +66,31 @@ public class KeyLocker<K extends Comparable<? super K>> {
+   public ReentrantLock acquireLock(K key) {
+     if (key == null) throw new IllegalArgumentException("key must not be null");
+ 
+-    Pair<KeyLock<K>, AtomicInteger> lock;
+-    synchronized (this) {
+-      lock = locks.get(key);
+-      if (lock == null) {
+-        lock = new Pair<KeyLock<K>, AtomicInteger>(
+-          new KeyLock<K>(this, key), new AtomicInteger(1));
+-        locks.put(key, lock);
+-      } else {
+-        lock.getSecond().incrementAndGet();
+-      }
+-    }
+-    lock.getFirst().lock();
+-    return lock.getFirst();
++    lockPool.purge();
++    ReentrantLock lock = lockPool.get(key);
++
++    lock.lock();
++    return lock;
+   }
+ 
+   /**
+    * Acquire locks for a set of keys. The keys will be
+    * sorted internally to avoid possible deadlock.
+    */
+-  public Map<K, Lock> acquireLocks(final Set<K> keys) {
+-    Map<K, Lock> locks = new HashMap<K, Lock>(keys.size());
+-    SortedSet<K> sortedKeys = new TreeSet<K>(keys);
+-    for (K key : sortedKeys) {
+-      locks.put(key, acquireLock(key));
+-    }
+-    return locks;
+-  }
++  public Map<K, Lock> acquireLocks(Set<? extends K> keys) {
++    List<K> keyList = new ArrayList<K>(keys);
++    Collections.sort(keyList);
+ 
+-  /**
+-   * Free the lock for the given key.
+-   */
+-  private synchronized void releaseLock(K key) {
+-    Pair<KeyLock<K>, AtomicInteger> lock = locks.get(key);
+-    if (lock != null) {
+-      if (lock.getSecond().decrementAndGet() == 0) {
+-        locks.remove(key);
+-      }
+-    } else {
+-      String message = "Can't release the lock for " + key+", this key is not in the key list." +
+-        " known keys are: "+ locks.keySet();
+-      LOG.error(message);
+-      throw new RuntimeException(message);
+-    }
+-  }
+-
+-  static class KeyLock<K extends Comparable<? super K>> extends ReentrantLock {
+-    private static final long serialVersionUID = -12432857283423584L;
+-
+-    private final transient KeyLocker<K> locker;
+-    private final K lockId;
+-
+-    private KeyLock(KeyLocker<K> locker, K lockId) {
+-      super();
+-      this.locker = locker;
+-      this.lockId = lockId;
++    lockPool.purge();
++    Map<K, Lock> locks = new LinkedHashMap<K, Lock>(keyList.size());
++    for (K key : keyList) {
++      ReentrantLock lock = lockPool.get(key);
++      locks.put(key, lock);
+     }
+ 
+-    @Override
+-    public void unlock() {
+-      super.unlock();
+-      locker.releaseLock(lockId);
++    for (Lock lock : locks.values()) {
++      lock.lock();
+     }
++    return locks;
+   }
+ }
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/WeakObjectPool.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/WeakObjectPool.java
+new file mode 100644
+index 0000000..9733c04
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/WeakObjectPool.java
+@@ -0,0 +1,122 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.util;
++
++import java.lang.ref.ReferenceQueue;
++import java.lang.ref.WeakReference;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * {@code WeakReference} based shared object pool.
++ * The objects are created by {@link ObjectFactory} on demand.
++ * Thread safe.
++ */
++@InterfaceAudience.Private
++public class WeakObjectPool<K, V> {
++  public interface ObjectFactory<K, V> {
++    V createObject(K key);
++  }
++
++  private final ReferenceQueue<V> staleRefQueue = new ReferenceQueue<V>();
++
++  private class ObjectReference extends WeakReference<V> {
++    final K key;
++
++    ObjectReference(K key, V obj) {
++      super(obj, staleRefQueue);
++      this.key = key;
++    }
++  }
++
++  /** Does not permit null keys. */
++  private final ConcurrentMap<K, ObjectReference> referenceCache;
++  private final ObjectFactory<K, V> objectFactory;
++
++  /**
++   * @throws IllegalArgumentException if {@code initCapacity} is negative
++   * @throws NullPointerException if {@code objectFactory} is null
++   */
++  public WeakObjectPool(int initCapacity, ObjectFactory<K, V> objectFactory) {
++    this.referenceCache = new ConcurrentHashMap<K, ObjectReference>(initCapacity);
++
++    if (objectFactory == null) { throw new NullPointerException(); }
++    this.objectFactory = objectFactory;
++  }
++
++  /**
++   * Removes stale references of shared objects from the pool.
++   */
++  public void purge() {
++    // This method is lightweight while there is no stale reference
++    // with the Oracle (Sun) implementation of {@code ReferenceQueue},
++    // because {@code ReferenceQueue.poll} just checks a volatile instance
++    // variable in {@code ReferenceQueue}.
++
++    while (true) {
++      @SuppressWarnings("unchecked")
++      ObjectReference ref = (ObjectReference)staleRefQueue.poll();
++      if (ref == null) {
++        break;
++      }
++      referenceCache.remove(ref.key, ref);
++    }
++  }
++
++  /**
++   * Returns a shared object.
++   * @throws NullPointerException if {@code key} is null
++   */
++  public V get(K key) {
++    ObjectReference ref = referenceCache.get(key);
++    if (ref != null) {
++      V obj = ref.get();
++      if (obj != null) {
++        return obj;
++      }
++      referenceCache.remove(key, ref);
++    }
++
++    V newObj = objectFactory.createObject(key);
++    ObjectReference newRef = new ObjectReference(key, newObj);
++    while (true) {
++      ObjectReference existingRef = referenceCache.putIfAbsent(key, newRef);
++      if (existingRef == null) {
++        return newObj;
++      }
++
++      V existingObject = existingRef.get();
++      if (existingObject != null) {
++        return existingObject;
++      }
++      referenceCache.remove(key, existingRef);
++    }
++  }
++
++  /**
++   * Returns an estimated size of the pool.
++   * This also counts stale references,
++   * and you might want to call {@link #purge()} beforehand.
++   */
++  public int size() {
++    return referenceCache.size();
++  }
++}
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/util/TestKeyLocker.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/util/TestKeyLocker.java
+index 9bb8a04..40b918c 100644
+--- a/hbase-common/src/test/java/org/apache/hadoop/hbase/util/TestKeyLocker.java
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/util/TestKeyLocker.java
+@@ -30,7 +30,7 @@ import org.junit.experimental.categories.Category;
+ public class TestKeyLocker {
+   @Test
+   public void testLocker(){
+-    KeyLocker<String> locker = new KeyLocker();
++    KeyLocker<String> locker = new KeyLocker<String>();
+     ReentrantLock lock1 = locker.acquireLock("l1");
+     Assert.assertTrue(lock1.isHeldByCurrentThread());
+ 
+@@ -51,9 +51,19 @@ public class TestKeyLocker {
+     lock2.unlock();
+     Assert.assertFalse(lock20.isHeldByCurrentThread());
+ 
+-    // The lock object was freed once useless, so we're recreating a new one
++    // The lock object will be garbage-collected
++    // if you free its reference for a long time,
++    // and you will get a new one at the next time.
++    int lock2Hash = System.identityHashCode(lock2);
++    lock2 = null;
++    lock20 = null;
++
++    System.gc();
++    System.gc();
++    System.gc();
++
+     ReentrantLock lock200 = locker.acquireLock("l2");
+-    Assert.assertTrue(lock2 != lock200);
++    Assert.assertNotEquals(lock2Hash, System.identityHashCode(lock200));
+     lock200.unlock();
+     Assert.assertFalse(lock200.isHeldByCurrentThread());
+ 

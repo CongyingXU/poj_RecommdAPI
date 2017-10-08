@@ -1,0 +1,161 @@
+From 944c44b348c5795d166183f9dacea91b370f2208 Mon Sep 17 00:00:00 2001
+From: Andrew Purtell <apurtell@apache.org>
+Date: Thu, 6 Nov 2014 11:04:48 -0800
+Subject: [PATCH 1/3] HBASE-12424 Finer grained logging and metrics for split
+ transactions
+
+Export a RegionServer histogram metric for total split transaction
+running time name "splitTime"
+---
+ .../regionserver/MetricsRegionServerSource.java    |  8 ++++++++
+ .../MetricsRegionServerSourceImpl.java             | 10 +++++++--
+ .../hbase/regionserver/MetricsRegionServer.java    |  4 ++++
+ .../hadoop/hbase/regionserver/SplitRequest.java    | 24 ++++++++++++++--------
+ 4 files changed, 36 insertions(+), 10 deletions(-)
+
+diff --git a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+index fa79523..a5fd8e4 100644
+--- a/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
++++ b/hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSource.java
+@@ -112,6 +112,12 @@ public interface MetricsRegionServerSource extends BaseSource {
+    */
+   void incrSlowAppend();
+ 
++  /**
++   * Update the split transaction time histogram
++   * @param t time it took, in milliseconds
++   */
++  void updateSplitTime(long t);
++
+   // Strings used for exporting to metrics system.
+   String REGION_COUNT = "regionCount";
+   String REGION_COUNT_DESC = "Number of regions";
+@@ -239,4 +245,6 @@ public interface MetricsRegionServerSource extends BaseSource {
+   String HEDGED_READ_WINS = "hedgedReadWins";
+   String HEDGED_READ_WINS_DESC =
+       "The number of times we started a hedged read and a hedged read won";
++
++  String SPLIT_KEY = "splitTime";
+ }
+diff --git a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+index a6377c0..9500e98 100644
+--- a/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
++++ b/hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServerSourceImpl.java
+@@ -35,8 +35,6 @@ import org.apache.hadoop.metrics2.lib.MutableCounterLong;
+ public class MetricsRegionServerSourceImpl
+     extends BaseSourceImpl implements MetricsRegionServerSource {
+ 
+-
+-
+   final MetricsRegionServerWrapper rsWrap;
+   private final MetricHistogram putHisto;
+   private final MetricHistogram deleteHisto;
+@@ -51,6 +49,7 @@ public class MetricsRegionServerSourceImpl
+   private final MutableCounterLong slowIncrement;
+   private final MutableCounterLong slowAppend;
+ 
++  private final MetricHistogram splitTimeHisto;
+ 
+   public MetricsRegionServerSourceImpl(MetricsRegionServerWrapper rsWrap) {
+     this(METRICS_NAME, METRICS_DESCRIPTION, METRICS_CONTEXT, METRICS_JMX_CONTEXT, rsWrap);
+@@ -80,6 +79,8 @@ public class MetricsRegionServerSourceImpl
+     slowAppend = getMetricsRegistry().newCounter(SLOW_APPEND_KEY, SLOW_APPEND_DESC, 0l);
+     
+     replayHisto = getMetricsRegistry().newHistogram(REPLAY_KEY);
++
++    splitTimeHisto = getMetricsRegistry().newHistogram(SPLIT_KEY);
+   }
+ 
+   @Override
+@@ -137,6 +138,11 @@ public class MetricsRegionServerSourceImpl
+     slowAppend.incr();
+   }
+ 
++  @Override
++  public void updateSplitTime(long t) {
++    splitTimeHisto.add(t);
++  }
++
+   /**
+    * Yes this is a get function that doesn't return anything.  Thanks Hadoop for breaking all
+    * expectations of java programmers.  Instead of returning anything Hadoop metrics expects
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
+index 2f1aaaa..3f369be 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsRegionServer.java
+@@ -94,4 +94,8 @@ public class MetricsRegionServer {
+   public void updateReplay(long t){
+     serverSource.updateReplay(t);
+   }
++
++  public void updateSplitTime(long t) {
++    serverSource.updateSplitTime(t);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitRequest.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitRequest.java
+index fb9598b..e704d92 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitRequest.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitRequest.java
+@@ -25,6 +25,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.master.TableLockManager.TableLock;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -60,10 +61,10 @@ class SplitRequest implements Runnable {
+         this.server.isStopping() + " or stopped=" + this.server.isStopped());
+       return;
+     }
++    boolean success = false;
++    long startTime = EnvironmentEdgeManager.currentTime();
++    SplitTransaction st = new SplitTransaction(parent, midKey);
+     try {
+-      final long startTime = System.currentTimeMillis();
+-      SplitTransaction st = new SplitTransaction(parent, midKey);
+-
+       //acquire a shared read lock on the table, so that table schema modifications
+       //do not happen concurrently
+       tableLock = server.getTableLockManager().readLock(parent.getTableDesc().getTableName()
+@@ -80,6 +81,7 @@ class SplitRequest implements Runnable {
+       if (!st.prepare()) return;
+       try {
+         st.execute(this.server, this.server);
++        success = true;
+       } catch (Exception e) {
+         if (this.server.isStopping() || this.server.isStopped()) {
+           LOG.info(
+@@ -106,11 +108,6 @@ class SplitRequest implements Runnable {
+         }
+         return;
+       }
+-      LOG.info("Region split, hbase:meta updated, and report to master. Parent="
+-          + parent.getRegionNameAsString() + ", new regions: "
+-          + st.getFirstDaughter().getRegionNameAsString() + ", "
+-          + st.getSecondDaughter().getRegionNameAsString() + ". Split took "
+-          + StringUtils.formatTimeDiff(System.currentTimeMillis(), startTime));
+     } catch (IOException ex) {
+       ex = ex instanceof RemoteException ? ((RemoteException) ex).unwrapRemoteException() : ex;
+       LOG.error("Split failed " + this, ex);
+@@ -128,6 +125,17 @@ class SplitRequest implements Runnable {
+         parent.clearSplit();
+       }
+       releaseTableLock();
++      long endTime = EnvironmentEdgeManager.currentTime();
++      // Update regionserver metrics with the split transaction total running time
++      server.metricsRegionServer.updateSplitTime(endTime - startTime);
++      if (success) {
++        // Log success
++        LOG.info("Region split, hbase:meta updated, and report to master. Parent="
++            + parent.getRegionNameAsString() + ", new regions: "
++            + st.getFirstDaughter().getRegionNameAsString() + ", "
++            + st.getSecondDaughter().getRegionNameAsString() + ". Split took "
++            + StringUtils.formatTimeDiff(EnvironmentEdgeManager.currentTime(), startTime));
++      }
+     }
+   }
+ 
+-- 
+1.7.12.4 (Apple Git-37)
+

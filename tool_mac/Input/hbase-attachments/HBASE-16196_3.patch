@@ -1,0 +1,284 @@
+From 6474d54845670003ddd610d7344f98128130aa42 Mon Sep 17 00:00:00 2001
+From: Matt Mullins <mmullins@fb.com>
+Date: Tue, 5 Jul 2016 14:51:44 -0700
+Subject: [PATCH] Update to JRuby 9.1.2.0 and JLine 2.12
+
+The update to JLine 2.12 changed the factory methods to retrieve a
+Terminal and its width.
+
+This also fixes warnings when running `hbase shell` due to renamed Ruby
+APIs.
+
+The shell's exception handling has been updated to handle Ruby 2.1's
+addition of Exception#cause - this patch continues to throw a Ruby
+RuntimeError instead of walking the chain of .cause() to the native Java
+exception.
+
+Hbase::Admin#describe now checks the existence of a table like many
+other commands, in order to throw a Ruby exception rather than a Java
+native exception.  The test for Admin#describe now calls it with a
+non-existent but otherwise legal table name.  This was previous the only
+test using an illegal name (which results in a Java-native
+IllegalArgumentException instead).
+
+setLoadPaths() is now on the ScriptingContainer in JRuby.
+
+region_mover.rb now uses Ruby 1.9's require_relative to load
+thread-pool.  An additional extraneous use of __FILE__ was removed from
+taskmonitor.rb since the Jackson JARs are already placed on the
+classpath by bin/hbase.
+---
+ bin/region_mover.rb                                |  3 ++-
+ hbase-shell/pom.xml                                |  4 ++++
+ hbase-shell/src/main/ruby/hbase.rb                 |  6 ++---
+ hbase-shell/src/main/ruby/hbase/admin.rb           |  1 +
+ hbase-shell/src/main/ruby/hbase/security.rb        |  2 +-
+ hbase-shell/src/main/ruby/hbase/taskmonitor.rb     |  5 ----
+ hbase-shell/src/main/ruby/irb/hirb.rb              |  2 +-
+ hbase-shell/src/main/ruby/shell/commands.rb        | 28 ++++++++++------------
+ hbase-shell/src/main/ruby/shell/formatter.rb       |  2 +-
+ .../hadoop/hbase/client/AbstractTestShell.java     |  2 +-
+ hbase-shell/src/test/ruby/hbase/admin_test.rb      |  4 ++--
+ pom.xml                                            |  8 ++++++-
+ 12 files changed, 36 insertions(+), 31 deletions(-)
+
+diff --git a/bin/region_mover.rb b/bin/region_mover.rb
+index 64709d7..f9de733 100644
+--- a/bin/region_mover.rb
++++ b/bin/region_mover.rb
+@@ -21,7 +21,8 @@
+ # location. Presumes balancer is disabled when we run (not harmful if its
+ # on but this script and balancer will end up fighting each other).
+ require 'optparse'
+-require File.join(File.dirname(__FILE__), 'thread-pool')
++require 'tmpdir'
++require_relative 'thread-pool'
+ include Java
+ import org.apache.hadoop.hbase.HConstants
+ import org.apache.hadoop.hbase.HBaseConfiguration
+diff --git a/hbase-shell/pom.xml b/hbase-shell/pom.xml
+index 663ee3e..df55942 100644
+--- a/hbase-shell/pom.xml
++++ b/hbase-shell/pom.xml
+@@ -247,6 +247,10 @@
+       <groupId>org.jruby</groupId>
+       <artifactId>jruby-complete</artifactId>
+     </dependency>
++    <dependency>
++      <groupId>jline</groupId>
++      <artifactId>jline</artifactId>
++    </dependency>
+     <!-- Test Dependencies -->
+     <dependency>
+       <groupId>org.apache.htrace</groupId>
+diff --git a/hbase-shell/src/main/ruby/hbase.rb b/hbase-shell/src/main/ruby/hbase.rb
+index 2de2111..3700f08 100644
+--- a/hbase-shell/src/main/ruby/hbase.rb
++++ b/hbase-shell/src/main/ruby/hbase.rb
+@@ -27,9 +27,9 @@
+ # whether the table exists and returns nil regardless.
+ include Java
+ 
+-include_class('java.lang.Integer') {|package,name| "J#{name}" }
+-include_class('java.lang.Long') {|package,name| "J#{name}" }
+-include_class('java.lang.Boolean') {|package,name| "J#{name}" }
++java_import('java.lang.Integer') {|package,name| "J#{name}" }
++java_import('java.lang.Long') {|package,name| "J#{name}" }
++java_import('java.lang.Boolean') {|package,name| "J#{name}" }
+ 
+ module HBaseConstants
+   COLUMN = "COLUMN"
+diff --git a/hbase-shell/src/main/ruby/hbase/admin.rb b/hbase-shell/src/main/ruby/hbase/admin.rb
+index 50d1e7d..d94e9a0 100644
+--- a/hbase-shell/src/main/ruby/hbase/admin.rb
++++ b/hbase-shell/src/main/ruby/hbase/admin.rb
+@@ -416,6 +416,7 @@ module Hbase
+     #----------------------------------------------------------------------------------------------
+     # Returns table's structure description
+     def describe(table_name)
++      tableExists(table_name)
+       @admin.getTableDescriptor(TableName.valueOf(table_name)).to_s
+     end
+ 
+diff --git a/hbase-shell/src/main/ruby/hbase/security.rb b/hbase-shell/src/main/ruby/hbase/security.rb
+index 56cc286..353699a 100644
+--- a/hbase-shell/src/main/ruby/hbase/security.rb
++++ b/hbase-shell/src/main/ruby/hbase/security.rb
+@@ -154,7 +154,7 @@ module Hbase
+             yield(user_name, "#{namespace},#{table},#{family},#{qualifier}: #{action.to_s}")
+           else
+             res[user_name] ||= {}
+-            res[user_name][family + ":" +qualifier] = action
++            res[user_name][family + ":" + qualifier] = action
+           end
+           count += 1
+       end
+diff --git a/hbase-shell/src/main/ruby/hbase/taskmonitor.rb b/hbase-shell/src/main/ruby/hbase/taskmonitor.rb
+index d312558..453bb28 100644
+--- a/hbase-shell/src/main/ruby/hbase/taskmonitor.rb
++++ b/hbase-shell/src/main/ruby/hbase/taskmonitor.rb
+@@ -20,11 +20,6 @@
+ 
+ include Java
+ 
+-# Add the $HBASE_HOME/lib directory to the ruby load_path to load jackson
+-if File.exists?(File.join(File.dirname(__FILE__), "..", "lib"))
+-    $LOAD_PATH.unshift File.join(File.dirname(__FILE__), "..", "lib")
+-end
+-
+ module Hbase
+   class TaskMonitor
+     include HBaseConstants
+diff --git a/hbase-shell/src/main/ruby/irb/hirb.rb b/hbase-shell/src/main/ruby/irb/hirb.rb
+index b32e691..4d6d277 100644
+--- a/hbase-shell/src/main/ruby/irb/hirb.rb
++++ b/hbase-shell/src/main/ruby/irb/hirb.rb
+@@ -19,7 +19,7 @@
+ require 'rbconfig'
+ 
+ module IRB
+-  WINDOZE = Config::CONFIG['host_os'] =~ /mswin|mingw/
++  WINDOZE = RbConfig::CONFIG['host_os'] =~ /mswin|mingw/
+ 
+   # Subclass of IRB so can intercept methods
+   class HIRB < Irb
+diff --git a/hbase-shell/src/main/ruby/shell/commands.rb b/hbase-shell/src/main/ruby/shell/commands.rb
+index d580f5e..22543fa 100644
+--- a/hbase-shell/src/main/ruby/shell/commands.rb
++++ b/hbase-shell/src/main/ruby/shell/commands.rb
+@@ -34,7 +34,10 @@ module Shell
+         translate_hbase_exceptions(*args) { send(cmd,*args) }
+       rescue => e
+         rootCause = e
+-        while rootCause != nil && rootCause.respond_to?(:cause) && rootCause.cause != nil
++        # RuntimeError comes from our Ruby wrapper, translate_hbase_exceptions.  Clients and the
++        # test suite may still expect to catch those, even though JRuby now propagates the original
++        # exception as e.cause.
++        while !rootCause.kind_of?(RuntimeError) && rootCause != nil && rootCause.respond_to?(:cause) && rootCause.cause != nil
+           rootCause = rootCause.cause
+         end
+         if @shell.interactive?
+@@ -105,30 +108,25 @@ module Shell
+       def translate_hbase_exceptions(*args)
+         yield
+       rescue => e
+-        # Since exceptions will be thrown from the java code, 'e' will always be NativeException.
+-        # Check for the original java exception and use it if present.
+-        raise e unless e.respond_to?(:cause) && e.cause != nil
+-        cause = e.cause
+-
+          # let individual command handle exceptions first
+         if self.respond_to?(:handle_exceptions)
+           self.handle_exceptions(cause, *args)
+         end
+         # Global HBase exception handling below if not handled by respective command above
+-        if cause.kind_of?(org.apache.hadoop.hbase.TableNotFoundException) then
++        if e.kind_of?(org.apache.hadoop.hbase.TableNotFoundException) then
+           raise "Unknown table #{args.first}!"
+         end
+-        if cause.kind_of?(org.apache.hadoop.hbase.UnknownRegionException) then
++        if e.kind_of?(org.apache.hadoop.hbase.UnknownRegionException) then
+           raise "Unknown region #{args.first}!"
+         end
+-        if cause.kind_of?(org.apache.hadoop.hbase.NamespaceNotFoundException) then
++        if e.kind_of?(org.apache.hadoop.hbase.NamespaceNotFoundException) then
+           raise "Unknown namespace #{args.first}!"
+         end
+-        if cause.kind_of?(org.apache.hadoop.hbase.snapshot.SnapshotDoesNotExistException) then
++        if e.kind_of?(org.apache.hadoop.hbase.snapshot.SnapshotDoesNotExistException) then
+           raise "Unknown snapshot #{args.first}!"
+         end
+-        if cause.kind_of?(org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException) then
+-          exceptions = cause.getCauses
++        if e.kind_of?(org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException) then
++          exceptions = e.getCauses
+           exceptions.each do |exception|
+             if exception.kind_of?(org.apache.hadoop.hbase.regionserver.NoSuchColumnFamilyException) then
+               valid_cols = table(args.first).get_all_columns.map { |c| c + '*' }
+@@ -136,13 +134,13 @@ module Shell
+             end
+           end
+         end
+-        if cause.kind_of?(org.apache.hadoop.hbase.TableExistsException) then
++        if e.kind_of?(org.apache.hadoop.hbase.TableExistsException) then
+           raise "Table already exists: #{args.first}!"
+         end
+         # To be safe, here only AccessDeniedException is considered. In future
+         # we might support more in more generic approach when possible.
+-        if cause.kind_of?(org.apache.hadoop.hbase.security.AccessDeniedException) then
+-          str = java.lang.String.new("#{cause}")
++        if e.kind_of?(org.apache.hadoop.hbase.security.AccessDeniedException) then
++          str = java.lang.String.new(e.to_s)
+           # Error message is merged with stack trace, reference StringUtils.stringifyException
+           # This is to parse and get the error message from the whole.
+           strs = str.split("\n")
+diff --git a/hbase-shell/src/main/ruby/shell/formatter.rb b/hbase-shell/src/main/ruby/shell/formatter.rb
+index 6e598fb..ec0901b 100644
+--- a/hbase-shell/src/main/ruby/shell/formatter.rb
++++ b/hbase-shell/src/main/ruby/shell/formatter.rb
+@@ -30,7 +30,7 @@ module Shell
+ 
+       def refresh_width()
+         if $stdout.tty?
+-          @max_width = Java::jline.Terminal.getTerminal().getTerminalWidth()
++          @max_width = Java::jline.TerminalFactory.get().getWidth()
+         else
+           @max_width = 0
+         end
+diff --git a/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/AbstractTestShell.java b/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/AbstractTestShell.java
+index f66bb6b..41101f4 100644
+--- a/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/AbstractTestShell.java
++++ b/hbase-shell/src/test/java/org/apache/hadoop/hbase/client/AbstractTestShell.java
+@@ -58,7 +58,7 @@ public abstract class AbstractTestShell {
+     List<String> loadPaths = new ArrayList();
+     loadPaths.add("src/main/ruby");
+     loadPaths.add("src/test/ruby");
+-    jruby.getProvider().setLoadPaths(loadPaths);
++    jruby.setLoadPaths(loadPaths);
+     jruby.put("$TEST_CLUSTER", TEST_UTIL);
+     System.setProperty("jruby.jit.logging.verbose", "true");
+     System.setProperty("jruby.jit.logging", "true");
+diff --git a/hbase-shell/src/test/ruby/hbase/admin_test.rb b/hbase-shell/src/test/ruby/hbase/admin_test.rb
+index d4d78d5..eae8a5f 100644
+--- a/hbase-shell/src/test/ruby/hbase/admin_test.rb
++++ b/hbase-shell/src/test/ruby/hbase/admin_test.rb
+@@ -213,8 +213,8 @@ module Hbase
+     #-------------------------------------------------------------------------------
+ 
+     define_test "describe should fail for non-existent tables" do
+-      assert_raise(NativeException) do
+-        admin.describe('.NOT.EXISTS.')
++      assert_raise(ArgumentError) do
++        admin.describe('NOT.EXISTS')
+       end
+     end
+ 
+diff --git a/pom.xml b/pom.xml
+index b7cded7..bd2407d 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -1180,7 +1180,8 @@
+     <jetty.version>6.1.26</jetty.version>
+     <jetty.jspapi.version>6.1.14</jetty.jspapi.version>
+     <jersey.version>1.9</jersey.version>
+-    <jruby.version>1.6.8</jruby.version>
++    <jruby.version>9.1.2.0</jruby.version>
++    <jline.version>2.12</jline.version>
+     <junit.version>4.12</junit.version>
+     <hamcrest.version>1.3</hamcrest.version>
+     <htrace.version>3.1.0-incubating</htrace.version>
+@@ -1555,6 +1556,11 @@
+         <version>${jruby.version}</version>
+       </dependency>
+       <dependency>
++        <groupId>jline</groupId>
++        <artifactId>jline</artifactId>
++        <version>${jline.version}</version>
++      </dependency>
++      <dependency>
+         <groupId>org.mortbay.jetty</groupId>
+         <artifactId>jetty</artifactId>
+         <version>${jetty.version}</version>
+-- 
+2.8.0.rc2
+

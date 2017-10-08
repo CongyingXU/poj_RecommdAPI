@@ -1,0 +1,204 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+index 6a28006..f52dbdf 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+@@ -68,7 +68,7 @@ import com.google.common.collect.Sets;
+  *
+  */
+ public abstract class BaseLoadBalancer implements LoadBalancer {
+-  private static final int MIN_SERVER_BALANCE = 2;
++  protected static final int MIN_SERVER_BALANCE = 2;
+   private volatile boolean stopped = false;
+ 
+   private static final List<HRegionInfo> EMPTY_REGION_LIST = new ArrayList<HRegionInfo>(0);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+index ab075db..d7895c4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/StochasticLoadBalancer.java
+@@ -42,6 +42,7 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.master.MasterServices;
+ import org.apache.hadoop.hbase.master.RegionPlan;
++import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.Action.Type;
+ import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer.Cluster.AssignRegionAction;
+@@ -107,6 +108,8 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   protected static final String KEEP_REGION_LOADS =
+       "hbase.master.balancer.stochastic.numRegionLoadsToRemember";
+   private static final String TABLE_FUNCTION_SEP = "_";
++  protected static final String MIN_COST_NEED_BALANCE_KEY =
++      "hbase.master.balancer.stochastic.minCostNeedBalance";
+ 
+   private static final Random RANDOM = new Random(System.currentTimeMillis());
+   private static final Log LOG = LogFactory.getLog(StochasticLoadBalancer.class);
+@@ -118,6 +121,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   private int stepsPerRegion = 800;
+   private long maxRunningTime = 30 * 1000 * 1; // 30 seconds.
+   private int numRegionLoadsToRemember = 15;
++  private float minCostNeedBalance = 0.05f;
+ 
+   private CandidateGenerator[] candidateGenerators;
+   private CostFromRegionLoadFunction[] regionLoadFunctions;
+@@ -163,6 +167,8 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+     numRegionLoadsToRemember = conf.getInt(KEEP_REGION_LOADS, numRegionLoadsToRemember);
+     isByTable = conf.getBoolean(HConstants.HBASE_MASTER_LOADBALANCE_BYTABLE, isByTable);
+ 
++    minCostNeedBalance = conf.getFloat(MIN_COST_NEED_BALANCE_KEY, minCostNeedBalance);
++
+     if (localityCandidateGenerator == null) {
+       localityCandidateGenerator = new LocalityBasedCandidateGenerator(services);
+     }
+@@ -258,6 +264,41 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+   }
+ 
+   @Override
++  protected boolean needsBalance(Cluster cluster) {
++    ClusterLoadState cs = new ClusterLoadState(cluster.clusterState);
++    if (cs.getNumServers() < MIN_SERVER_BALANCE) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Not running balancer because only " + cs.getNumServers()
++            + " active regionserver(s)");
++      }
++      return false;
++    }
++    if (areSomeRegionReplicasColocated(cluster)) {
++      return true;
++    }
++
++    double total = 0.0;
++    float sumMultiplier = 0.0f;
++    for (CostFunction c : costFunctions) {
++      float multiplier = c.getMultiplier();
++      if (multiplier <= 0) {
++        continue;
++      }
++      sumMultiplier += multiplier;
++      total += c.cost() * multiplier;
++    }
++
++    if (total <= 0 || sumMultiplier <= 0
++        || (sumMultiplier > 0 && (total / sumMultiplier) < minCostNeedBalance)) {
++      LOG.info("Skipping load balancing because balanced cluster; " + "total cost is " + total
++          + ", sum multiplier is " + sumMultiplier + " min cost which need balance is "
++          + minCostNeedBalance);
++      return false;
++    }
++    return true;
++  }
++
++  @Override
+   public synchronized List<RegionPlan> balanceCluster(TableName tableName, Map<ServerName,
+     List<HRegionInfo>> clusterState) {
+     this.tableName = tableName;
+@@ -298,19 +339,21 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+     // Keep track of servers to iterate through them.
+     Cluster cluster = new Cluster(clusterState, loads, finder, rackManager);
+ 
+-    if (!needsBalance(cluster)) {
+-      return null;
+-    }
+-
+     long startTime = EnvironmentEdgeManager.currentTime();
+ 
+     initCosts(cluster);
+ 
++    if (!needsBalance(cluster)) {
++      return null;
++    }
++
+     double currentCost = computeCost(cluster, Double.MAX_VALUE);
+     curOverallCost = currentCost;
+     for (int i = 0; i < this.curFunctionCosts.length; i++) {
+       curFunctionCosts[i] = tempFunctionCosts[i];
+     }
++    LOG.info("start StochasticLoadBalancer.balaner, initCost=" + currentCost + ", functionCost="
++        + functionCost());
+ 
+     double initCost = currentCost;
+     double newCost = currentCost;
+@@ -407,6 +450,18 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
+     }
+   }
+ 
++  private String functionCost() {
++    StringBuilder builder = new StringBuilder();
++    for (CostFunction c:costFunctions) {
++      builder.append(c.getClass().getSimpleName());
++      builder.append(" : (");
++      builder.append(c.getMultiplier());
++      builder.append(", ");
++      builder.append(c.cost());
++      builder.append("); ");
++    }
++    return builder.toString();
++  }
+ 
+   /**
+    * Create all of the RegionPlan's needed to move from the initial cluster state to the desired
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+index 903f614..7ae0133 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/BalancerTestBase.java
+@@ -70,6 +70,7 @@ public class BalancerTestBase {
+     conf.setFloat("hbase.master.balancer.stochastic.maxMovePercent", 0.75f);
+     conf.setFloat("hbase.regions.slop", 0.0f);
+     conf.setFloat("hbase.master.balancer.stochastic.localityCost", 0);
++    conf.setFloat("hbase.master.balancer.stochastic.minCostNeedBalance", 0.0f);
+     loadBalancer = new StochasticLoadBalancer();
+     loadBalancer.setConf(conf);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+index 8300f32..9caf264 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer.java
+@@ -93,6 +93,20 @@ public class TestStochasticLoadBalancer extends BalancerTestBase {
+     }
+   }
+ 
++  @Test
++  public void testNeedBalance() {
++    conf.setFloat("hbase.master.balancer.stochastic.minCostNeedBalance", 1.0f);
++    loadBalancer.setConf(conf);
++    for (int[] mockCluster : clusterStateMocks) {
++      Map<ServerName, List<HRegionInfo>> servers = mockClusterServers(mockCluster);
++      List<RegionPlan> plans = loadBalancer.balanceCluster(servers);
++      assertNull(plans);
++    }
++    // reset config
++    conf.setFloat("hbase.master.balancer.stochastic.minCostNeedBalance", 0.0f);
++    loadBalancer.setConf(conf);
++  }
++
+   /**
+    * Test the load balancing algorithm.
+    *
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer2.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer2.java
+index 395eef2..f814fdf4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer2.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestStochasticLoadBalancer2.java
+@@ -49,6 +49,7 @@ public class TestStochasticLoadBalancer2 extends BalancerTestBase {
+     conf.setLong(StochasticLoadBalancer.MAX_STEPS_KEY, 2000000L);
+     conf.setLong("hbase.master.balancer.stochastic.maxRunningTime", 90 * 1000); // 90 sec
+     conf.setFloat("hbase.master.balancer.stochastic.localityCost", 0);
++    conf.setFloat("hbase.master.balancer.stochastic.minCostNeedBalance", 0.05f);
+     loadBalancer.setConf(conf);
+     int numNodes = 1000;
+     int numRegions = 20 * numNodes; // 20 * replication regions per RS
+@@ -56,6 +57,9 @@ public class TestStochasticLoadBalancer2 extends BalancerTestBase {
+     int numTables = 100;
+     int replication = 3;
+     testWithCluster(numNodes, numRegions, numRegionsPerServer, replication, numTables, true, true);
++    // reset config
++    conf.setFloat("hbase.master.balancer.stochastic.minCostNeedBalance", 0.0f);
++    loadBalancer.setConf(conf);
+   }
+ 
+   @Test (timeout = 800000)
+@@ -87,4 +91,4 @@ public class TestStochasticLoadBalancer2 extends BalancerTestBase {
+     int numTables = 10;
+     testWithCluster(numNodes, numRegions, numRegionsPerServer, replication, numTables, true, false);
+   }
+-}
+\ No newline at end of file
++}

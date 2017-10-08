@@ -1,0 +1,210 @@
+From 77b572de7b22de7e5281ee90eeb47a7b9fc67111 Mon Sep 17 00:00:00 2001
+From: Josh Elser <elserj@apache.org>
+Date: Wed, 7 Dec 2016 13:11:16 -0500
+Subject: [PATCH] HBASE-17276 Only log stacktraces for exceptions once for
+ updates in a batch
+
+For large batches of updates, repeatedly logging WrongRegionExceptions,
+FailedSanityCheckExceptions, and/or NoSuchColumnFamilyExceptions can
+easily dominate the contents of a RegionServer log. After the first
+occurence of logging the full exception, switch to logging only the
+message on the exception.
+---
+ .../apache/hadoop/hbase/regionserver/HRegion.java  | 81 ++++++++++++++++++++--
+ .../TestObservedExceptionsInBatch.java             | 58 ++++++++++++++++
+ 2 files changed, 134 insertions(+), 5 deletions(-)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestObservedExceptionsInBatch.java
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index d0e5f93..7364162 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -550,6 +550,57 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     }
+   }
+ 
++  /**
++   * A class that tracks exceptions that have been observed in one batch. Not thread safe.
++   */
++  static class ObservedExceptionsInBatch {
++    private boolean wrongRegion = false;
++    private boolean failedSanityCheck = false;
++    private boolean wrongFamily = false;
++
++    /**
++     * @return If a {@link WrongRegionException} has been observed.
++     */
++    boolean hasSeenWrongRegion() {
++      return wrongRegion;
++    }
++
++    /**
++     * Records that a {@link WrongRegionException} has been observed.
++     */
++    void sawWrongRegion() {
++      wrongRegion = true;
++    }
++
++    /**
++     * @return If a {@link FailedSanityCheckException} has been observed.
++     */
++    boolean hasSeenFailedSanityCheck() {
++      return failedSanityCheck;
++    }
++
++    /**
++     * Records that a {@link FailedSanityCheckException} has been observed.
++     */
++    void sawFailedSanityCheck() {
++      failedSanityCheck = true;
++    }
++
++    /**
++     * @return If a {@link NoSuchColumnFamilyException} has been observed.
++     */
++    boolean hasSeenNoSuchFamily() {
++      return wrongFamily;
++    }
++
++    /**
++     * Records that a {@link NoSuchColumnFamilyException} has been observed.
++     */
++    void sawNoSuchFamily() {
++      wrongFamily = true;
++    }
++  }
++
+   final WriteState writestate = new WriteState();
+ 
+   long memstoreFlushSize;
+@@ -3107,12 +3158,13 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     /** Keep track of the locks we hold so we can release them in finally clause */
+     List<RowLock> acquiredRowLocks = Lists.newArrayListWithCapacity(batchOp.operations.length);
+     MemstoreSize memstoreSize = new MemstoreSize();
++    final ObservedExceptionsInBatch observedExceptions = new ObservedExceptionsInBatch();
+     try {
+       // STEP 1. Try to acquire as many locks as we can, and ensure we acquire at least one.
+       int numReadyToWrite = 0;
+       long now = EnvironmentEdgeManager.currentTime();
+       while (lastIndexExclusive < batchOp.operations.length) {
+-        if (checkBatchOp(batchOp, lastIndexExclusive, familyMaps, now)) {
++        if (checkBatchOp(batchOp, lastIndexExclusive, familyMaps, now, observedExceptions)) {
+           lastIndexExclusive++;
+           continue;
+         }
+@@ -3477,7 +3529,8 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+   }
+ 
+   private boolean checkBatchOp(BatchOperation<?> batchOp, final int lastIndexExclusive,
+-      final Map<byte[], List<Cell>>[] familyMaps, final long now)
++      final Map<byte[], List<Cell>>[] familyMaps, final long now,
++      final ObservedExceptionsInBatch observedExceptions)
+   throws IOException {
+     boolean skip = false;
+     // Skip anything that "ran" already
+@@ -3493,17 +3546,35 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+     try {
+       checkAndPrepareMutation(mutation, batchOp.isInReplay(), familyMap, now);
+     } catch (NoSuchColumnFamilyException nscf) {
+-      LOG.warn("No such column family in batch mutation", nscf);
++      final String msg = "No such column family in batch mutation. ";
++      if (observedExceptions.hasSeenNoSuchFamily()) {
++        LOG.warn(msg + nscf.getMessage());
++      } else {
++        LOG.warn(msg, nscf);
++        observedExceptions.sawNoSuchFamily();
++      }
+       batchOp.retCodeDetails[lastIndexExclusive] = new OperationStatus(
+           OperationStatusCode.BAD_FAMILY, nscf.getMessage());
+       skip = true;
+     } catch (FailedSanityCheckException fsce) {
+-      LOG.warn("Batch Mutation did not pass sanity check", fsce);
++      final String msg = "Batch Mutation did not pass sanity check. ";
++      if (observedExceptions.hasSeenFailedSanityCheck()) {
++        LOG.warn(msg + fsce.getMessage());
++      } else {
++        LOG.warn(msg, fsce);
++        observedExceptions.sawFailedSanityCheck();
++      }
+       batchOp.retCodeDetails[lastIndexExclusive] = new OperationStatus(
+           OperationStatusCode.SANITY_CHECK_FAILURE, fsce.getMessage());
+       skip = true;
+     } catch (WrongRegionException we) {
+-      LOG.warn("Batch mutation had a row that does not belong to this region", we);
++      final String msg = "Batch mutation had a row that does not belong to this region. ";
++      if (observedExceptions.hasSeenWrongRegion()) {
++        LOG.warn(msg + we.getMessage());
++      } else {
++        LOG.warn(msg, we);
++        observedExceptions.sawWrongRegion();
++      }
+       batchOp.retCodeDetails[lastIndexExclusive] = new OperationStatus(
+           OperationStatusCode.SANITY_CHECK_FAILURE, we.getMessage());
+       skip = true;
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestObservedExceptionsInBatch.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestObservedExceptionsInBatch.java
+new file mode 100644
+index 0000000..64237fd
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestObservedExceptionsInBatch.java
+@@ -0,0 +1,58 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++import org.apache.hadoop.hbase.regionserver.HRegion.ObservedExceptionsInBatch;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++/**
++ * Test class for {@link ObservedExceptionsInBatch}.
++ */
++@Category(SmallTests.class)
++public class TestObservedExceptionsInBatch {
++
++  private ObservedExceptionsInBatch observedExceptions;
++
++  @Before
++  public void setup() {
++    observedExceptions = new ObservedExceptionsInBatch();
++  }
++
++  @Test
++  public void testNoObservationsOnCreation() {
++    assertFalse(observedExceptions.hasSeenFailedSanityCheck());
++    assertFalse(observedExceptions.hasSeenNoSuchFamily());
++    assertFalse(observedExceptions.hasSeenWrongRegion());
++  }
++
++  @Test
++  public void testObservedAfterRecording() {
++    observedExceptions.sawFailedSanityCheck();
++    assertTrue(observedExceptions.hasSeenFailedSanityCheck());
++    observedExceptions.sawNoSuchFamily();
++    assertTrue(observedExceptions.hasSeenNoSuchFamily());
++    observedExceptions.sawWrongRegion();
++    assertTrue(observedExceptions.hasSeenWrongRegion());
++  }
++}
+-- 
+2.10.2
+

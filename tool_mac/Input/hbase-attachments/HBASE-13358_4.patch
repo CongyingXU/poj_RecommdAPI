@@ -1,0 +1,1113 @@
+From ffcde72cb45270a5f89abd76c82f5e96a3b2f360 Mon Sep 17 00:00:00 2001
+From: Matt Warhaftig <mwarhaftig@gmail.com>
+Date: Wed, 29 Apr 2015 21:11:55 -0400
+Subject: [PATCH] HBASE-13358 - Update VisibilityClient to accept Connection
+ objects.
+
+---
+ .../security/visibility/VisibilityClient.java      | 208 +++++++++++++++------
+ .../IntegrationTestIngestWithVisibilityLabels.java |   4 +-
+ ...IntegrationTestBigLinkedListWithVisibility.java |   4 +-
+ ...grationTestWithCellVisibilityLoadAndVerify.java |   6 +-
+ .../hadoop/hbase/rest/TestScannersWithLabels.java  |  10 +-
+ .../TestImportTSVWithVisibilityLabels.java         |   6 +-
+ .../TestDefaultScanLabelGeneratorStack.java        |   6 +-
+ .../TestEnforcingScanLabelGenerator.java           |   6 +-
+ .../security/visibility/TestVisibilityLabels.java  |  30 +--
+ ...tVisibilityLabelsOpWithDifferentUsersNoACL.java |  23 ++-
+ .../TestVisibilityLabelsReplication.java           |  10 +-
+ .../visibility/TestVisibilityLabelsWithACL.java    |  43 +++--
+ ...VisibilityLabelsWithDefaultVisLabelService.java |  18 +-
+ .../TestVisibilityLabelsWithDeletes.java           |  18 +-
+ .../TestVisibilityLabelsWithSLGStack.java          |   6 +-
+ .../visibility/TestVisibilityLablesWithGroups.java |  19 +-
+ .../visibility/TestVisibilityWithCheckAuths.java   |  12 +-
+ .../visibility/TestWithDisabledAuthorization.java  |  27 +--
+ .../TestThriftHBaseServiceHandlerWithLabels.java   |   8 +-
+ 19 files changed, 289 insertions(+), 175 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
+index fef7d14..be6aacb 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityClient.java
+@@ -61,10 +61,27 @@ public class VisibilityClient {
+    * @param label
+    * @return VisibilityLabelsResponse
+    * @throws Throwable
++   * @deprecated Use {@link #addLabel(Connection,String)} instead.
+    */
++  @Deprecated
+   public static VisibilityLabelsResponse addLabel(Configuration conf, final String label)
+       throws Throwable {
+-    return addLabels(conf, new String[] { label });
++    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      return addLabels(connection, new String[] { label });
++    }
++  }
++
++  /**
++   * Utility method for adding label to the system.
++   *
++   * @param connection
++   * @param label
++   * @return VisibilityLabelsResponse
++   * @throws Throwable
++   */
++  public static VisibilityLabelsResponse addLabel(Connection connection, final String label)
++      throws Throwable {
++    return addLabels(connection, new String[] { label });
+   }
+ 
+   /**
+@@ -74,43 +91,57 @@ public class VisibilityClient {
+    * @param labels
+    * @return VisibilityLabelsResponse
+    * @throws Throwable
++   * @deprecated Use {@link #addLabels(Connection,String[])} instead.
+    */
++  @Deprecated
+   public static VisibilityLabelsResponse addLabels(Configuration conf, final String[] labels)
+       throws Throwable {
+-    // TODO: Make it so caller passes in a Connection rather than have us do this expensive
+-    // setup each time.  This class only used in test and shell at moment though.
+     try (Connection connection = ConnectionFactory.createConnection(conf)) {
+-      try (Table table = connection.getTable(LABELS_TABLE_NAME)) {
+-        Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse> callable = 
+-            new Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse>() {
+-          ServerRpcController controller = new ServerRpcController();
+-          BlockingRpcCallback<VisibilityLabelsResponse> rpcCallback = 
+-              new BlockingRpcCallback<VisibilityLabelsResponse>();
++      return addLabels(connection, labels);
++    }
++  }
+ 
+-          public VisibilityLabelsResponse call(VisibilityLabelsService service)
+-          throws IOException {
+-            VisibilityLabelsRequest.Builder builder = VisibilityLabelsRequest.newBuilder();
+-            for (String label : labels) {
+-              if (label.length() > 0) {
+-                VisibilityLabel.Builder newBuilder = VisibilityLabel.newBuilder();
+-                newBuilder.setLabel(ByteStringer.wrap(Bytes.toBytes(label)));
+-                builder.addVisLabel(newBuilder.build());
++  /**
++   * Utility method for adding labels to the system.
++   *
++   * @param connection
++   * @param labels
++   * @return VisibilityLabelsResponse
++   * @throws Throwable
++   */
++  public static VisibilityLabelsResponse addLabels(Connection connection, final String[] labels)
++      throws Throwable {
++
++    try (Table table = connection.getTable(LABELS_TABLE_NAME)) {
++      Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse> callable =
++          new Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse>() {
++            ServerRpcController controller = new ServerRpcController();
++            BlockingRpcCallback<VisibilityLabelsResponse> rpcCallback =
++                new BlockingRpcCallback<VisibilityLabelsResponse>();
++
++            public VisibilityLabelsResponse call(VisibilityLabelsService service)
++                throws IOException {
++              VisibilityLabelsRequest.Builder builder = VisibilityLabelsRequest.newBuilder();
++              for (String label : labels) {
++                if (label.length() > 0) {
++                  VisibilityLabel.Builder newBuilder = VisibilityLabel.newBuilder();
++                  newBuilder.setLabel(ByteStringer.wrap(Bytes.toBytes(label)));
++                  builder.addVisLabel(newBuilder.build());
++                }
+               }
++              service.addLabels(controller, builder.build(), rpcCallback);
++              VisibilityLabelsResponse response = rpcCallback.get();
++              if (controller.failedOnException()) {
++                throw controller.getFailedOn();
++              }
++              return response;
+             }
+-            service.addLabels(controller, builder.build(), rpcCallback);
+-            VisibilityLabelsResponse response = rpcCallback.get();
+-            if (controller.failedOnException()) {
+-              throw controller.getFailedOn();
+-            }
+-            return response;
+-          }
+-        };
+-        Map<byte[], VisibilityLabelsResponse> result =
++          };
++      Map<byte[], VisibilityLabelsResponse> result =
+           table.coprocessorService(VisibilityLabelsService.class, HConstants.EMPTY_BYTE_ARRAY,
+             HConstants.EMPTY_BYTE_ARRAY, callable);
+-        return result.values().iterator().next(); // There will be exactly one region for labels
+-        // table and so one entry in result Map.
+-      }
++      return result.values().iterator().next(); // There will be exactly one region for labels
++      // table and so one entry in result Map.
+     }
+   }
+ 
+@@ -121,10 +152,27 @@ public class VisibilityClient {
+    * @param user
+    * @return VisibilityLabelsResponse
+    * @throws Throwable
++   * @deprecated Use {@link #setAuths(Connection,String[],String)} instead.
+    */
++  @Deprecated
+   public static VisibilityLabelsResponse setAuths(Configuration conf, final String[] auths,
+       final String user) throws Throwable {
+-    return setOrClearAuths(conf, auths, user, true);
++    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      return setOrClearAuths(connection, auths, user, true);
++    }
++  }
++
++  /**
++   * Sets given labels globally authorized for the user.
++   * @param connection
++   * @param auths
++   * @param user
++   * @return VisibilityLabelsResponse
++   * @throws Throwable
++   */
++  public static VisibilityLabelsResponse setAuths(Connection connection, final String[] auths,
++      final String user) throws Throwable {
++    return setOrClearAuths(connection, auths, user, true);
+   }
+ 
+   /**
+@@ -132,11 +180,23 @@ public class VisibilityClient {
+    * @param user
+    * @return labels, the given user is globally authorized for.
+    * @throws Throwable
++   * @deprecated Use {@link #getAuths(Connection,String)} instead.
+    */
++  @Deprecated
+   public static GetAuthsResponse getAuths(Configuration conf, final String user) throws Throwable {
+-    // TODO: Make it so caller passes in a Connection rather than have us do this expensive
+-    // setup each time.  This class only used in test and shell at moment though.
+     try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      return getAuths(connection, user);
++    }
++  }
++
++  /**
++   * @param connection the Connection instance to use.
++   * @param user
++   * @return labels, the given user is globally authorized for.
++   * @throws Throwable
++   */
++  public static GetAuthsResponse getAuths(Connection connection, final String user)
++      throws Throwable {
+       try (Table table = connection.getTable(LABELS_TABLE_NAME)) {
+         Batch.Call<VisibilityLabelsService, GetAuthsResponse> callable = 
+             new Batch.Call<VisibilityLabelsService, GetAuthsResponse>() {
+@@ -161,7 +221,6 @@ public class VisibilityClient {
+         return result.values().iterator().next(); // There will be exactly one region for labels
+         // table and so one entry in result Map.
+       }
+-    }
+   }
+ 
+   /**
+@@ -170,35 +229,49 @@ public class VisibilityClient {
+    * @param regex  The regular expression to filter which labels are returned.
+    * @return labels The list of visibility labels defined in the system.
+    * @throws Throwable
++   * @deprecated Use {@link #listLabels(Connection,String)} instead.
+    */
++  @Deprecated
+   public static ListLabelsResponse listLabels(Configuration conf, final String regex)
+       throws Throwable {
+-    Connection connection = null;
++    try(Connection connection = ConnectionFactory.createConnection(conf)){
++      return listLabels(connection, regex);
++    }
++  }
++
++  /**
++   * Retrieve the list of visibility labels defined in the system.
++   * @param connection The Connection instance to use.
++   * @param regex  The regular expression to filter which labels are returned.
++   * @return labels The list of visibility labels defined in the system.
++   * @throws Throwable
++   */
++  public static ListLabelsResponse listLabels(Connection connection, final String regex)
++      throws Throwable {
+     Table table = null;
+     try {
+-      connection = ConnectionFactory.createConnection(conf);
+       table = connection.getTable(LABELS_TABLE_NAME);
+       Batch.Call<VisibilityLabelsService, ListLabelsResponse> callable =
+           new Batch.Call<VisibilityLabelsService, ListLabelsResponse>() {
+-        ServerRpcController controller = new ServerRpcController();
+-        BlockingRpcCallback<ListLabelsResponse> rpcCallback =
+-            new BlockingRpcCallback<ListLabelsResponse>();
++            ServerRpcController controller = new ServerRpcController();
++            BlockingRpcCallback<ListLabelsResponse> rpcCallback =
++                new BlockingRpcCallback<ListLabelsResponse>();
+ 
+-        public ListLabelsResponse call(VisibilityLabelsService service) throws IOException {
+-          ListLabelsRequest.Builder listAuthLabelsReqBuilder = ListLabelsRequest.newBuilder();
+-          if (regex != null) {
+-            // Compile the regex here to catch any regex exception earlier.
+-            Pattern pattern = Pattern.compile(regex);
+-            listAuthLabelsReqBuilder.setRegex(pattern.toString());
+-          }
+-          service.listLabels(controller, listAuthLabelsReqBuilder.build(), rpcCallback);
+-          ListLabelsResponse response = rpcCallback.get();
+-          if (controller.failedOnException()) {
+-            throw controller.getFailedOn();
+-          }
+-          return response;
+-        }
+-      };
++            public ListLabelsResponse call(VisibilityLabelsService service) throws IOException {
++              ListLabelsRequest.Builder listAuthLabelsReqBuilder = ListLabelsRequest.newBuilder();
++              if (regex != null) {
++                // Compile the regex here to catch any regex exception earlier.
++                Pattern pattern = Pattern.compile(regex);
++                listAuthLabelsReqBuilder.setRegex(pattern.toString());
++              }
++              service.listLabels(controller, listAuthLabelsReqBuilder.build(), rpcCallback);
++              ListLabelsResponse response = rpcCallback.get();
++              if (controller.failedOnException()) {
++                throw controller.getFailedOn();
++              }
++              return response;
++            }
++          };
+       Map<byte[], ListLabelsResponse> result =
+           table.coprocessorService(VisibilityLabelsService.class, HConstants.EMPTY_BYTE_ARRAY,
+             HConstants.EMPTY_BYTE_ARRAY, callable);
+@@ -222,17 +295,33 @@ public class VisibilityClient {
+    * @param user
+    * @return VisibilityLabelsResponse
+    * @throws Throwable
++   * @deprecated Use {@link #clearAuths(Connection,String[],String)} instead.
+    */
++  @Deprecated
+   public static VisibilityLabelsResponse clearAuths(Configuration conf, final String[] auths,
+       final String user) throws Throwable {
+-    return setOrClearAuths(conf, auths, user, false);
++    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++      return setOrClearAuths(connection, auths, user, false);
++    }
+   }
+ 
+-  private static VisibilityLabelsResponse setOrClearAuths(Configuration conf, final String[] auths,
+-      final String user, final boolean setOrClear) throws IOException, ServiceException, Throwable {
+-    // TODO: Make it so caller passes in a Connection rather than have us do this expensive
+-    // setup each time.  This class only used in test and shell at moment though.
+-    try (Connection connection = ConnectionFactory.createConnection(conf)) {
++  /**
++   * Removes given labels from user's globally authorized list of labels.
++   * @param connection
++   * @param auths
++   * @param user
++   * @return VisibilityLabelsResponse
++   * @throws Throwable
++   */
++  public static VisibilityLabelsResponse clearAuths(Connection connection, final String[] auths,
++      final String user) throws Throwable {
++    return setOrClearAuths(connection, auths, user, false);
++  }
++
++  private static VisibilityLabelsResponse setOrClearAuths(Connection connection,
++      final String[] auths, final String user, final boolean setOrClear)
++          throws IOException, ServiceException, Throwable {
++
+       try (Table table = connection.getTable(LABELS_TABLE_NAME)) {
+         Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse> callable = 
+             new Batch.Call<VisibilityLabelsService, VisibilityLabelsResponse>() {
+@@ -266,6 +355,5 @@ public class VisibilityClient {
+         return result.values().iterator().next(); // There will be exactly one region for labels
+         // table and so one entry in result Map.
+       }
+-    }
+   }
+ }
+\ No newline at end of file
+diff --git a/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestIngestWithVisibilityLabels.java b/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestIngestWithVisibilityLabels.java
+index 8da811b..b942918 100644
+--- a/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestIngestWithVisibilityLabels.java
++++ b/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestIngestWithVisibilityLabels.java
+@@ -115,8 +115,8 @@ public class IntegrationTestIngestWithVisibilityLabels extends IntegrationTestIn
+   
+   private void addLabels() throws Exception {
+     try {
+-      VisibilityClient.addLabels(util.getConfiguration(), LABELS);
+-      VisibilityClient.setAuths(util.getConfiguration(), LABELS, User.getCurrent().getName());
++      VisibilityClient.addLabels(util.getConnection(), LABELS);
++      VisibilityClient.setAuths(util.getConnection(), LABELS, User.getCurrent().getName());
+     } catch (Throwable t) {
+       throw new IOException(t);
+     }
+diff --git a/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java b/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
+index a4bd9f7..a49d9ca 100644
+--- a/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
++++ b/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
+@@ -385,8 +385,8 @@ public class IntegrationTestBigLinkedListWithVisibility extends IntegrationTestB
+ 
+   private void addLabels() throws Exception {
+     try {
+-      VisibilityClient.addLabels(util.getConfiguration(), labels.split(COMMA));
+-      VisibilityClient.setAuths(util.getConfiguration(), labels.split(COMMA), USER.getName());
++      VisibilityClient.addLabels(util.getConnection(), labels.split(COMMA));
++      VisibilityClient.setAuths(util.getConnection(), labels.split(COMMA), USER.getName());
+     } catch (Throwable t) {
+       throw new IOException(t);
+     }
+diff --git a/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java b/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
+index 3fc4e8e..41a705f 100644
+--- a/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
++++ b/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
+@@ -141,10 +141,10 @@ public class IntegrationTestWithCellVisibilityLoadAndVerify extends IntegrationT
+ 
+   private void addLabelsAndAuths() throws Exception {
+     try {
+-      VisibilityClient.addLabels(util.getConfiguration(), LABELS);
+-      VisibilityClient.setAuths(util.getConfiguration(), new String[] { CONFIDENTIAL, TOPSECRET,
++      VisibilityClient.addLabels(util.getConnection(), LABELS);
++      VisibilityClient.setAuths(util.getConnection(), new String[] { CONFIDENTIAL, TOPSECRET,
+           SECRET, PRIVATE }, USER1.getName());
+-      VisibilityClient.setAuths(util.getConfiguration(), new String[] { PUBLIC },
++      VisibilityClient.setAuths(util.getConnection(), new String[] { PUBLIC },
+           USER2.getName());
+     } catch (Throwable t) {
+       throw new IOException(t);
+diff --git a/hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/TestScannersWithLabels.java b/hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/TestScannersWithLabels.java
+index 41c036d..83c72e3 100644
+--- a/hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/TestScannersWithLabels.java
++++ b/hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/TestScannersWithLabels.java
+@@ -24,6 +24,8 @@ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Durability;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Table;
+@@ -165,8 +167,8 @@ public class TestScannersWithLabels {
+     PrivilegedExceptionAction<VisibilityLabelsResponse> action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, CONFIDENTIAL, PRIVATE, PUBLIC, TOPSECRET };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+@@ -177,8 +179,8 @@ public class TestScannersWithLabels {
+   }
+   private static void setAuths() throws Exception {
+     String[] labels = { SECRET, CONFIDENTIAL, PRIVATE, PUBLIC, TOPSECRET };
+-    try {
+-      VisibilityClient.setAuths(conf, labels, User.getCurrent().getShortName());
++    try (Connection conn = ConnectionFactory.createConnection(conf)) {
++      VisibilityClient.setAuths(conn, labels, User.getCurrent().getShortName());
+     } catch (Throwable t) {
+       throw new IOException(t);
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestImportTSVWithVisibilityLabels.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestImportTSVWithVisibilityLabels.java
+index 17ee461..8d974ab 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestImportTSVWithVisibilityLabels.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestImportTSVWithVisibilityLabels.java
+@@ -45,6 +45,8 @@ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
+ import org.apache.hadoop.hbase.testclassification.LargeTests;
+ import org.apache.hadoop.hbase.testclassification.MapReduceTests;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Delete;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.HTable;
+@@ -131,8 +133,8 @@ public class TestImportTSVWithVisibilityLabels implements Configurable {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, TOPSECRET, CONFIDENTIAL, PUBLIC, PRIVATE };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+           LOG.info("Added labels ");
+         } catch (Throwable t) {
+           LOG.error("Error in adding labels" , t);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestDefaultScanLabelGeneratorStack.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestDefaultScanLabelGeneratorStack.java
+index 2cd5ff9..3487d15 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestDefaultScanLabelGeneratorStack.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestDefaultScanLabelGeneratorStack.java
+@@ -86,9 +86,9 @@ public class TestDefaultScanLabelGeneratorStack {
+     // Set up for the test
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.addLabels(conf, new String[] { SECRET, CONFIDENTIAL });
+-          VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL }, TESTUSER.getShortName());
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, new String[] { SECRET, CONFIDENTIAL });
++          VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL }, TESTUSER.getShortName());
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestEnforcingScanLabelGenerator.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestEnforcingScanLabelGenerator.java
+index 2fa8afd..3284453 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestEnforcingScanLabelGenerator.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestEnforcingScanLabelGenerator.java
+@@ -84,9 +84,9 @@ public class TestEnforcingScanLabelGenerator {
+     // Set up for the test
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.addLabels(conf, new String[] { SECRET, CONFIDENTIAL });
+-          VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, }, TESTUSER.getShortName());
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, new String[] { SECRET, CONFIDENTIAL });
++          VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, }, TESTUSER.getShortName());
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
+index 3671386..2cd32b1 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabels.java
+@@ -413,8 +413,8 @@ public abstract class TestVisibilityLabels {
+     PrivilegedExceptionAction<Void> action = new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+         String[] auths = { SECRET, CONFIDENTIAL };
+-        try {
+-          VisibilityClient.setAuths(conf, auths, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.setAuths(conn, auths, user);
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -439,8 +439,8 @@ public abstract class TestVisibilityLabels {
+     action = new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+         GetAuthsResponse authsResponse = null;
+-        try {
+-          authsResponse = VisibilityClient.getAuths(conf, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          authsResponse = VisibilityClient.getAuths(conn, user);
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -461,10 +461,10 @@ public abstract class TestVisibilityLabels {
+       public Void run() throws Exception {
+         String[] auths1 = { SECRET, CONFIDENTIAL };
+         GetAuthsResponse authsResponse = null;
+-        try {
+-          VisibilityClient.setAuths(conf, auths1, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.setAuths(conn, auths1, user);
+           try {
+-            authsResponse = VisibilityClient.getAuths(conf, user);
++            authsResponse = VisibilityClient.getAuths(conn, user);
+           } catch (Throwable e) {
+             fail("Should not have failed");
+           }
+@@ -502,8 +502,8 @@ public abstract class TestVisibilityLabels {
+       public Void run() throws Exception {
+         String[] auths = { SECRET, CONFIDENTIAL, PRIVATE };
+         String user = "testUser";
+-        try {
+-          VisibilityClient.setAuths(conf, auths, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.setAuths(conn, auths, user);
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -511,8 +511,8 @@ public abstract class TestVisibilityLabels {
+         // Passing a non existing auth also.
+         auths = new String[] { SECRET, PUBLIC, CONFIDENTIAL };
+         VisibilityLabelsResponse response = null;
+-        try {
+-          response = VisibilityClient.clearAuths(conf, auths, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          response = VisibilityClient.clearAuths(conn, auths, user);
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -540,8 +540,8 @@ public abstract class TestVisibilityLabels {
+         }
+ 
+         GetAuthsResponse authsResponse = null;
+-        try {
+-          authsResponse = VisibilityClient.getAuths(conf, user);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          authsResponse = VisibilityClient.getAuths(conn, user);
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -826,8 +826,8 @@ public abstract class TestVisibilityLabels {
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, TOPSECRET, CONFIDENTIAL, PUBLIC, PRIVATE, COPYRIGHT, ACCENT,
+             UNICODE_VIS_TAG, UC1, UC2 };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOpWithDifferentUsersNoACL.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOpWithDifferentUsersNoACL.java
+index 2c4955c..06fc7be 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOpWithDifferentUsersNoACL.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsOpWithDifferentUsersNoACL.java
+@@ -28,6 +28,8 @@ import java.util.List;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.GetAuthsResponse;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsResponse;
+ import org.apache.hadoop.hbase.security.User;
+@@ -84,8 +86,8 @@ public class TestVisibilityLabelsOpWithDifferentUsersNoACL {
+     PrivilegedExceptionAction<VisibilityLabelsResponse> action =
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -98,8 +100,8 @@ public class TestVisibilityLabelsOpWithDifferentUsersNoACL {
+     // Ideally this should not be allowed.  this operation should fail or do nothing.
+     action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user3");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, PRIVATE }, "user3");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -114,8 +116,8 @@ public class TestVisibilityLabelsOpWithDifferentUsersNoACL {
+     PrivilegedExceptionAction<GetAuthsResponse> action1 =
+         new PrivilegedExceptionAction<GetAuthsResponse>() {
+       public GetAuthsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.getAuths(conf, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.getAuths(conn, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -137,8 +139,9 @@ public class TestVisibilityLabelsOpWithDifferentUsersNoACL {
+     PrivilegedExceptionAction<VisibilityLabelsResponse> action2 = 
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.clearAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.clearAuths(conn, new String[] {
++              CONFIDENTIAL, PRIVATE }, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -161,8 +164,8 @@ public class TestVisibilityLabelsOpWithDifferentUsersNoACL {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, CONFIDENTIAL, PRIVATE };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
+index bc34ce3..a945a9e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
+@@ -350,8 +350,8 @@ public class TestVisibilityLabelsReplication {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, TOPSECRET, CONFIDENTIAL, PUBLIC, PRIVATE, UNICODE_VIS_TAG };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+@@ -365,9 +365,9 @@ public class TestVisibilityLabelsReplication {
+     PrivilegedExceptionAction<VisibilityLabelsResponse> action =
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { SECRET, CONFIDENTIAL, PRIVATE,
+-              TOPSECRET, UNICODE_VIS_TAG }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { SECRET,
++            CONFIDENTIAL, PRIVATE, TOPSECRET, UNICODE_VIS_TAG }, "user1");
+         } catch (Throwable e) {
+           throw new Exception(e);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithACL.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithACL.java
+index 3175fcc..a6192fc 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithACL.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithACL.java
+@@ -115,7 +115,7 @@ public class TestVisibilityLabelsWithACL {
+   public void testScanForUserWithFewerLabelAuthsThanLabelsInScanAuthorizations() throws Throwable {
+     String[] auths = { SECRET };
+     String user = "user2";
+-    VisibilityClient.setAuths(conf, auths, user);
++    VisibilityClient.setAuths(TEST_UTIL.getConnection(), auths, user);
+     TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     final Table table = createTableAndWriteDataWithLabels(tableName, SECRET + "&" + CONFIDENTIAL
+         + "&!" + PRIVATE, SECRET + "&!" + PRIVATE);
+@@ -144,7 +144,9 @@ public class TestVisibilityLabelsWithACL {
+   public void testScanForSuperUserWithFewerLabelAuths() throws Throwable {
+     String[] auths = { SECRET };
+     String user = "admin";
+-    VisibilityClient.setAuths(conf, auths, user);
++    try (Connection conn = ConnectionFactory.createConnection(conf)) {
++      VisibilityClient.setAuths(conn, auths, user);
++    }
+     TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     final Table table = createTableAndWriteDataWithLabels(tableName, SECRET + "&" + CONFIDENTIAL
+         + "&!" + PRIVATE, SECRET + "&!" + PRIVATE);
+@@ -168,7 +170,7 @@ public class TestVisibilityLabelsWithACL {
+   public void testGetForSuperUserWithFewerLabelAuths() throws Throwable {
+     String[] auths = { SECRET };
+     String user = "admin";
+-    VisibilityClient.setAuths(conf, auths, user);
++    VisibilityClient.setAuths(TEST_UTIL.getConnection(), auths, user);
+     TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     final Table table = createTableAndWriteDataWithLabels(tableName, SECRET + "&" + CONFIDENTIAL
+         + "&!" + PRIVATE, SECRET + "&!" + PRIVATE);
+@@ -191,8 +193,10 @@ public class TestVisibilityLabelsWithACL {
+   public void testVisibilityLabelsForUserWithNoAuths() throws Throwable {
+     String user = "admin";
+     String[] auths = { SECRET };
+-    VisibilityClient.clearAuths(conf, auths, user); // Removing all auths if any.
+-    VisibilityClient.setAuths(conf, auths, "user1");
++    try (Connection conn = ConnectionFactory.createConnection(conf)) {
++      VisibilityClient.clearAuths(conn, auths, user); // Removing all auths if any.
++      VisibilityClient.setAuths(conn, auths, "user1");
++    }
+     TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+     final Table table = createTableAndWriteDataWithLabels(tableName, SECRET);
+     SecureTestUtil.grantOnTable(TEST_UTIL, NORMAL_USER1.getShortName(), tableName,
+@@ -219,8 +223,8 @@ public class TestVisibilityLabelsWithACL {
+     PrivilegedExceptionAction<VisibilityLabelsResponse> action = 
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.addLabels(conf, new String[] { "l1", "l2" });
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.addLabels(conn, new String[] { "l1", "l2" });
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -234,8 +238,8 @@ public class TestVisibilityLabelsWithACL {
+ 
+     action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -249,8 +253,8 @@ public class TestVisibilityLabelsWithACL {
+ 
+     action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -262,8 +266,9 @@ public class TestVisibilityLabelsWithACL {
+ 
+     action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.clearAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.clearAuths(conn, new String[] {
++              CONFIDENTIAL, PRIVATE }, "user1");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -275,16 +280,18 @@ public class TestVisibilityLabelsWithACL {
+     assertEquals("org.apache.hadoop.hbase.security.AccessDeniedException", response.getResult(1)
+         .getException().getName());
+ 
+-    response = VisibilityClient.clearAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user1");
++    response = VisibilityClient.clearAuths(TEST_UTIL.getConnection(), new String[] { CONFIDENTIAL,
++      PRIVATE }, "user1");
+     assertTrue(response.getResult(0).getException().getValue().isEmpty());
+     assertTrue(response.getResult(1).getException().getValue().isEmpty());
+ 
+-    VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE }, "user3");
++    VisibilityClient.setAuths(TEST_UTIL.getConnection(), new String[] { CONFIDENTIAL, PRIVATE },
++      "user3");
+     PrivilegedExceptionAction<GetAuthsResponse> action1 = 
+         new PrivilegedExceptionAction<GetAuthsResponse>() {
+       public GetAuthsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.getAuths(conf, "user3");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.getAuths(conn, "user3");
+         } catch (Throwable e) {
+         }
+         return null;
+@@ -328,7 +335,7 @@ public class TestVisibilityLabelsWithACL {
+   private static void addLabels() throws IOException {
+     String[] labels = { SECRET, CONFIDENTIAL, PRIVATE };
+     try {
+-      VisibilityClient.addLabels(conf, labels);
++      VisibilityClient.addLabels(TEST_UTIL.getConnection(), labels);
+     } catch (Throwable t) {
+       throw new IOException(t);
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDefaultVisLabelService.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDefaultVisLabelService.java
+index b7a6240..7797493 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDefaultVisLabelService.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDefaultVisLabelService.java
+@@ -32,6 +32,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+ import org.apache.hadoop.hbase.client.Scan;
+@@ -85,8 +87,8 @@ public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibili
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { "L1", SECRET, "L2", "invalid~", "L3" };
+         VisibilityLabelsResponse response = null;
+-        try {
+-          response = VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          response = VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable e) {
+           fail("Should not have thrown exception");
+         }
+@@ -124,8 +126,8 @@ public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibili
+           new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+         public VisibilityLabelsResponse run() throws Exception {
+           String[] labels = { SECRET, CONFIDENTIAL, PRIVATE, "ABC", "XYZ" };
+-          try {
+-            VisibilityLabelsResponse resp = VisibilityClient.addLabels(conf, labels);
++          try (Connection conn = ConnectionFactory.createConnection(conf)) {
++            VisibilityLabelsResponse resp = VisibilityClient.addLabels(conn, labels);
+             List<RegionActionResult> results = resp.getResultList();
+             if (results.get(0).hasException()) {
+               NameBytesPair pair = results.get(0).getException();
+@@ -172,8 +174,8 @@ public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibili
+         new PrivilegedExceptionAction<ListLabelsResponse>() {
+       public ListLabelsResponse run() throws Exception {
+         ListLabelsResponse response = null;
+-        try {
+-          response = VisibilityClient.listLabels(conf, null);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          response = VisibilityClient.listLabels(conn, null);
+         } catch (Throwable e) {
+           fail("Should not have thrown exception");
+         }
+@@ -202,8 +204,8 @@ public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibili
+         new PrivilegedExceptionAction<ListLabelsResponse>() {
+       public ListLabelsResponse run() throws Exception {
+         ListLabelsResponse response = null;
+-        try {
+-          response = VisibilityClient.listLabels(conf, ".*secret");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          response = VisibilityClient.listLabels(conn, ".*secret");
+         } catch (Throwable e) {
+           fail("Should not have thrown exception");
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
+index 033299b..a8f7ec3 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithDeletes.java
+@@ -1780,8 +1780,8 @@ public class TestVisibilityLabelsWithDeletes {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE, SECRET },
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL, PRIVATE, SECRET },
+               SUPERUSER.getShortName());
+         } catch (Throwable e) {
+         }
+@@ -1931,8 +1931,9 @@ public class TestVisibilityLabelsWithDeletes {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE, SECRET },
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL,
++            PRIVATE, SECRET },
+               SUPERUSER.getShortName());
+         } catch (Throwable e) {
+         }
+@@ -2460,8 +2461,9 @@ public class TestVisibilityLabelsWithDeletes {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL, PRIVATE, SECRET,
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL,
++            PRIVATE, SECRET,
+               TOPSECRET }, SUPERUSER.getShortName());
+         } catch (Throwable e) {
+         }
+@@ -2867,8 +2869,8 @@ public class TestVisibilityLabelsWithDeletes {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, TOPSECRET, CONFIDENTIAL, PUBLIC, PRIVATE };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithSLGStack.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithSLGStack.java
+index 5abfecc..c48b4c4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithSLGStack.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsWithSLGStack.java
+@@ -28,6 +28,8 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+@@ -107,8 +109,8 @@ public class TestVisibilityLabelsWithSLGStack {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { SECRET, CONFIDENTIAL };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java
+index f0881fd..76ea96c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLablesWithGroups.java
+@@ -97,10 +97,10 @@ public class TestVisibilityLablesWithGroups {
+     // Set up for the test
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.addLabels(conf, new String[] { SECRET, CONFIDENTIAL });
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, new String[] { SECRET, CONFIDENTIAL });
+           // set auth for @testgroup
+-          VisibilityClient.setAuths(conf, new String[] { CONFIDENTIAL }, "@testgroup");
++          VisibilityClient.setAuths(conn, new String[] { CONFIDENTIAL }, "@testgroup");
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+@@ -174,8 +174,8 @@ public class TestVisibilityLablesWithGroups {
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+         GetAuthsResponse authsResponse = null;
+-        try {
+-          authsResponse = VisibilityClient.getAuths(conf, "@testgroup");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          authsResponse = VisibilityClient.getAuths(conn, "@testgroup");
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -267,8 +267,9 @@ public class TestVisibilityLablesWithGroups {
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+         VisibilityLabelsResponse response = null;
+-        try {
+-          response = VisibilityClient.clearAuths(conf, new String[] { CONFIDENTIAL }, "@testgroup");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          response = VisibilityClient.clearAuths(conn, new String[] {
++            CONFIDENTIAL }, "@testgroup");
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+@@ -280,8 +281,8 @@ public class TestVisibilityLablesWithGroups {
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+         GetAuthsResponse authsResponse = null;
+-        try {
+-          authsResponse = VisibilityClient.getAuths(conf, "@testgroup");
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          authsResponse = VisibilityClient.getAuths(conn, "@testgroup");
+         } catch (Throwable e) {
+           fail("Should not have failed");
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityWithCheckAuths.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityWithCheckAuths.java
+index 67d9c63..0b0d9d0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityWithCheckAuths.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityWithCheckAuths.java
+@@ -95,8 +95,8 @@ public class TestVisibilityWithCheckAuths {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+         String[] labels = { TOPSECRET };
+-        try {
+-          VisibilityClient.addLabels(conf, labels);
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn, labels);
+         } catch (Throwable t) {
+           throw new IOException(t);
+         }
+@@ -112,8 +112,8 @@ public class TestVisibilityWithCheckAuths {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { TOPSECRET },
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { TOPSECRET },
+               USER.getShortName());
+         } catch (Throwable e) {
+         }
+@@ -158,8 +158,8 @@ public class TestVisibilityWithCheckAuths {
+         new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+       @Override
+       public VisibilityLabelsResponse run() throws Exception {
+-        try {
+-          return VisibilityClient.setAuths(conf, new String[] { TOPSECRET },
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          return VisibilityClient.setAuths(conn, new String[] { TOPSECRET },
+               USER.getShortName());
+         } catch (Throwable e) {
+         }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestWithDisabledAuthorization.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestWithDisabledAuthorization.java
+index d5e83de..7253198 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestWithDisabledAuthorization.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestWithDisabledAuthorization.java
+@@ -28,6 +28,8 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.ResultScanner;
+@@ -66,10 +68,11 @@ public class TestWithDisabledAuthorization {
+ 
+   private static User SUPERUSER;
+   private static User USER_RW;
++  private static Configuration conf;
+ 
+   @BeforeClass
+   public static void setUpBeforeClass() throws Exception {
+-    Configuration conf = TEST_UTIL.getConfiguration();
++    conf = TEST_UTIL.getConfiguration();
+ 
+     // Set up superuser
+     SecureTestUtil.configureSuperuser(conf);
+@@ -92,10 +95,10 @@ public class TestWithDisabledAuthorization {
+     // Define test labels
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.addLabels(TEST_UTIL.getConfiguration(),
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.addLabels(conn,
+             new String[] { SECRET, CONFIDENTIAL, PRIVATE });
+-          VisibilityClient.setAuths(TEST_UTIL.getConfiguration(),
++          VisibilityClient.setAuths(conn,
+             new String[] { SECRET, CONFIDENTIAL },
+             USER_RW.getShortName());
+         } catch (Throwable t) {
+@@ -117,8 +120,8 @@ public class TestWithDisabledAuthorization {
+ 
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.setAuths(TEST_UTIL.getConfiguration(),
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.setAuths(conn,
+             new String[] { SECRET, CONFIDENTIAL },
+             USER_RW.getShortName());
+         } catch (Throwable t) {
+@@ -132,8 +135,8 @@ public class TestWithDisabledAuthorization {
+       new PrivilegedExceptionAction<List<String>>() {
+         public List<String> run() throws Exception {
+           GetAuthsResponse authsResponse = null;
+-          try {
+-            authsResponse = VisibilityClient.getAuths(TEST_UTIL.getConfiguration(),
++          try (Connection conn = ConnectionFactory.createConnection(conf)) {
++            authsResponse = VisibilityClient.getAuths(conn,
+               USER_RW.getShortName());
+           } catch (Throwable t) {
+             fail("Should not have failed");
+@@ -153,8 +156,8 @@ public class TestWithDisabledAuthorization {
+ 
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.clearAuths(TEST_UTIL.getConfiguration(),
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.clearAuths(conn,
+             new String[] { SECRET },
+             USER_RW.getShortName());
+         } catch (Throwable t) {
+@@ -170,8 +173,8 @@ public class TestWithDisabledAuthorization {
+ 
+     SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+       public Void run() throws Exception {
+-        try {
+-          VisibilityClient.clearAuths(TEST_UTIL.getConfiguration(),
++        try (Connection conn = ConnectionFactory.createConnection(conf)) {
++          VisibilityClient.clearAuths(conn,
+             new String[] { CONFIDENTIAL },
+             USER_RW.getShortName());
+         } catch (Throwable t) {
+diff --git a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandlerWithLabels.java b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandlerWithLabels.java
+index 6c80907..9153c9b 100644
+--- a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandlerWithLabels.java
++++ b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift2/TestThriftHBaseServiceHandlerWithLabels.java
+@@ -39,6 +39,8 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsResponse;
+ import org.apache.hadoop.hbase.security.User;
+@@ -153,8 +155,8 @@ private static void createLabels() throws IOException, InterruptedException {
+   PrivilegedExceptionAction<VisibilityLabelsResponse> action = new PrivilegedExceptionAction<VisibilityLabelsResponse>() {
+     public VisibilityLabelsResponse run() throws Exception {
+       String[] labels = { SECRET, CONFIDENTIAL, PRIVATE, PUBLIC, TOPSECRET };
+-      try {
+-        VisibilityClient.addLabels(conf, labels);
++      try (Connection conn = ConnectionFactory.createConnection(conf)) {
++        VisibilityClient.addLabels(conn, labels);
+       } catch (Throwable t) {
+         throw new IOException(t);
+       }
+@@ -167,7 +169,7 @@ private static void createLabels() throws IOException, InterruptedException {
+ private static void setAuths() throws IOException {
+   String[] labels = { SECRET, CONFIDENTIAL, PRIVATE, PUBLIC, TOPSECRET };
+   try {
+-    VisibilityClient.setAuths(conf, labels, User.getCurrent().getShortName());
++    VisibilityClient.setAuths(UTIL.getConnection(), labels, User.getCurrent().getShortName());
+   } catch (Throwable t) {
+     throw new IOException(t);
+   }
+-- 
+2.3.2 (Apple Git-55)
+
