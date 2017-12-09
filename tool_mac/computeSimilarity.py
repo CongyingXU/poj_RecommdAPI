@@ -4,6 +4,7 @@
 Created on Mon Aug  7 19:23:55 2017
 
 @author: Congying.Xu
+文本相似度计算的主要技术实现
 """
 
 ''' ------------------------------------------------------- 
@@ -44,7 +45,7 @@ sys.setdefaultencoding('utf8')
 
 
 def tokenize_stopwords_stemmer(texts):
-    
+#texts：列表存放的字符串    
     #用斯坦福的分词采用这一段，用普通分词时不用这个
     #tokenize
     Str_texts=texts[0]

@@ -104,9 +104,7 @@ def computeSimilarityScors(newReportSummary,newReportDescription        ,sheet1)
    
     all_classdir=[]
     
-    all_className=[]
-    all_methodName=[]
-    all_variableName=[]
+    all_program_lanuage=[]
     all_comments=[]
     """
     workbook = xlrd.open_workbook(Src_info_file_dir,'r')
@@ -118,19 +116,14 @@ def computeSimilarityScors(newReportSummary,newReportDescription        ,sheet1)
     for i in range(1,sheet1.nrows):
         
         all_classdir.append(sheet1.cell(i,0).value.encode('utf-8'))
-        
         className=[]
         className = sheet1.cell(i,1).value.encode('utf-8').split(' ')
-        all_className.append(className)
-        
         methodName=[]
         methodName = sheet1.cell(i,2).value.encode('utf-8').split(' ')
-        all_methodName.append(methodName)
-
         variableName=[]
         variableName = sheet1.cell(i,3).value.encode('utf-8').split(' ')
-        all_variableName.append(variableName)
-        
+        program_lanuage = className + methodName  + variableName
+        all_program_lanuage.append(program_lanuage)
         
         comments_str=''
         j=6
@@ -149,87 +142,32 @@ def computeSimilarityScors(newReportSummary,newReportDescription        ,sheet1)
    
     
     #版本二，数据已经经过文本处理，节省时间
-    newRportS= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary] )
-    newRportD= computeSimilarity.tokenize_stopwords_stemmer( [newReportDescription] )
+    newRportSD= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary + newReportDescription] )
     #print 11
     
-    all_classNameS_result = Half_computeSimilarity(newRportS,all_className)
-    all_methodNameS_result = Half_computeSimilarity(newRportS,all_methodName)
-    #print 22
-    all_variableNameS_result = Half_computeSimilarity(newRportS,all_variableName)
-    all_commentsS_result = Half_computeSimilarity(newRportS,all_comments)
-    #print 33
-        
-    all_classNameD_result = Half_computeSimilarity(newRportD,all_className)
-    all_methodNameD_result = Half_computeSimilarity(newRportD,all_methodName)
-    #print 44
-    all_variableNameD_result = Half_computeSimilarity(newRportD,all_variableName)
-    all_commentsD_result = Half_computeSimilarity(newRportD,all_comments)
+    all_program_language_result = Half_computeSimilarity(newRportSD,all_program_lanuage)
+    all_commentsSD_result = Half_computeSimilarity(newRportSD,all_comments)
+    #归一化处理
+    Max_socre  = all_program_language_result[0]
+    for score in all_program_language_result:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    if Max_socre != 0:
+        for i in range(len(all_program_language_result)):
+            all_program_language_result[i] = all_program_language_result[i] / Max_socre
     
-    #print 55
-    """
-    #版本一：数据无文本预处理
-    #print sheet1.cell(6,28).value.encode('utf-8')    
-    for i in range(1,sheet1.nrows):
-        
-        all_classdir.append(sheet1.cell(i,0).value.encode('utf-8'))
-        
-        className=[]
-        className.append(sheet1.cell(i,1).value.encode('utf-8'))
-        all_className.append(className)
-        
-        methodName=[]
-        methodName.append(sheet1.cell(i,2).value.encode('utf-8'))
-        all_methodName.append(methodName)
-
-        variableName=[]
-        variableName.append(sheet1.cell(i,3).value.encode('utf-8'))
-        all_variableName.append(variableName)
-        
-        
-        comments_str=''
-        j=2
-        while 1 :
-            try:#因为不确定  注释占了几格
-                comments_str= comments_str + sheet2.cell(i,j).value.encode('utf-8')
-                j=j+1
-            except IndexError:
-                break
-        comments=[]
-        comments.append(comments_str)
-        all_comments.append(comments)
-    
-    newRportS=[newReportSummary]
-    newRportD=[newReportDescription]
-    
-    all_classNameS_result = computeSimilarity.all_computeSimilarity(newRportS,all_className)
-    all_methodNameS_result = computeSimilarity.all_computeSimilarity(newRportS,all_methodName)
-    all_variableNameS_result = computeSimilarity.all_computeSimilarity(newRportS,all_variableName)
-    all_commentsS_result = computeSimilarity.all_computeSimilarity(newRportS,all_comments)
-        
-    all_classNameD_result = computeSimilarity.all_computeSimilarity(newRportD,all_className)
-    all_methodNameD_result = computeSimilarity.all_computeSimilarity(newRportD,all_methodName)
-    all_variableNameD_result = computeSimilarity.all_computeSimilarity(newRportD,all_variableName)
-    all_commentsD_result = computeSimilarity.all_computeSimilarity(newRportD,all_comments)
-    """
-    
-    """
-        result =  all_classNameS_result +  all_classNameD_result
-        + all_methodNameS_result +  all_methodNameD_result
-        + all_variableNameS_result +  all_variableNameD_result
-        + all_commentsS_result +  all_commentsD_result
-    """
-
+    Max_socre  = all_commentsSD_result[0]
+    for score in all_commentsSD_result:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    if Max_socre != 0:
+        for i in range(len(all_commentsSD_result)):
+            all_commentsSD_result[i] = all_commentsSD_result[i] / Max_socre
+            
     result=[]
     result.append(all_classdir)
-    result.append(all_classNameS_result)
-    result.append(all_classNameD_result)
-    result.append(all_methodNameS_result)
-    result.append(all_methodNameD_result)
-    result.append(all_variableNameS_result)
-    result.append(all_variableNameD_result)
-    result.append(all_commentsS_result)
-    result.append(all_commentsD_result)
+    result.append(all_program_language_result)
+    result.append(all_commentsSD_result)
     
     return result
 
@@ -274,7 +212,7 @@ def getAimList():
     #准备设计成 字典，以issuekey 作为键   ，  其aimresulr  为值
     Aimresult={}
     import csv
-    with open("Input/Attachments_PatchInfo.csv","r") as csvfile:
+    with open("Input/Hadoop_Attachments_PatchInfo.csv","r") as csvfile:
         reader = csv.reader(csvfile)
         #这里不需要readlines
         for i,rows in enumerate(reader):
@@ -290,20 +228,20 @@ def getAimList():
 def getall_result():
     #begin = time()
     
-    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+    workbook = xlrd.open_workbook(r'Input/HadoopCommon.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     #print sheet1.cell(6,28).value.encode('utf-8')
     
     
     #定向制作
-    Src_info_file_dir='Output/repo_SrcfileInfo.xls'
+    Src_info_file_dir='Output/Hadoop_repo_SrcfileInfo.xls'
     workbook = xlrd.open_workbook(Src_info_file_dir,'r')
     sheet1 = workbook.sheet_by_name('sheet1')
     #因为数据量小，所以代码没有优化，
     #正式使用前，一定会要  优化！！！！
     ######################################
     All_result={}
-    data = range(904,1004)# + range(204,1004)
+    data = range(104,204)# + range(204,1004)
     for i in data:
         newReportissueKey=sheet.cell(i,1).value.encode('utf-8')
         newReportSummary=sheet.cell(i,2).value.encode('utf-8')
@@ -321,14 +259,15 @@ def getall_result():
     return All_result
 
 def getFinal_result(All_result , weights):
+    weights = [0.5 , 0.5]
+    #默认情况下，不需要调参数 weights = [0.5 ， 0.5 ]
     #转为实验设计
     Final_result = {}
     for key in All_result:
         result = All_result[key]
         all_result={}
         for i in range(len(result[0])):
-            all_result0= weights[0]*result[1][i] +weights[1]*result[2][i] +weights[2]*result[3][i] +weights[3]*result[4][i]
-            + weights[4]*result[5][i] +weights[5]*result[6][i] +weights[6]*result[7][i] +weights[7]*result[8][i] 
+            all_result0 = weights[0]*result[1][i] +weights[1]*result[2][i] 
             all_result[result[0][i]] = all_result0
         #all_result = sorted(all_result.iteritems(), key = lambda asd:asd[1], reverse = True)
         Final_result[key]= all_result

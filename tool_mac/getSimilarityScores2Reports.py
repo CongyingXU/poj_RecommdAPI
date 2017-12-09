@@ -108,11 +108,13 @@ def Half_computeSimilarity(text1, all_reports_tokens):
     #                                 ......
     #                                [ "  ","  ","  " ] 】
     
+    """
     #检查text1，是否在数据集中
     if text1 in all_reports_tokens:
         pass
     else:
         all_reports_tokens.append(text1)      
+    """
     
     word_dict={}
     for text in all_reports_tokens:
@@ -192,13 +194,13 @@ def main():
     newReportLinkedissue=['']  #列表类型，表格中是以’，‘号分割的字符串;若没有，则为【‘’】
     """
 def getnewreportInfo():
-    oldReports_dir='Input/Hbase.xlsx'
+    oldReports_dir='Input/HadoopCommon.xlsx'
     workbook = xlrd.open_workbook(oldReports_dir,'r')
     sheet1 = workbook.sheet_by_name('general_report')
     #print sheet1.cell(6,28).value.encode('utf-8')
     All_newreportinfo=[]
     
-    data = range(104,1004)# + range(204,1004)
+    data = range(104,204)# + range(204,1004)
     for i in data:
         print i
         newReportSummary=sheet1.cell(i,2).value.encode('utf-8')
@@ -274,7 +276,7 @@ def getnewreportInfo():
     return  All_newreportinfo
        
 def getOldreportsInfo():
-    oldReports_dir='Input/Hbase.xlsx'
+    oldReports_dir='Input/HadoopCommon.xlsx'
     workbook = xlrd.open_workbook(oldReports_dir,'r')
     sheet1 = workbook.sheet_by_name('general_report')
     
@@ -418,6 +420,16 @@ def getOldreportsSimilarScores(newreportinfo,oldreportsInfo):
     D2D_result=Half_computeSimilarity(newReportDescriptionText_tokens, OldReportsDescription_tokens)
     S2S_result=Half_computeSimilarity(newReportSummaryText_tokens, OldReportsSummary_tokens)
     SD2SD_result=Half_computeSimilarity(newReportSummaryAndDescriptionText_tokens, OldReportsSummaryAndDescription_tokens)
+    
+    #特殊处理一下，作为归一化处理
+    Max_socre  = SD2SD_result[0]
+    for score in SD2SD_result:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    
+    for i in range(len(SD2SD_result)):
+        SD2SD_result[i] = SD2SD_result[i] / Max_socre
+        
     Comp_result=[]
     for OldReportComponentList in OldReportsComponent:
         if OldReportComponentList[0]=='' or OldReportComponentList[0]=='':
@@ -457,7 +469,7 @@ def getOldreportsSimilarScores(newreportinfo,oldreportsInfo):
     
     #print time()
 
-    
+    """
     print len(D2D_result)
     print len(S2S_result)
     print len(SD2SD_result)
@@ -465,6 +477,7 @@ def getOldreportsSimilarScores(newreportinfo,oldreportsInfo):
     print len(Rpoter_result)
     print len(Prio_result)
     print len(Llediss_result)
+    """
     
     if len(D2D_result) > len(Llediss_result):
         D2D_result.pop(-1)   #因为最后项  为new report
@@ -491,7 +504,7 @@ def getPathinfo():
     #根据排名靠前的report 找到对应的  .java文件
     issuekey_file_num = {}  #用于存放 issuekey及其对应 修复文件的个数
     issuekey_file_list = {} #存放  issuekey，及其对应 修复文件   0个时，不放入其中
-    with open("Input/Attachments_PatchInfo.csv","r") as csvfile:
+    with open("Input/Hadoop_Attachments_PatchInfo.csv","r") as csvfile:
         reader = csv.reader(csvfile)
         #这里不需要readlines
         #先确保topk 的report中都是有 附件的
@@ -516,13 +529,14 @@ def getFinalResultsbyWeights(All_result,weights,issuekey_file_num,issuekey_file_
         OldIssueKey = all_result[6]
         Llediss_result = all_result[7]
         newReportIssueKey = all_result[8]
-        #a=[0.38 , 0.29 , 0.36 , 0.20 , 0.23 , 0.60 , 0.5]
+        
         Final_SimlarScors2Reports=[]
         for i in range(len(Llediss_result)):
             score = a[0]*S2S_result[i] + a[1]*D2D_result[i] + a[2]*SD2SD_result[i] + a[3]*Rpoter_result[i]+ a[4]*Comp_result[i]+ a[5]*Prio_result[i] + a[6]*Llediss_result[i]
             Final_SimlarScors2Reports.append( score )
             result_dict[ OldIssueKey[i] ]=score
         result_list = sorted(result_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
+        
         #列表类型，【 （key，value） 】
         """
         #根据排名靠前的report 找到对应的  .java文件
@@ -615,7 +629,7 @@ def getIssueKey_UsedAPIinfo():
     issuekey_UsedAPI_num = {}  #用于存放 issuekey及其对应 修复文件的个数
     issuekey_UsedAPI_list = {} #存放  issuekey，及其对应 修复文件   0个时，不放入其中
     
-    workbook = xlrd.open_workbook(r'Input/issuekeys_UsedAPI.xls')
+    workbook = xlrd.open_workbook(r'Input/Hadoop_issuekeys_UsedAPI.xls')
     sheet = workbook.sheet_by_name('sheet1')
 
     for j in range(1,sheet.nrows):
@@ -681,7 +695,17 @@ def getFinalAPIResultsbyWeights(All_result,weights,issuekey_UsedAPI_num,issuekey
         API_scores_dict ={}###为该词的结果
         for key in API_num_dict:
             API_scores_dict[key] = API_num_dict[key]/float(k)
-            
+        
+        #数据归一化处理    
+        Max_socre  = 0.0
+        for key in API_scores_dict:
+            if Max_socre < API_scores_dict[key] and API_scores_dict[key] < 1 :#里面有一个是其本身。最大值为一
+                Max_socre = API_scores_dict[key]
+                
+        if Max_socre != 0:
+            for key in API_scores_dict:
+                API_scores_dict[key] = API_scores_dict[key] / Max_socre
+        
         #API_scores_list = sorted(API_scores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)#列表类型，【 （key，value） 】
         
         #Result_dict[newReportIssueKey] = API_scores_list
@@ -725,8 +749,11 @@ def main(weights):
 def main_API():
     
     #begin = time()
-    weights = [1, 0.5000000000000001, 1.0, 0.30000000000000016, 1, 1.3877787807814457e-16, 0.10000000000000014, 1.3877787807814457e-16, 1, 0.7000000000000001, 0.5000000000000001, 0.10000000000000014, 0.5000000000000001, 1, 1, 1, 1]
-    
+    # = [0.9, 0.7000000000000001, 1.3877787807814457e-16, 1.3877787807814457e-16, 0.9, 0.40000000000000013, 0.6000000000000001, 1.3877787807814457e-16, 0.40000000000000013, 1, 1, 0.5000000000000001, 0.20000000000000015, 1, 1, 1, 1] 
+    weights = [0.9, 0.7000000000000001, 0, 0, 0.9, 0.40000000000000013, 0.6000000000000001, 1.3877787807814457e-16, 0.40000000000000013, 1, 1, 0.5000000000000001, 0.20000000000000015, 1, 1, 1, 1] 
+
+    #weights = [0.20000000000000015, 0.5000000000000001, 0, 0, 1, 0.10000000000000014, 0.10000000000000014, 0, 0.4, 1, 1, 1]
+
     All_newreportinfo = getnewreportInfo()
     oldreportsInfo = getOldreportsInfo()
     All_result=[]

@@ -4,6 +4,7 @@
 Created on Sat Aug 12 14:33:35 2017
 
 @author: Congying.Xu
+从  .java文件中提取文件中的信息，主要是javalang的包，用于解析
 """
 
 """
@@ -145,7 +146,7 @@ def get_class(dir):
                         #if isinstance(each,javalang.tree.ClassDeclaration):
                             #对路径名进行美化处理，去掉  Input
                             #String_dir = dir.split('Input/')
-                            String_dir = dir.split('/Users/apple/Documents/API/Hadoop/')
+                            String_dir = dir.split('/Users/apple/Git/')
                             if len(String_dir) == 2:
                                 class_dict[String_dir[1]] = extract_class( each )  #以类路径名  作为Key  ，类的内容为 Value
                             if len(String_dir) == 1:
@@ -177,7 +178,7 @@ reload(sys) # Python2.5 初始化后会删除 sys.setdefaultencoding 这个方�
 sys.setdefaultencoding('utf-8') 
 
 
-repo_dir='/Users/apple/Documents/API/Hadoop/hadoop-common-project'
+repo_dir='/Users/apple/Git/ofbiz'
 
 if __name__ == '__main__':
     project_dict=extract_file(repo_dir)
@@ -298,7 +299,11 @@ if __name__ == '__main__':
             Variable_name = Variable_name +' ' + word
         
         sheet1.write(i,3,Variable_name.strip(' '))
-        sheet1.write(i,5,variable_info)
+        #在表格中  Exception: String longer than 32767 characters
+        if len(variable_info) > 32000:
+            sheet1.write(i,5,variable_info[:32000])
+        else:
+            sheet1.write(i,5,variable_info)
         
         
         #存注释，在表格中  Exception: String longer than 32767 characters
@@ -321,5 +326,5 @@ if __name__ == '__main__':
         print i
              
     #f.save('Output/repo_SrcfileInfo.xls')#保存文件 
-    f.save('/Users/apple/Documents/API/Hadoop/repo_SrcfileInfo.xls')
+    f.save('/Users/apple/Documents/API/MULAPI+/OFBiz/OFBiz_repo_SrcfileInfo.xls')
     #cxf有问题，但时候好好看看

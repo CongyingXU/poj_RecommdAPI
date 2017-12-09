@@ -4,15 +4,15 @@
 Created on Fri Aug 25 20:48:14 2017
 
 @author: Congying.Xu
+实现各个评估指标
+Aimresult  正确答案的字典存储
+Result_dict  目前答案的字典存储
+
+#aimList：表示已知的答案列表
+#resultLIst：表示工具计算的结果列表
 """
 
 import numpy
-import getStrucCmptScors
-from time import time
-import getFeatureLocation_result
-
-
-#kong_num =0
 
 #aimList：表示已知的答案列表
 #resultLIst：表示工具计算的结果列表
@@ -52,7 +52,7 @@ def getAimList():
     #准备设计成 字典，以issuekey 作为键   ，  其aimresulr  为值
     Aimresult={}
     import csv
-    with open("Input/Attachments_PatchInfo.csv","r") as csvfile:
+    with open("Input/CXF_Attachments_PatchInfo.csv","r") as csvfile:
         reader = csv.reader(csvfile)
         #这里不需要readlines
         for i,rows in enumerate(reader):
@@ -100,7 +100,10 @@ def main(Aimresult,Result_dict):
     #print len( Result)
     #print kong_num
     #print MAP
-    MAP =  MAP/(len( Result)- kong_num )
+    try:
+        MAP =  MAP/(len( Result)- kong_num )
+    except ZeroDivisionError:
+        MAP = 0.0
     #print MAP
     return MAP
 

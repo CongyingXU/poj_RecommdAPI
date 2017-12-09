@@ -4,6 +4,7 @@
 Created on Wed Aug  9 14:56:42 2017
 
 @author: Congying.Xu
+从每个issue的Attachment中提取相关的信息  一般为：  .patch文件
 """
 """
 数据结构
@@ -46,14 +47,14 @@ class switch(object):
             return False
 
 
-repo_path = "/Users/apple/Git/hadoop"
+repo_path = "/Users/apple/Git/hive"
 
 def getCommitHash():
     CommitHash_dict = {}
     with open(repo_path+'/log.log','r') as f:
         content = f.read()
         list0 = content.split('\n')
-        p1='HADOOP-[0-9]+'
+        p1='HIVE-[0-9]+'
         pa1=re.compile(p1)
         for each in list0:
             index = each.find(',')
@@ -70,7 +71,7 @@ def getCommitHash():
 CommitHash_dict = getCommitHash()
 
 def getSrcInfo():
-    Src_info_file_dir='Output/repo_SrcfileInfo.xls'
+    Src_info_file_dir='/Users/apple/Documents/API/MULAPI+/Hive/Hive_repo_SrcfileInfo.xls'
     workbook = xlrd.open_workbook(Src_info_file_dir,'r')
     sheet1 = workbook.sheet_by_name('sheet1')
     
@@ -123,14 +124,14 @@ All_3partAPI_set = getAll_3partAPI()
 #提取出每个issuekey所修改的.java文件
 def getfixedfile():
     #读取出目前已有的路径
-    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/repo_SrcfileInfo.xls')
+    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/MULAPI+/Hive/Hive_repo_SrcfileInfo.xls')
     sheet0 = workbook0.sheet_by_name('sheet1')
     file_list = []
     for i in range(1,sheet0.nrows):
         name = sheet0.cell(i,0).value.encode('utf-8')
         file_list.append(name)
     #print    file_list
-    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/HadoopCommon.xlsx')
+    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/MULAPI+/Hive/Hive.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     
     Result=collections.OrderedDict()
@@ -142,7 +143,7 @@ def getfixedfile():
         class_result=[]
         x=0
         while 1:
-            filename='/Users/apple/Documents/API/Hadoop/HadoopCommon-attachments/'+issuekey+'_'+str(x)+'.patch'
+            filename='/Users/apple/Documents/API/MULAPI+/Hive/Hive-attachments/'+issuekey+'_'+str(x)+'.patch'
             x = x + 1
             try:
                 #获取patch中设计的源代码文件
@@ -153,10 +154,12 @@ def getfixedfile():
                         if line[:3]=='+++':#提取所有修改的类
                             class_name = line.split(' ')[1].strip('\n').strip('b/') 
                             #class_name =class_name[ class_name.find('hadoop-common/'):]
-                            #class_name = 'cxf/'+class_name
+                            class_name = 'hive/'+class_name
                             class_name = class_name.split('\t')[0]
+                            #print class_name
                             if not class_name in class_result and class_name.endswith(".java") and class_name in file_list: 
                                 class_result.append(class_name)
+                                #print class_name
                                 
             except IOError:
                 print issuekey
@@ -168,13 +171,14 @@ def getfixedfile():
     return Result
 
 """
-    with open("/Users/apple/Documents/API/Hadoop/Attachments_PatchInfo.csv","w") as csvfile:
+    with open("/Users/apple/Documents/API/MULAPI+/Hive/Hive_Attachments_PatchInfo.csv","w") as csvfile:
         writer = csv.writer(csvfile)
         for k,v in Result.items():
             writer.writerow([k]+v[0])
-    #return Result
-#getfixedfile()
+    return Result
 """
+#getfixedfile()
+
 #将项目退回到某一版本，并进行解析信息
 def getSrcvariable_Info_git(issuekey,file_name):
     git_repo = PyGit(repo_path)
@@ -186,7 +190,10 @@ def getSrcvariable_Info_git(issuekey,file_name):
     except KeyError:
         #print issuekey
         return {'':''}
-    git_repo('reset --hard '+commit_hash)
+    try:
+        git_repo('reset --hard '+commit_hash)
+    except UnicodeDecodeError:
+        return {'':''}
     
     #file_name = repo_path + file_name [file_name.find('/'):]#因为有些是  hbase-1-master开头的
     file_name = repo_path + '/'+ file_name#   Hadoop 特殊处理，不然统一用上面的 [file_name.find('/'):]#因为有些是  hbase-1-master开头的
@@ -224,14 +231,14 @@ def getAPIFromSrcfile(pre_result_dict,variable_Info_dict):
 
 #提取出每个issuekey所使用的API
 def getUsedAPI(fixedfile_result):
-    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/repo_SrcfileInfo.xls')
+    workbook0 = xlrd.open_workbook(r'/Users/apple/Documents/API/MULAPI+/Hive/Hive_repo_SrcfileInfo.xls')
     sheet0 = workbook0.sheet_by_name('sheet1')
     file_list = []
     for i in range(1,sheet0.nrows):
         name = sheet0.cell(i,0).value.encode('utf-8')
         file_list.append(name)
         
-    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/Hadoop/HadoopCommon.xlsx')
+    workbook = xlrd.open_workbook(r'/Users/apple/Documents/API/MULAPI+/Hive/Hive.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     
     Result=collections.OrderedDict()
@@ -243,7 +250,7 @@ def getUsedAPI(fixedfile_result):
         Add_line={}
         x=0
         while 1:
-            filename='/Users/apple/Documents/API/Hadoop/HadoopCommon-attachments/'+issuekey+'_'+str(x)+'.patch'
+            filename='/Users/apple/Documents/API/MULAPI+/Hive/Hive-attachments/'+issuekey+'_'+str(x)+'.patch'
             x = x + 1
             try:
                 if len(fixedfile_result[issuekey][0])==0:#无fixed file时
@@ -386,6 +393,8 @@ def getAPI(add_line,file_name,issuekey):
     
     Used_API=[]#[ (类名 , 方法名,【参数】 ) .]
     for ele in APIresult_list:
+        
+        ################   try
         if ele[0]+ '.' + ele[1] in All_3partAPI_set:
             Used_API.append( (ele[0], ele[1] , ele[2] ) )
             print (ele[0], ele[1] , ele[2] ),issuekey
@@ -449,12 +458,12 @@ def write(Used_API):
         sheet1.write(i,1,string0.strip(';'))#格式：  类名.方法名|参数1，参数2:
         sheet1.write(i,2,para0.strip(','))#格式：  类名.方法名|参数1，参数2
         i = i+1
-    f.save('/Users/apple/Documents/API/Hadoop/issuekeys_UsedAPI.xls')#保存文件 
+    f.save('/Users/apple/Documents/API/MULAPI+/Hive/Hive_issuekeys_UsedAPI.xls')#保存文件 
 
 def main():
     fixedfile_result = getfixedfile()
     Used_API = getUsedAPI(fixedfile_result)
     write(Used_API)
     
-#main()
+main()
 #8:34

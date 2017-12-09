@@ -25,7 +25,7 @@ import getStrucCmptScors
 def Info_IO():
     ##########################################
     #注意文件名   序号的修改
-    dir0 = 'Output/FeaturnLocation_result.xls' 
+    dir0 = 'Output/Hadoop_FeaturnLocation_result.xls' 
     workbook0 = xlrd.open_workbook(dir0,'r')
     sheet0 = workbook0.sheet_by_name('sheet1')
     issuekeyOrder_dict = {}
@@ -33,7 +33,7 @@ def Info_IO():
         issuekeyOrder_dict[sheet0.cell(i,0).value] = i
     
 
-    Srcfileinfo_dir = 'Output/repo_SrcfileInfo.xls'
+    Srcfileinfo_dir = 'Output/Hadoop_repo_SrcfileInfo.xls'
     workbook1 = xlrd.open_workbook(Srcfileinfo_dir,'r')
     sheet1 = workbook1.sheet_by_name('sheet1')
     
@@ -120,10 +120,30 @@ def computeFinal_SimilarScores(weights):
     #不使用列表的原因，后期直接根据  键找分数
     
 """
-def computeFinal_SimilarScores(weights,issukey):
+def computeFinal_SimilarScores(weights ,issuekey):
     SimilarScores_dict = {}
-    text0_result = text0_result_dict[issuekey]
-    text1_result = text1_result_dict[issuekey]
+    text0_result = text0_result_dict[ issuekey]
+    text1_result = text1_result_dict[ issuekey]
+    
+    """
+    #将结果归一化处理一下
+    Max_socre  = text0_result[0]
+    for score in text0_result:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    for i in range(len(text0_result)):
+        text0_result[i] = text0_result[i] / Max_socre
+        
+    Max_socre  = text1_result[0]
+    for score in text1_result:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    for i in range(len(text1_result)):
+        text1_result[i] = text1_result[i] / Max_socre
+    """    
+        
+    
+    
     for i in range(len(allAPI_info_list)):
         API = allAPI_info_list[i][0]  + '.' + allAPI_info_list[i][1]
         try:
@@ -134,22 +154,32 @@ def computeFinal_SimilarScores(weights,issukey):
            pass
         else:
            SimilarScores_dict[API] = score
+       
+    """
+    #数据归一化处理
+    Max_socre  = 0.0
+    for key in SimilarScores_dict:
+        if Max_socre < SimilarScores_dict[key] and SimilarScores_dict[key] < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    for i in range(len(text1_result)):
+         SimilarScores_dict[key] = SimilarScores_dict[key] / Max_socre
+    """
           
     #SimilarScores = sorted(SimilarScores_dict.iteritems(), key = lambda asd:asd[1], reverse = True)
     return SimilarScores_dict#列表类型，【 （key，value） 】
 
 
 #这样零散得放置便于调参数
-
-
 sheet0,sheet1,issuekeyOrder_dict = Info_IO()
 allAPI_info_list,APIinfo_list = get_allAPI_info()
+
+"""
 workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
 sheet = workbook.sheet_by_name('general_report')
-
 ###########################################################
 #调节范围
-num_list = range(4,14)
+num_list = range(4,404) + range(504,1004)
+
 text0_result_dict={}
 text1_result_dict={}
 for i in num_list:
@@ -159,21 +189,42 @@ for i in num_list:
     text0_result,text1_result = computeSimilarScores( RelatedSrcfileinfo_dict , allAPI_info_list )
     text0_result_dict[issuekey] = text0_result
     text1_result_dict[issuekey] = text1_result
-    print issuekey
-    
-    
-#因为fixedfile_result中，很多超过256个  所以用CSV存储
-with open("/Users/apple/Documents/API/hbase/API_Src_Scores0.csv","w") as csvfile:
-    writer = csv.writer(csvfile)
-    for k,v in text0_result_dict.items():
-        writer.writerow([k]+v)
+    print issuekey,i
+"""
 
-with open("/Users/apple/Documents/API/hbase/API_Src_Scores1.csv","w") as csvfile:
-    writer = csv.writer(csvfile)
-    for k,v in text1_result_dict.items():
-        writer.writerow([k]+v)
-        
+#省省省省
+num_list = range(4,1004)# + range(404,1004)
+text0_result_dict={}
+text1_result_dict={}
+with open("Input/Hadoop_API_Src_Scores0.csv","r") as csvfile:
+        reader = csv.reader(csvfile)
+        #这里不需要readlines
+        for i,rows in enumerate(reader):
+            if i+4 in num_list:
+                scores = rows[1:7366+1]
+                for j in range(len(scores)):
+                    scores[j] = float(scores[j])
+                try:
+                    text0_result_dict[rows[0]] = scores
+                except IndexError:
+                    pass
+                
+with open("Input/Hadoop_API_Src_Scores1.csv","r") as csvfile:
+        reader = csv.reader(csvfile)
+        #这里不需要readlines
+        for i,rows in enumerate(reader):
+            if i+4 in num_list:
+                scores = rows[1:7366+1]
+                for j in range(len(scores)):
+                    scores[j] = float(scores[j])
+                try:    
+                    text1_result_dict[rows[0]] = scores
+                except IndexError:
+                    pass
 def main( weights):
+    
+    #默认情况下，weights = [0.5 , 0.5]
+    weights = [0.5, 0.5] 
     ALL_SimilarScores_dict = {}
     for key in text0_result_dict:
         issuekey = key

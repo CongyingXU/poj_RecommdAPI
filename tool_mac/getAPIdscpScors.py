@@ -10,6 +10,7 @@ import computeSimilarity
 import os
 import xlrd
 import xlwt
+import csv
 import math
 from time import time
 
@@ -227,6 +228,17 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     newRportSD= computeSimilarity.tokenize_stopwords_stemmer( [newReportSummary,newReportDescription] )
     scores = Half_computeSimilarity(newRportSD,all_APIdescription)
     
+    """
+    #用于将数据归一化处理
+    Max_socre  = scores[0]
+    for score in scores:
+        if Max_socre < score and score < 1 :#里面有一个是其本身。最大值为一
+            Max_socre = score
+    if Max_socre != 0:
+        for i in range(len(scores)):
+            scores[i] = scores[i] / Max_socre
+    """
+    
     #print time(),44
     Scores={}
     for i  in range(len(All_3partAPIinfo_list)):
@@ -237,12 +249,12 @@ def computeSimilarityScors(newReportSummary, newReportDescription , All_3partAPI
     Scores = sorted(Scores.iteritems(), key = lambda asd:asd[1], reverse = True)
     return Scores # [(key,value)]
     """
-    return Scores   #直接用字典，这样便于后续的关键字查找
+    return Scores   #直接用字典，这)# + ran样便于后续的关键字查找
 
-num_list = range(104,1004)
+num_list = range(104,204)# +range(904,1004)
 def main():#即issuekey的行号【4:1004】 是全部
 
-    workbook = xlrd.open_workbook(r'Input/Hbase.xlsx')
+    workbook = xlrd.open_workbook(r'Input/HadoopCommon.xlsx')
     sheet = workbook.sheet_by_name('general_report')
     #print sheet1.cell(6,28).value.encode('utf-8')
     Scores_dict={}
@@ -258,5 +270,6 @@ def main():#即issuekey的行号【4:1004】 是全部
     return Scores_dict
 
 
-#if __name__=='__main__':
-#    print main()
+if __name__=='__main__':
+    print main()
+    

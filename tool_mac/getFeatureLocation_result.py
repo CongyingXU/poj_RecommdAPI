@@ -57,9 +57,9 @@ def write(Final_Result,evaluate_result):
     sheet1.write(0,0,"Evaluation_Result".decode('utf-8'))
     sheet1.write(0,1,"MAP: " + bytes(evaluate_result[0]) )
     sheet1.write(0,2,"MRR: " + bytes(evaluate_result[1])  )
-    sheet1.write(0,3,"Recall-Rate@1: " + bytes(evaluate_result[2]) )
-    sheet1.write(0,4,"Recall-Rate@5: " + bytes(evaluate_result[3]) )
-    sheet1.write(0,5,"Recall-Rate@10: "+ bytes(evaluate_result[4]) )
+    sheet1.write(0,3,"Hit@1: " + bytes(evaluate_result[2]) )
+    sheet1.write(0,4,"Hit@5: " + bytes(evaluate_result[3]) )
+    sheet1.write(0,5,"Hit@10: "+ bytes(evaluate_result[4]) )
     
     sheet1.write(1,0,"issuekey".decode('utf-8'))
     sheet1.write(1,1,"ralatedSrcfiles".decode('utf-8'))
@@ -72,7 +72,7 @@ def write(Final_Result,evaluate_result):
                 break#只存前15个
         i = i+1
 
-    f.save('Output/FeaturnLocation_result9.xls')
+    f.save('Output/FeaturnLocation_result1.xls')
             
         
 
