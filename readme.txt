@@ -1,10 +1,20 @@
 
 
-主要管理两个项目：MULAPI， MULAPI+
+Hello, this repository contains experimental data and related tools for the work “MULAPI: Improving API method recommendation with API usage location”.    
 
-MULAPI+于MULAPI，删去了较多的参数，同时使用百度ai提供的自然语言处理技术的接口。
-MULAPI主项目文件即为 Tool_mac/Tool_win，具体的文件介绍可在MULAPI／readme.txt中查看
-Amalgam_plus是对bug location工作的重现
 
-愿安好
+Experiment_data:
+	- para_trainingResult0.txt: the parameters for feature location
+	- para_trainingResult1.txt: the parameters forAPI recommendation
+	- API_Usage_Location_experiment_result: the result of API usage location recommendation 
+	- API_recommendation_experiments_result: the result of API methods recommendation 
+
+Tools:
+	-MULAPI: the tool with user-friendly interface, work as a web service.
+	-tool_mac: just experimental platform for mac 
+	-tool_win: just experimental platform for win
+	—AmaLgam_plus: Wang et al.’s work, we re-run it for comparative experiment to evaluate the effect of MULAPI in recommending API usage location.
+	
+ 
+Best wishes
 	
